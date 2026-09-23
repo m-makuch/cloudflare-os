@@ -13,6 +13,8 @@ export type CloudflareObservabilityFields = {
   attempt: number;
   totalCount: number;
   vendorId: string;
+  /** Cloudflare account whose notification delivery failed. */
+  accountId: string;
 };
 
 /** Ambient observability fields for one Cloudflare gatekeeper operation. */

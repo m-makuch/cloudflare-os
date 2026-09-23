@@ -21,6 +21,11 @@
     "gatekeeper-cloudflare": {
       "bindings": [
         {
+          "class_name": "CloudflareNotificationRegistry",
+          "name": "NOTIFICATION_REGISTRY",
+          "type": "durable_object_namespace"
+        },
+        {
           "name": "CLIENT_ID",
           "text": "$SECRET(CLIENT_ID)",
           "type": "secret_text"
@@ -63,6 +68,19 @@
             "CloudflareObservabilityGatekeeper"
           ],
           "tag": "v1"
+        },
+        {
+          "new_sqlite_classes": [
+            "CloudflareNotificationsGatekeeper",
+            "CloudflareNotificationReceiver"
+          ],
+          "tag": "v2"
+        },
+        {
+          "new_sqlite_classes": [
+            "CloudflareNotificationRegistry"
+          ],
+          "tag": "v3"
         }
       ],
       "modules": [
