@@ -243,6 +243,13 @@ test("the backend's per-preview resources carry no ids, so wrangler provisions t
   }
 });
 
+test("the Cloudflare gatekeeper preview binds its notification registry", () => {
+  const { configs } = buildAll();
+  assert.deepEqual(previewsOf(configs, "gatekeeper-cloudflare").durable_objects, {
+    bindings: [{ name: "NOTIFICATION_REGISTRY", class_name: "CloudflareNotificationRegistry" }],
+  });
+});
+
 test("no config names a resource belonging to another deployment", () => {
   // The committed wrangler.jsonc files name resources for the deployment they were written for:
   // a real `bucket_name`, and KV entries whose only id is a local-dev Miniflare `preview_id`.
