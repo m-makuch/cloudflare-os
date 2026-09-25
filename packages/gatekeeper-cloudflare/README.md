@@ -200,6 +200,8 @@ or billing/sign-in flow. The account resource is `https://dash.cloudflare.com/<a
 1. Allow **Notifications Write** (`notifications.write`) on your Cloudflare OAuth client. Make it
    optional if that client also supports sign-in or billing. Existing connections request this grant
    when the Notifications resource is first selected; billing-only and auth-only grants do not gain it.
+   A connection that selects no specific resources requests every resource scope, including this one,
+   so allow it on the OAuth client before upgrading a deployment.
 2. Add **Cloudflare Notifications** to a workspace and select the account.
 3. Register a persistent callback with one Cloudflare alert type, then enable the resulting hook in
    **Connections**. Enabling creates an authenticated generic webhook destination and an enabled
@@ -215,8 +217,11 @@ await env.CLOUDFLARE_NOTIFICATIONS.subscribe(callback, {
 const health = await env.CLOUDFLARE_NOTIFICATIONS.getStatus();
 ```
 
-The alert type must be available to the connected Cloudflare account. The callback receives the bound
-account and notification time, optional alert type, policy/name/text/correlation/event-state metadata,
+The alert type must be available to the connected Cloudflare account. Policies are created without
+filters, so alert types that require them (for example, per-zone or per-health-check alerts) are not
+supported yet; enabling such a hook fails with the provider's error codes.
+
+The callback receives the bound account and notification time, optional alert type, policy/name/text/correlation/event-state metadata,
 and the original product-specific `data`. Cloudflare's documented payload may omit `account_id`,
 `policy_id`, or `alert_type`; when `account_id` is present, it must match the bound account. An alert
 with neither `policy_id` nor `alert_type` receives HTTP 500 while hooks are active, because it cannot
@@ -224,7 +229,7 @@ be routed without risking delivery to the wrong subscription.
 
 ### Delivery and lifecycle
 
-The router verifies `cf-webhook-auth` in one of 256 credential shards before reading the body or
+The gatekeeper's HTTP entrypoint verifies `cf-webhook-auth` in one of 256 credential shards before reading the body or
 contacting the account receiver. The receiver verifies it again, accepts Cloudflare's documented
 `{"text":"…"}` test message, and checks any reported account ID. Request bodies are capped at
 512 KiB while streaming, not after an unbounded allocation. API keys are random 256-bit values;
@@ -249,9 +254,12 @@ observation describing the bound account, reported alert type, policy ID, and ev
 Notification status and delivered alerts are marked as restricted data, so observing either latches
 the workspace against sharing. Notifications bindings are private to their owner. Disabling a hook
 stops future handoffs and removes the managed policy when no other hook uses its alert type. The shared
-webhook remains for other policies. Disconnecting Cloudflare stops ingress and delivery, then removes this connection's
-provider resources. Cleanup failures retain credentials for retry; reconnect first if credentials
-have expired. Provider-side setup is reconciled by the exact webhook URL, allowing recovery from
+webhook remains for other policies. If that removal fails, the next hook enabled on the connection
+retries it. Disconnecting Cloudflare stops ingress and delivery, then removes this connection's
+provider resources. Transient cleanup failures retain credentials for retry. If the grant has expired
+or no longer has access to the account, provider resources cannot be removed, so disconnect completes
+locally and logs `notification.revoke.cleanup.skipped`; delete the `Cloudflare OS` destination and
+policies in the dashboard. Provider-side setup is reconciled by the exact webhook URL, allowing recovery from
 interrupted creation without taking over similarly named destinations owned by other connections.
 Policies are reconciled by a connection-specific description and matching alert type and destination.
 Existing user-created policies are not rewritten by setup.
@@ -288,7 +296,9 @@ and store its credentials using the deployment's normal secret configuration. `B
 resolve to this Worker's public HTTPS address. If notification ingress uses a different public
 hostname or path, set `NOTIFICATIONS_WEBHOOK_BASE_URL` to that base address and route it to the same
 Worker. The notification address must use HTTPS on port 443, without URL credentials, query, or
-fragment; Cloudflare only dispatches generic webhooks to public ports 80 or 443.
+fragment; Cloudflare only dispatches generic webhooks to public ports 80 or 443. If the deployment is
+behind Cloudflare Access, add a bypass for the webhook path (`<base>/webhooks/*`): ANS cannot present
+Access credentials, and each request is authenticated by `cf-webhook-auth` instead.
 
 Connect the test Cloudflare account, enable a notification subscription, and use **Save and Test** on
 its webhook destination in Cloudflare. Confirm that the test timestamp appears in the connection's

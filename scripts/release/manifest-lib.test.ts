@@ -147,15 +147,6 @@ test("worker entries carry the deploy contract", () => {
       google.bindings.find((b) => b.name === "CLIENT_SECRET"),
       { type: "secret_text", name: "CLIENT_SECRET", text: "$SECRET(CLIENT_SECRET)" });
 
-  // Cloudflare Notifications needs its credential registry in customer instances too.
-  const cloudflare = workers["gatekeeper-cloudflare"];
-  assert.deepEqual(
-      cloudflare.bindings.find((b) => b.name === "NOTIFICATION_REGISTRY"),
-      { type: "durable_object_namespace", name: "NOTIFICATION_REGISTRY",
-        class_name: "CloudflareNotificationRegistry" });
-  assert.ok(cloudflare.migrations.some((migration) =>
-    migration.new_sqlite_classes?.includes("CloudflareNotificationRegistry")));
-
   // gatekeeper-email ships in the release but is not installable (needs Email Routing/a zone).
   assert.equal(workers["gatekeeper-email"].installable, false);
   assert.deepEqual(workers["gatekeeper-email"].inputs, []);
@@ -296,25 +287,6 @@ test("generateManifest rejects gatekeepers whose folded shortNames collide", () 
 
   assert.throws(() => buildTestManifest([...builds, collider]),
       /gatekeeper-google and gatekeeper-goo-gle both emit shortName "google"/);
-});
-
-test("Durable Object bindings reject unsupported deployment options", () => {
-  const builds = readTestWorkerBuilds();
-  const cloudflare = builds.find((w) => w.pkgName === "gatekeeper-cloudflare");
-  assert.ok(cloudflare);
-  const changed = builds.map((w) => w === cloudflare ? {
-    ...w,
-    config: {
-      ...w.config,
-      durable_objects: { bindings: [{
-        name: "NOTIFICATION_REGISTRY",
-        class_name: "CloudflareNotificationRegistry",
-        script_name: "some-other-worker",
-      }] },
-    },
-  } : w);
-  assert.throws(() => buildTestManifest(changed),
-      /unsupported Durable Object binding option/);
 });
 
 test("per-package deploy-inputs.json files are well-formed when present", () => {

@@ -13,7 +13,7 @@ export type CloudflareObservabilityFields = {
   attempt: number;
   totalCount: number;
   vendorId: string;
-  /** Cloudflare account whose notification delivery failed. */
+  /** Cloudflare account of a notification delivery or cleanup event. */
   accountId: string;
 };
 

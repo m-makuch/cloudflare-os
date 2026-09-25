@@ -73,9 +73,10 @@ export default {
             Details
           </summary>
           <p className="field-description" style={{ marginTop: "8px" }}>
-            Choose the Cloudflare OS webhook on the notification policies you want to receive.
-            Enabling your first hook creates the destination. Notifications Write access is
-            required.
+            Each hook subscribes to one alert type. Enabling the first hook for a type creates the
+            Cloudflare OS webhook destination and a managed notification policy for that type;
+            disabling the last one removes the policy. Alerts from other policies are ignored, even
+            if they use this webhook. Notifications Write access is required.
           </p>
           {values.statusDetails && (
             <p className="field-description" style={{ overflowWrap: "anywhere" }}>

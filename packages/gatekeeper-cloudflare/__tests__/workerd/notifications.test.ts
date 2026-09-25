@@ -277,3 +277,58 @@ it("does not report interrupted setup as complete", async () => {
   await runInDurableObject(stub, (_instance, state) => state.storage.kv.delete("setupComplete"));
   expect(await stub.getStatus()).toMatchObject({ installed: false, webhookId: "d".repeat(32) });
 });
+
+// Revoke removes the credential under the owner's real receiver name, not the test DO's name.
+const ownerReceiverName = notificationReceiverName(userObjectId, accountId);
+async function registerCredential() {
+  const registry = env.NOTIFICATION_REGISTRY.getByName(ownerReceiverName.slice(0, 2));
+  await registry.register(ownerReceiverName, await hashWebhookApiKey(secret));
+  return registry;
+}
+
+it("completes disconnect locally when the grant can no longer manage the account", async () => {
+  for (const [label, token] of [["denied", "test-access"], ["expired", null]] as const) {
+    const name = `revoke-${label}`;
+    const stub = await setup(name);
+    const registry = await registerCredential();
+    const fetch = vi.fn(async () => new Response("{}", { status: 403 }));
+    vi.stubGlobal("fetch", fetch);
+    await stub.revokeWithToken(token);
+    if (token === null) expect(fetch).not.toHaveBeenCalled();
+    expect(await registry.authorize(ownerReceiverName, secret)).toBe(false);
+    expect(await stub.getStatus()).toMatchObject({ suspended: true, installed: false, subscribers: 0 });
+    expect(await sendAlert(stub)).toBe(410);
+  }
+});
+
+it("keeps state for retry when disconnect cleanup fails transiently", async () => {
+  const name = "revoke-transient";
+  const stub = await setup(name);
+  const registry = await registerCredential();
+  vi.stubGlobal("fetch", vi.fn(async () => new Response("{}", { status: 503 })));
+  const error = await stub.revokeWithToken("test-access").then(() => undefined, (caught: Error) => caught);
+  expect(error?.message).toContain("HTTP 503");
+  expect(await registry.authorize(ownerReceiverName, secret)).toBe(true);
+  await registry.remove(ownerReceiverName);
+  expect(await stub.getStatus()).toMatchObject({
+    suspended: true,
+    policies: [{ alertType: "test_alert", policyId: "b".repeat(32) }],
+  });
+});
+
+it("retries an orphaned policy's removal when another hook is enabled", async () => {
+  const name = "orphaned-policy";
+  const orphanId = "e".repeat(32);
+  await runInDurableObject(env.NOTIFICATION_RECEIVER.getByName(name), (_instance, state) =>
+    state.storage.kv.put("policy:orphan_alert", { alertType: "orphan_alert", policyId: orphanId }));
+  const deleted: string[] = [];
+  vi.stubGlobal("fetch", vi.fn(async (input: string, init: RequestInit) => {
+    if (init.method === "DELETE") deleted.push(input);
+    return Response.json({ success: true, result: [] });
+  }));
+  const stub = await setup(name);
+  expect(deleted).toEqual([expect.stringMatching(new RegExp(`/policies/${orphanId}$`))]);
+  expect((await stub.getStatus()).policies).toEqual([
+    { alertType: "test_alert", policyId: "b".repeat(32) },
+  ]);
+});

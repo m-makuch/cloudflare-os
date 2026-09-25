@@ -38,8 +38,9 @@ import { VENDOR_ID } from "./vendor.js";
 import TYPES_CODE from "./types.txt";
 import { obsContext } from "./observability.js";
 import { readTextCapped, ResponseTooLargeError } from "@gadgets/gatekeeper-kit/response-body";
-import { parseNotificationWebhookPath, notificationReceiverName,
+import { parseNotificationWebhookPath, notificationReceiverName, configuredNotificationBaseUrl,
   notificationWebhookBaseUrl, MAX_NOTIFICATION_BODY_BYTES } from "./notifications-webhook.js";
+import { notificationRegistry } from "./notifications.js";
 export { CloudflareNotificationsGatekeeper, CloudflareNotificationHookController,
   CloudflareNotificationReceiver, CloudflareNotificationRegistry } from "./notifications.js";
 
@@ -136,8 +137,7 @@ export default {
     const basePath = getBasePath(env);
     let notificationPath: ReturnType<typeof parseNotificationWebhookPath> = null;
     try {
-      const webhookBasePath = new URL(stripTrailingSlashes(
-        env.NOTIFICATIONS_WEBHOOK_BASE_URL ?? getBaseUrl(env))).pathname.replace(/\/$/, "");
+      const webhookBasePath = new URL(configuredNotificationBaseUrl(env)).pathname.replace(/\/$/, "");
       notificationPath = parseNotificationWebhookPath(url.pathname, webhookBasePath);
     } catch {
       // A misconfigured notification address must not break OAuth routes.
@@ -148,8 +148,7 @@ export default {
       if (!apiKey) return new Response(null, { status: 401 });
       try {
         const name = notificationReceiverName(notificationPath.userObjectId, notificationPath.accountId);
-        const registry = env.NOTIFICATION_REGISTRY.getByName(name.slice(0, 2));
-        if (!(await registry.authorize(name, apiKey))) return new Response(null, { status: 401 });
+        if (!(await notificationRegistry(ctx.exports, name).authorize(name, apiKey))) return new Response(null, { status: 401 });
         const body = await readTextCapped(new Response(req.body, { headers: req.headers }),
           MAX_NOTIFICATION_BODY_BYTES);
         const receiver = ctx.exports.CloudflareNotificationReceiver.getByName(name);
@@ -482,7 +481,8 @@ export class UserAccount extends DurableObject<Env> {
 
   async revoke(): Promise<void> {
     this.ctx.storage.kv.put("revoking", true);
-    // Stop delivery before deleting provider resources. Failed cleanup retains credentials for retry.
+    // Stop delivery before deleting provider resources. A transient cleanup failure retains
+    // credentials for retry; a dead grant (null token) or denied access cleans up locally only.
     const accounts = [...this.ctx.storage.kv.list({ prefix: "notifications:" })].map(([key]) => key);
     for (const key of accounts) {
       await this.ctx.exports.CloudflareNotificationReceiver.getByName(
@@ -490,7 +490,6 @@ export class UserAccount extends DurableObject<Env> {
     }
     if (accounts.length) {
       const token = await this.getAccessToken();
-      if (!token) throw new Error("Reconnect Cloudflare to remove its notification destinations, then disconnect again.");
       for (const key of accounts) {
         await this.ctx.exports.CloudflareNotificationReceiver.getByName(
           notificationReceiverName(this.ctx.id.toString(), key.slice("notifications:".length))).revokeWithToken(token);
@@ -599,7 +598,7 @@ export class GatekeeperUserImpl extends WorkerEntrypoint<Env, GatekeeperUserImpl
               (status.lastTestAt ? `Last webhook test: ${status.lastTestAt}.` : "No webhook test received yet."),
           };
           try {
-            notificationWebhookBaseUrl(this.env.NOTIFICATIONS_WEBHOOK_BASE_URL ?? getBaseUrl(this.env));
+            notificationWebhookBaseUrl(configuredNotificationBaseUrl(this.env));
           } catch {
             return {
               summary: "Public webhook address needed",
