@@ -107,8 +107,6 @@ export interface WranglerConfig {
   compatibility_flags?: string[];
   /** Durable Object migration history, ordered. Replayed verbatim by fresh installs. */
   migrations?: DurableObjectMigration[];
-  /** Durable Object bindings implemented by this Worker. */
-  durable_objects?: { bindings: { name: string; class_name: string }[] };
   /** Workers observability settings. */
   observability?: ObservabilityConfig;
   /** KV namespace bindings; ids become `$KV_<BINDING>_ID` placeholders. */
@@ -256,7 +254,7 @@ export interface WorkerBuild {
 // on a deployable worker needs an explicit decision about how customer instances get it.
 const HANDLED_CONFIG_KEYS = new Set([
   "$schema", "name", "main", "build", "compatibility_date", "compatibility_flags", "rules",
-  "migrations", "durable_objects", "observability", "kv_namespaces", "r2_buckets", "worker_loaders", "services",
+  "migrations", "observability", "kv_namespaces", "r2_buckets", "worker_loaders", "services",
   "assets", "vars",
   // Browser Rendering (Gadget PDF exports). Unlike artifacts it is generally available, so it
   // passes through to customer instances as a placeholder-free binding, like the AI binding.
@@ -446,20 +444,6 @@ export function buildWorkerEntry(
       type: "r2_bucket",
       name: r2.binding,
       bucket_name: `$R2_${r2.binding}_NAME`,
-    });
-  }
-  if (config.durable_objects &&
-      Object.keys(config.durable_objects).some((key) => key !== "bindings")) {
-    throw new Error(`${pkgName}/wrangler.jsonc has an unsupported durable_objects option`);
-  }
-  for (const object of config.durable_objects?.bindings ?? []) {
-    if (Object.keys(object).some((key) => key !== "name" && key !== "class_name")) {
-      throw new Error(`${pkgName}/wrangler.jsonc has an unsupported Durable Object binding option`);
-    }
-    bindings.push({
-      type: "durable_object_namespace",
-      name: object.name,
-      class_name: object.class_name,
     });
   }
   if (config.browser) {

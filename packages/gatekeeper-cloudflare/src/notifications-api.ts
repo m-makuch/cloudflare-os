@@ -6,6 +6,32 @@ const API = "https://api.cloudflare.com/client/v4";
 export type NotificationInstallation = { webhookId: string };
 export type NotificationPolicy = { policyId: string };
 
+/** A non-success provider response. Only numeric codes are kept: messages can quote inputs back. */
+export class NotificationsApiError extends Error {
+  constructor(readonly status: number, readonly codes: number[]) {
+    super(`Cloudflare Notifications request failed (HTTP ${status}` +
+      (codes.length ? `, codes ${codes.join(", ")}` : "") + ")." +
+      (status === 401 || status === 403 ? " Check Notifications Write access to this account." : ""));
+    this.name = "NotificationsApiError";
+  }
+}
+
+/** The grant can no longer manage this account's notifications, so retrying cannot succeed. */
+export function isNotificationAccessDenied(error: unknown): boolean {
+  return error instanceof NotificationsApiError && (error.status === 401 || error.status === 403);
+}
+
+async function errorCodes(response: Response): Promise<number[]> {
+  try {
+    const envelope = object(JSON.parse(await readTextCapped(response)));
+    if (!Array.isArray(envelope.errors)) return [];
+    return envelope.errors.map((entry) => object(entry).code)
+      .filter((code): code is number => Number.isSafeInteger(code)).slice(0, 10);
+  } catch {
+    return [];
+  }
+}
+
 function object(value: unknown): Record<string, unknown> {
   if (!value || typeof value !== "object" || Array.isArray(value))
     throw new Error("Malformed Cloudflare Notifications response.");
@@ -42,12 +68,7 @@ async function requestEnvelope(
     await response.body?.cancel();
     return { success: true };
   }
-  if (!response.ok) {
-    await response.body?.cancel();
-    throw new Error(
-      `Cloudflare Notifications request failed (${response.status}). Check Notifications Write access and webhook eligibility.`,
-    );
-  }
+  if (!response.ok) throw new NotificationsApiError(response.status, await errorCodes(response));
   const envelope = object(JSON.parse(await readTextCapped(response)));
   if (envelope.success !== true) throw new Error("Cloudflare Notifications rejected the request.");
   return envelope;
@@ -169,13 +190,21 @@ export async function provisionNotificationPolicy(
       throw new Error("The managed notification policy was changed in Cloudflare.");
     return { policyId: id(matches[0].id) };
   }
-  const policy = object(await request(token, root, "POST", {
-    name: `Cloudflare OS: ${alertType}`,
-    description,
-    alert_type: alertType,
-    enabled: true,
-    mechanisms: { webhooks: [{ id: destination }] },
-  }));
+  let policy: Record<string, unknown>;
+  try {
+    policy = object(await request(token, root, "POST", {
+      name: `Cloudflare OS: ${alertType}`,
+      description,
+      alert_type: alertType,
+      enabled: true,
+      mechanisms: { webhooks: [{ id: destination }] },
+    }));
+  } catch (error) {
+    if (error instanceof NotificationsApiError && error.status === 400)
+      throw new Error(`${error.message} Check that ${alertType} is available to this account; ` +
+        "alert types that require filters are not supported yet.", { cause: error });
+    throw error;
+  }
   return { policyId: id(policy.id) };
 }
 

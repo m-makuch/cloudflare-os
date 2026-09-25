@@ -6,6 +6,14 @@ import type { CloudflareNotification } from "./types.js";
 const API_KEY_BYTES = 32;
 export const MAX_NOTIFICATION_BODY_BYTES = 512 * 1024;
 
+/** The configured, unvalidated notification ingress base: the override, else the gatekeeper base. */
+export function configuredNotificationBaseUrl(
+  env: { NOTIFICATIONS_WEBHOOK_BASE_URL?: string; BASE_URL?: string },
+): string {
+  return stripTrailingSlashes(env.NOTIFICATIONS_WEBHOOK_BASE_URL ||
+    env.BASE_URL || "http://localhost:8787/gatekeeper/cloudflare");
+}
+
 /** Cloudflare generic webhooks require a public HTTP(S) endpoint on port 80 or 443. */
 export function notificationWebhookBaseUrl(value: string): string {
   const base = stripTrailingSlashes(value);

@@ -56,8 +56,6 @@ export interface PreviewOverrides {
   vars?: Record<string, unknown>;
   /** Service bindings, each pointed at a sibling preview once its id is known. */
   services?: PreviewService[];
-  /** Durable Object bindings read from env; migrations stay at the top level. */
-  durable_objects?: WranglerConfig["durable_objects"];
   /** KV namespaces to auto-provision per preview. */
   kv_namespaces?: BindingDecl[];
   /** R2 buckets to auto-provision per preview. */
@@ -326,7 +324,6 @@ function applyGatekeeper(
   config.previews = {
     observability: previewObservability(config),
     vars: { ...config.vars },
-    ...(config.durable_objects ? { durable_objects: config.durable_objects } : {}),
     ...(config.unsafe ? { unsafe: config.unsafe } : {}),
     ...(config.artifacts ? { artifacts: config.artifacts } : {}),
     ...(config.ai ? { ai: config.ai } : {}),

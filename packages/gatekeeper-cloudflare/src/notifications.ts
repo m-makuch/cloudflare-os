@@ -20,6 +20,7 @@ import {
   provisionNotificationPolicy,
   removeNotificationConnection,
   removeNotificationPolicy,
+  isNotificationAccessDenied,
   type NotificationInstallation,
   type NotificationPolicy,
 } from "./notifications-api.js";
@@ -29,6 +30,7 @@ import {
   matchesWebhookApiKey,
   MAX_NOTIFICATION_BODY_BYTES,
   notificationReceiverName,
+  configuredNotificationBaseUrl,
   notificationWebhookBaseUrl,
   parseNotificationWebhook,
   isWebhookTest,
@@ -85,9 +87,14 @@ export class CloudflareNotificationRegistry extends DurableObject<NotificationEn
   }
 }
 
-function registry(env: NotificationEnv, props: NotificationsProps) {
-  const name = notificationReceiverName(props.userObjectId, props.accountId);
-  return env.NOTIFICATION_REGISTRY.getByName(name.slice(0, 2));
+/** The credential shard holding a receiver's webhook verifier. */
+export function notificationRegistry(exports: Cloudflare.Exports, receiverName: string) {
+  return exports.CloudflareNotificationRegistry.getByName(receiverName.slice(0, 2));
+}
+
+function registry(ctx: DurableObjectState, props: NotificationsProps) {
+  return notificationRegistry(ctx.exports,
+    notificationReceiverName(props.userObjectId, props.accountId));
 }
 
 function receiver(ctx: DurableObjectState<NotificationsProps>, props: NotificationsProps) {
@@ -266,26 +273,17 @@ export class CloudflareNotificationReceiver extends DurableObject<NotificationEn
   }
 
   async #provision(props: NotificationsProps): Promise<void> {
-    const account = this.#account(props.userObjectId);
-    if (!(await account.getGrantedScopes()).includes(NOTIFICATIONS_SCOPE)) {
-      throw new Error("Reconnect Cloudflare with Notifications access first.");
-    }
-    const token = await account.getAccessToken();
-    if (!token) throw new Error("Reconnect Cloudflare before enabling notifications.");
-    const base = notificationWebhookBaseUrl(
-      this.env.NOTIFICATIONS_WEBHOOK_BASE_URL ??
-        this.env.BASE_URL ??
-        "http://localhost:8787/gatekeeper/cloudflare",
-    );
+    const token = await this.#token(props);
+    const base = notificationWebhookBaseUrl(configuredNotificationBaseUrl(this.env));
     // Record ownership before external side effects, so disconnect can stop incomplete setup.
-    await account.registerNotificationAccount(props.accountId);
+    await this.#account(props.userObjectId).registerNotificationAccount(props.accountId);
     const webhookUrl = `${base}/webhooks/${props.userObjectId}/${props.accountId}`;
     this.ctx.storage.kv.put("webhookUrl", webhookUrl);
     const apiKey = generateWebhookApiKey();
     const authHash = await hashWebhookApiKey(apiKey);
     this.ctx.storage.kv.put("pendingAuthHash", authHash);
     this.ctx.storage.kv.put("owner", props);
-    const credentialRegistry = registry(this.env, props);
+    const credentialRegistry = registry(this.ctx, props);
     try {
       await credentialRegistry.register(notificationReceiverName(props.userObjectId, props.accountId), authHash);
       const installation = await provisionNotificationInstallation(
@@ -347,6 +345,17 @@ export class CloudflareNotificationReceiver extends DurableObject<NotificationEn
       } finally {
         disposeHook(replaced);
       }
+      // A connection-removal disable is best-effort and never retried by the Workshop, and an
+      // interrupted enable leaves an intent with no hook; retry either here rather than leak it.
+      for (const [, policy] of this.#policies()) {
+        if (policy.alertType === props.alertType) continue;
+        await this.#removeUnusedPolicy(policy.alertType).catch((error: unknown) =>
+          logger.warn("orphaned notification policy cleanup failed", {
+            event: "notification.policy.cleanup.failed",
+            accountId: props.accountId,
+            error,
+          }));
+      }
     });
   }
 
@@ -362,23 +371,28 @@ export class CloudflareNotificationReceiver extends DurableObject<NotificationEn
         .filter(([deliveryKey]) => deliveryKey.endsWith(`:${hookId}`))
         .map(([, delivery]) => delivery));
       this.ctx.storage.sql.exec("DELETE FROM notification_receipts WHERE hook_id = ?", hookId);
-      const policyKey = `policy:${alertType}`;
-      const policy = this.ctx.storage.kv.get<PolicyIntent>(policyKey);
-      const hooks = this.#hooks();
-      const stillUsed = hooks.some((hook) => hook.props.alertType === alertType);
-      for (const hook of hooks) disposeHook(hook);
-      if (policy && !stillUsed) {
-        const owner = this.ctx.storage.kv.get<NotificationsProps>("owner");
-        if (!owner) throw new Error("Notification policy owner is missing.");
-        const installation = this.ctx.storage.kv.get<Installation>("installation");
-        if (!installation) throw new Error("Notification destination is missing.");
-        this.ctx.storage.kv.put<PolicyIntent>(policyKey, { ...policy, needsReconcile: true });
-        await removeNotificationPolicy(await this.#token(owner), owner.accountId,
-          owner.userObjectId, alertType, installation.webhookId,
-          policy.policyId ? { policyId: policy.policyId } : undefined);
-        this.ctx.storage.kv.delete(policyKey);
-      }
+      await this.#removeUnusedPolicy(alertType);
     });
+  }
+
+  /** Delete the managed policy for an alert type once no hook uses it. Callers hold #mutations. */
+  async #removeUnusedPolicy(alertType: string): Promise<void> {
+    const policyKey = `policy:${alertType}`;
+    const policy = this.ctx.storage.kv.get<PolicyIntent>(policyKey);
+    if (!policy) return;
+    const hooks = this.#hooks();
+    const stillUsed = hooks.some((hook) => hook.props.alertType === alertType);
+    for (const hook of hooks) disposeHook(hook);
+    if (stillUsed) return;
+    const owner = this.ctx.storage.kv.get<NotificationsProps>("owner");
+    if (!owner) throw new Error("Notification policy owner is missing.");
+    const installation = this.ctx.storage.kv.get<Installation>("installation");
+    if (!installation) throw new Error("Notification destination is missing.");
+    this.ctx.storage.kv.put<PolicyIntent>(policyKey, { ...policy, needsReconcile: true });
+    await removeNotificationPolicy(await this.#token(owner), owner.accountId,
+      owner.userObjectId, alertType, installation.webhookId,
+      policy.policyId ? { policyId: policy.policyId } : undefined);
+    this.ctx.storage.kv.delete(policyKey);
   }
   async suspend(): Promise<void> {
     this.ctx.storage.kv.put("suspended", true);
@@ -388,29 +402,51 @@ export class CloudflareNotificationReceiver extends DurableObject<NotificationEn
       await this.#provisioning?.catch(() => undefined);
     });
   }
-  async revokeWithToken(token: string): Promise<void> {
+  /**
+   * Stop delivery, then delete this connection's provider resources. A null token (the grant is
+   * gone) or an access-denied response can never succeed on retry, so those skip provider cleanup
+   * rather than wedge disconnect; any other failure propagates so the caller can retry.
+   */
+  async revokeWithToken(token: string | null): Promise<void> {
     await this.suspend();
-    const installation = this.ctx.storage.kv.get<Installation>("installation");
     const owner = this.ctx.storage.kv.get<NotificationsProps>("owner");
-    const webhookUrl = this.ctx.storage.kv.get<string>("webhookUrl");
     if (owner) {
-      for (const [key, policy] of this.#policies()) {
-        if (!installation) throw new Error("Notification destination is missing.");
-        await removeNotificationPolicy(token, owner.accountId, owner.userObjectId,
-          key.slice("policy:".length), installation.webhookId,
-          policy.policyId ? { policyId: policy.policyId } : undefined);
-        this.ctx.storage.kv.delete(key);
+      const skip = (reason: unknown) => logger.warn("notification provider cleanup skipped", {
+        event: "notification.revoke.cleanup.skipped",
+        accountId: owner.accountId,
+        error: reason,
+      });
+      if (!token) skip("Cloudflare credentials are no longer available.");
+      else {
+        try {
+          await this.#removeProviderResources(token, owner);
+        } catch (error) {
+          if (!isNotificationAccessDenied(error)) throw error;
+          skip(error);
+        }
       }
+      await registry(this.ctx, owner).remove(notificationReceiverName(owner.userObjectId, owner.accountId));
     }
-    if (owner && webhookUrl)
-      await removeNotificationConnection(token, owner.accountId, webhookUrl, installation);
-    if (owner) await registry(this.env, owner).remove(notificationReceiverName(owner.userObjectId, owner.accountId));
     // Keep a tombstone so outstanding controller capabilities cannot resurrect this receiver.
     for (const [key, value] of this.ctx.storage.kv.list()) {
       if (key !== "suspended") this.ctx.storage.kv.delete(key);
       if (key.startsWith("hook:")) disposeHook(value as StoredHook);
     }
     this.ctx.storage.sql.exec("DELETE FROM notification_receipts");
+  }
+
+  async #removeProviderResources(token: string, owner: NotificationsProps): Promise<void> {
+    const installation = this.ctx.storage.kv.get<Installation>("installation");
+    const webhookUrl = this.ctx.storage.kv.get<string>("webhookUrl");
+    for (const [key, policy] of this.#policies()) {
+      if (!installation) throw new Error("Notification destination is missing.");
+      await removeNotificationPolicy(token, owner.accountId, owner.userObjectId,
+        key.slice("policy:".length), installation.webhookId,
+        policy.policyId ? { policyId: policy.policyId } : undefined);
+      this.ctx.storage.kv.delete(key);
+    }
+    if (webhookUrl)
+      await removeNotificationConnection(token, owner.accountId, webhookUrl, installation);
   }
 
   async getStatus(): Promise<CloudflareNotificationStatus> {

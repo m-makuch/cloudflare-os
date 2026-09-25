@@ -543,7 +543,8 @@ export interface CloudflareNotification {
 
 /** The Cloudflare alert type for the policy created when this hook is enabled. */
 export interface CloudflareNotificationSubscription {
-  /** Use an alert type available to the connected Cloudflare account. */
+  /** Use an alert type available to the connected Cloudflare account. Alert types that require
+   * policy filters (for example, specific zones or health checks) are not supported yet. */
   alertType: string;
 }
 
@@ -564,7 +565,7 @@ export interface CloudflareNotificationStatus {
   webhookId?: string;
   /** Policies created for enabled alert types. Hooks for one type share a policy. */
   policies: { alertType: string; policyId: string }[];
-  /** Number of enabled subscribers. */
+  /** Enabled hooks for this Cloudflare account across all of the owner's workspaces (limit 100). */
   subscribers: number;
   /** Time the last authenticated webhook test succeeded. */
   lastTestAt?: string;

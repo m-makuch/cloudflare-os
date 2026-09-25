@@ -1,5 +1,7 @@
 import { afterEach, expect, it, vi } from "vitest";
 import {
+  isNotificationAccessDenied,
+  NotificationsApiError,
   provisionNotificationInstallation,
   provisionNotificationPolicy,
   removeNotificationConnection,
@@ -191,4 +193,28 @@ it("deletes only this hook's policy, including a known ID after its description 
   await removeNotificationPolicy("token", account, ownerId, "incident_alert", webhook, { policyId: policy });
   expect(calls.filter((call) => call.init.method === "DELETE").map((call) => call.url))
     .toEqual([`https://api.cloudflare.com/client/v4/accounts/${account}/alerting/v3/policies/${policy}`]);
+});
+
+it("reports provider error codes without echoing provider messages", async () => {
+  mock([
+    [],
+    Response.json({ success: false, errors: [{ code: 17000, message: `bad ${ownerId}` }] },
+      { status: 400 }),
+  ]);
+  const error = await provisionNotificationPolicy("token", account, webhook, "test_alert", ownerId)
+    .catch((caught: unknown) => caught as Error);
+  expect(error.message).toContain("HTTP 400, codes 17000");
+  expect(error.message).toContain("require filters");
+  expect(error.message).not.toContain(ownerId);
+  expect(isNotificationAccessDenied(error.cause)).toBe(false);
+});
+
+it("classifies 401 and 403 as access denied, and other failures as retryable", async () => {
+  for (const [status, denied] of [[401, true], [403, true], [500, false], [429, false]] as const) {
+    mock([new Response("{}", { status })]);
+    const error = await removeNotificationPolicy("token", account, ownerId, "test_alert", webhook)
+      .catch((caught: unknown) => caught);
+    expect(error).toBeInstanceOf(NotificationsApiError);
+    expect(isNotificationAccessDenied(error)).toBe(denied);
+  }
 });
