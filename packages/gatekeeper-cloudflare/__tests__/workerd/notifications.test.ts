@@ -95,11 +95,13 @@ it("tests the destination, receives matching alerts once, and ignores other aler
     expect.objectContaining({
       title: "Cloudflare notification: test_alert",
       description: expect.stringContaining(`policy ID: ${"b".repeat(32)}; event state: ALERT_STATE_EVENT_START`),
-      containsRestrictedData: true,
     }),
   ]);
-  expect((await env.NOTIFICATION_TEST_HOOKS.readObservations())[0]!.description)
-    .toContain(`account ${accountId}`);
+  const [observation] = await env.NOTIFICATION_TEST_HOOKS.readObservations();
+  expect(observation!.description).toContain(`account ${accountId}`);
+  // A restricted observation would permanently stop the workspace from taking actions, so an alert
+  // could never lead to a fix being pushed.
+  expect(observation!.containsRestrictedData).toBeUndefined();
 
   await sendAlert(stub);
   expect(await receivedAlerts()).toEqual(alerts);
@@ -115,7 +117,6 @@ it("delivers an authenticated notification with no optional account or alert typ
   expect(await env.NOTIFICATION_TEST_HOOKS.readObservations()).toEqual([
     expect.objectContaining({
       title: "Cloudflare notification: not provided",
-      containsRestrictedData: true,
     }),
   ]);
 });

@@ -116,7 +116,6 @@ function notificationObservation(notification: CloudflareNotification): Observat
       `Alert type: ${alertType}; policy ID: ${auditIdentifier(notification.policyId)}; ` +
       `event state: ${auditIdentifier(notification.event)}. The body includes free-form text and ` +
       "product-specific evidence.",
-    containsRestrictedData: true,
   };
 }
 
@@ -164,7 +163,6 @@ class CloudflareNotificationsSessionImpl
     await this.#queue.authorizeObservation({
       title: `Cloudflare notification status for ${this.#ctx.props.accountId}`,
       description: `Read destination and managed policy IDs, subscriber count, and recent delivery times for Cloudflare account ${this.#ctx.props.accountId}.`,
-      containsRestrictedData: true,
     });
     return receiver(this.#ctx, this.#ctx.props).getStatus();
   }

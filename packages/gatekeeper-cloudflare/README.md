@@ -251,8 +251,9 @@ side effects idempotent. Delivery order is not guaranteed, and delivery stops if
 
 A connection supports 100 hooks. Each callback is preceded by a Cloudflare-specific Workshop
 observation describing the bound account, reported alert type, policy ID, and event state.
-Notification status and delivered alerts are marked as restricted data, so observing either latches
-the workspace against sharing. Notifications bindings are private to their owner. Disabling a hook
+Like Workers Observability reads, these observations are not marked as restricted data: that would
+permanently stop the workspace from taking actions, so an alert could never lead to a pushed fix.
+Notifications bindings are private to their owner. Disabling a hook
 stops future handoffs and removes the managed policy when no other hook uses its alert type. The shared
 webhook remains for other policies. If that removal fails, the next hook enabled on the connection
 retries it. Disconnecting Cloudflare stops ingress and delivery, then removes this connection's
