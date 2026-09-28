@@ -225,7 +225,11 @@ The callback receives the bound account and notification time, optional alert ty
 and the original product-specific `data`. Cloudflare's documented payload may omit `account_id`,
 `policy_id`, or `alert_type`; when `account_id` is present, it must match the bound account. An alert
 with neither `policy_id` nor `alert_type` receives HTTP 500 while hooks are active, because it cannot
-be routed without risking delivery to the wrong subscription.
+be routed without risking delivery to the wrong subscription. Hooks receive only alerts from the policy
+managed for their alert type, compared without regard to dashes or case, because the API returns IDs
+without dashes while deliveries carry dashed UUIDs. An alert from any other policy that targets the
+destination, such as one Real-Time Issues creates when a destination rather than a policy is chosen,
+is acknowledged and logged as `notification.unmatched`.
 
 ### Delivery and lifecycle
 

@@ -121,6 +121,28 @@ it("delivers an authenticated notification with no optional account or alert typ
   ]);
 });
 
+it("matches the managed policy when the alert carries its ID as a dashed UUID", async () => {
+  const stub = await setup("dashed-policy-id");
+  // The API returns policy IDs without dashes; deliveries carry them dashed.
+  const dashed = "BBBBBBBB-bbbb-bbbb-bbbb-bbbbbbbbbbbb";
+  const body = JSON.stringify({ ...JSON.parse(payload), policy_id: dashed });
+
+  const status = await sendAlert(stub, body);
+
+  expect(status).toBe(204);
+  expect(await receivedAlerts()).toEqual([expect.objectContaining({ policyId: dashed })]);
+});
+
+it("does not deliver an alert sent through another policy", async () => {
+  const stub = await setup("foreign-policy");
+  const body = JSON.stringify({ ...JSON.parse(payload), policy_id: "e".repeat(32) });
+
+  const status = await sendAlert(stub, body);
+
+  expect(status).toBe(204);
+  expect(await receivedAlerts()).toEqual([]);
+});
+
 it("retries an alert with neither policy ID nor alert type instead of acknowledging its loss", async () => {
   const stub = await setup("unroutable-alert");
   const body = JSON.stringify({ ts: 1234567890, data: { signal: "degraded" } });
