@@ -143,6 +143,17 @@ it("does not deliver an alert sent through another policy", async () => {
   expect(await receivedAlerts()).toEqual([]);
 });
 
+it("delivers Real-Time Issues sent through the destination's policy", async () => {
+  const alertType = "workers_observability_real_time_issue";
+  const stub = await setup("workers-issues-policy", alertType);
+  const body = JSON.stringify({ ...JSON.parse(payload), alert_type: alertType, policy_id: "e".repeat(32) });
+
+  expect(await sendAlert(stub, body)).toBe(204);
+  expect(await receivedAlerts()).toEqual([
+    expect.objectContaining({ alertType, policyId: "e".repeat(32) }),
+  ]);
+});
+
 it("retries an alert with neither policy ID nor alert type instead of acknowledging its loss", async () => {
   const stub = await setup("unroutable-alert");
   const body = JSON.stringify({ ts: 1234567890, data: { signal: "degraded" } });
