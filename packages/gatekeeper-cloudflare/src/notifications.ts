@@ -108,6 +108,14 @@ function auditIdentifier(value: string | undefined): string {
   return /^[A-Za-z0-9_./:-]{1,120}$/.test(value) ? value : "value omitted";
 }
 
+// The API returns policy IDs without dashes, but alert deliveries carry them as dashed UUIDs.
+function normalizeResourceId(id: string): string {
+  return id.replaceAll("-", "").toLowerCase();
+}
+function sameResourceId(a: string, b: string): boolean {
+  return normalizeResourceId(a) === normalizeResourceId(b);
+}
+
 function notificationObservation(notification: CloudflareNotification): ObservationDescription {
   const alertType = auditIdentifier(notification.alertType);
   return {
@@ -502,10 +510,17 @@ export class CloudflareNotificationReceiver extends DurableObject<NotificationEn
       const policy = this.ctx.storage.kv.get<PolicyIntent>(`policy:${props.alertType}`);
       if (notification.alertType && notification.alertType !== props.alertType) return false;
       if (notification.policyId && policy?.policyId)
-        return notification.policyId === policy.policyId;
+        return sameResourceId(notification.policyId, policy.policyId);
       return notification.alertType === props.alertType;
     });
     for (const hook of available) if (!hooks.includes(hook)) disposeHook(hook);
+    if (!hooks.length) {
+      logger.info("notification matched no enabled hook", {
+        event: "notification.unmatched",
+        alertType: auditIdentifier(notification.alertType),
+        policyId: auditIdentifier(notification.policyId),
+      });
+    }
     const results = await Promise.all(hooks.map((hook) => this.#handoff(hook, notification)));
     if (results.some((delivered) => !delivered)) return 500;
     if (this.ctx.storage.kv.get("suspended")) return 410;
