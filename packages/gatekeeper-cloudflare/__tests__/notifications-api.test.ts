@@ -202,7 +202,7 @@ it("reports provider error codes without echoing provider messages", async () =>
       { status: 400 }),
   ]);
   const error = await provisionNotificationPolicy("token", account, webhook, "test_alert", ownerId)
-    .catch((caught: unknown) => caught as Error);
+    .then(() => { throw new Error("expected provisioning to fail"); }, (caught: unknown) => caught as Error);
   expect(error.message).toContain("HTTP 400, codes 17000");
   expect(error.message).toContain("require filters");
   expect(error.message).not.toContain(ownerId);
