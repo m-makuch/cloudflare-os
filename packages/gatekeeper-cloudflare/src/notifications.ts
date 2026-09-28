@@ -148,12 +148,17 @@ class CloudflareNotificationsSessionImpl
       alertType: subscription.alertType,
     };
     const controller = this.#ctx.exports.CloudflareNotificationHookController({ props });
-    await this.#queue.bindHook(controller, callback, {
-      title: `Cloudflare ${props.alertType} alerts for ${props.accountId}`,
-      description: `When enabled, create or share a Cloudflare notification policy for ${props.alertType} ` +
-        `in account ${props.accountId}, deliver its alerts to this workspace, and remove the policy ` +
-        "when the last hook for this alert type is disabled.",
-    });
+    await this.#queue.bindHook(
+      // @ts-expect-error Workers currently widens the controller's hook type across bindHook RPC.
+      controller,
+      callback,
+      {
+        title: `Cloudflare ${props.alertType} alerts for ${props.accountId}`,
+        description: `When enabled, create or share a Cloudflare notification policy for ${props.alertType} ` +
+          `in account ${props.accountId}, deliver its alerts to this workspace, and remove the policy ` +
+          "when the last hook for this alert type is disabled.",
+      },
+    );
   }
   async getStatus(): Promise<CloudflareNotificationStatus> {
     await this.#queue.authorizeObservation({
