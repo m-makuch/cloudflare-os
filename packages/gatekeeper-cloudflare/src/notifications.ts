@@ -509,6 +509,11 @@ export class CloudflareNotificationReceiver extends DurableObject<NotificationEn
     const hooks = available.filter(({ props }) => {
       const policy = this.ctx.storage.kv.get<PolicyIntent>(`policy:${props.alertType}`);
       if (notification.alertType && notification.alertType !== props.alertType) return false;
+      // Workers Issues sends manual and automatic notifications through the policy it
+      // creates for our destination, not the policy created for this subscription.
+      // The authenticated webhook is already scoped to this Cloudflare account.
+      if (props.alertType === "workers_observability_real_time_issue" &&
+          notification.alertType === props.alertType) return true;
       if (notification.policyId && policy?.policyId)
         return sameResourceId(notification.policyId, policy.policyId);
       return notification.alertType === props.alertType;
