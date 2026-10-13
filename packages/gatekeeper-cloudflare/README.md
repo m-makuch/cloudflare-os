@@ -205,7 +205,8 @@ or billing/sign-in flow. The account resource is `https://dash.cloudflare.com/<a
 2. Add **Cloudflare Notifications** to a workspace and select the account.
 3. Register a persistent callback with one Cloudflare alert type, then enable the resulting hook in
    **Connections**. Enabling creates an authenticated generic webhook destination and an enabled
-   Cloudflare notification policy for that alert type. Hooks for the same type share the policy.
+   Cloudflare notification policy for that alert type by default. Managed hooks for the same type
+   share the policy; `createPolicy: false` uses only the destination.
 4. Use Cloudflare's **Save and Test** to verify ingress. `getStatus()` reports destination and policy
    IDs, plus last test and receive times. It never returns credentials.
 
@@ -219,27 +220,32 @@ const health = await env.CLOUDFLARE_NOTIFICATIONS.getStatus();
 
 The alert type must be available to the connected Cloudflare account. Policies are created without
 filters, so alert types that require them (for example, per-zone or per-health-check alerts) are not
-supported yet; enabling such a hook fails with the provider's error codes.
+supported by managed policies yet; enabling such a managed hook fails with the provider's error codes.
+Use `createPolicy: false` with an existing filtered policy when appropriate.
 
 The callback receives the bound account and notification time, optional alert type, policy/name/text/correlation/event-state metadata,
 and the original product-specific `data`. Cloudflare's documented payload may omit `account_id`,
 `policy_id`, or `alert_type`; when `account_id` is present, it must match the bound account. An alert
-with neither `policy_id` nor `alert_type` receives HTTP 500 while hooks are active, because it cannot
-be routed without risking delivery to the wrong subscription. Hooks normally receive only alerts from
-the policy managed for their alert type, compared without regard to dashes or case, because the API
-returns IDs without dashes while deliveries carry dashed UUIDs. Workers Real-Time Issues sends through
-its own policy for the selected webhook destination. An authenticated
-`workers_observability_real_time_issue` alert therefore reaches enabled hooks for that alert type
-even when its policy ID differs from the managed policy. Alerts for other types still use the managed
-policy ID.
+without `alert_type` receives HTTP 500 while hooks are active because it cannot be routed.
+Every enabled hook receives every authenticated alert of its type reaching this connection's
+webhook destination, regardless of policy ID. Set `createPolicy: false` when subscribing to rely on
+an existing policy or Workers Issues **Send to**, avoiding a second managed policy for that flow.
+The default is true; managed subscribers share one policy per type, removed when its last managed
+subscriber is disabled. External-policy subscribers remain active.
 
 ### Delivery and lifecycle
 
-The gatekeeper's HTTP entrypoint verifies `cf-webhook-auth` in one of 256 credential shards before reading the body or
-contacting the account receiver. The receiver verifies it again, accepts Cloudflare's documented
-`{"text":"…"}` test message, and checks any reported account ID. Request bodies are capped at
-512 KiB while streaming, not after an unbounded allocation. API keys are random 256-bit values;
-only their SHA-256 verifier is retained locally. Provider requests are fixed-origin, bounded,
+The HTTP entrypoint rejects malformed owner/account paths and missing `cf-webhook-auth` before
+calling a receiver. The receiver authenticates before writing storage and creates receipt tables
+lazily, so unknown credentials leave no persistent state. It accepts Cloudflare's documented
+`{"text":"…"}` test message and checks any reported account ID. Request bodies are capped at
+512 KiB while streaming. API keys are random 256-bit values; only their SHA-256 verifier is retained
+once setup completes. An address migration temporarily stores the pending secret to retry an
+interrupted update exactly, accepting both the old and pending credentials until it succeeds.
+Enabling a hook reconciles a changed base URL by updating the existing destination in place,
+preserving its ID and policies. The receiver accepts its stored old path during migration; both
+origins must still route to this Worker for uninterrupted delivery during a hostname change.
+Provider requests are fixed-origin, bounded,
 time-limited, and do not follow redirects.
 
 A successful event returns **204 after all matching subscribers accept it**. Callback or authorization
@@ -260,7 +266,7 @@ observation describing the bound account, reported alert type, policy ID, and ev
 Like Workers Observability reads, these observations are not marked as restricted data: that would
 permanently stop the workspace from taking actions, so an alert could never lead to a pushed fix.
 Notifications bindings are private to their owner. Disabling a hook
-stops future handoffs and removes the managed policy when no other hook uses its alert type. The shared
+stops future handoffs and removes the managed policy when no other managed-policy hook uses its alert type. The shared
 webhook remains for other policies. If that removal fails, the next hook enabled on the connection
 retries it. Disconnecting Cloudflare stops ingress and delivery, then removes this connection's
 provider resources. Transient cleanup failures retain credentials for retry. If the grant has expired
@@ -272,7 +278,7 @@ Policies are reconciled by a connection-specific description and matching alert 
 Existing user-created policies are not rewritten by setup.
 
 This binding exposes no gadget-initiated writes. Destination and policy creation happen only after the
-user approves and enables the hook in Connections; disabling the last hook for a type removes its policy.
+user approves and enables the hook in Connections; disabling the last managed subscriber removes its policy.
 Consequently it submits observations for status reads and deliveries, but has no action to submit
 through `ActionDescription`.
 

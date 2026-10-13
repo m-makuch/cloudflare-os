@@ -40,9 +40,8 @@ import { obsContext } from "./observability.js";
 import { readTextCapped, ResponseTooLargeError } from "@gadgets/gatekeeper-kit/response-body";
 import { parseNotificationWebhookPath, notificationReceiverName, configuredNotificationBaseUrl,
   notificationWebhookBaseUrl, MAX_NOTIFICATION_BODY_BYTES } from "./notifications-webhook.js";
-import { notificationRegistry } from "./notifications.js";
 export { CloudflareNotificationsGatekeeper, CloudflareNotificationHookController,
-  CloudflareNotificationReceiver, CloudflareNotificationRegistry } from "./notifications.js";
+  CloudflareNotificationReceiver } from "./notifications.js";
 
 const logger = obsContext.createLogger({
   component: "gatekeeper.cloudflare", vendorId: VENDOR_ID,
@@ -142,18 +141,19 @@ export default {
     } catch {
       // A misconfigured notification address must not break OAuth routes.
     }
+    // Retain old configured paths during an address migration; the receiver checks its stored URL.
+    notificationPath ??= parseNotificationWebhookPath(url.pathname, url.pathname.split("/webhooks/")[0]!);
     if (notificationPath) {
       if (req.method !== "POST") return new Response(null, { status: 405, headers: { Allow: "POST" } });
       const apiKey = req.headers.get("cf-webhook-auth");
       if (!apiKey) return new Response(null, { status: 401 });
       try {
         const name = notificationReceiverName(notificationPath.userObjectId, notificationPath.accountId);
-        if (!(await notificationRegistry(ctx.exports, name).authorize(name, apiKey))) return new Response(null, { status: 401 });
         const body = await readTextCapped(new Response(req.body, { headers: req.headers }),
           MAX_NOTIFICATION_BODY_BYTES);
         const receiver = ctx.exports.CloudflareNotificationReceiver.getByName(name);
         const status = await receiver.receiveWebhook(apiKey,
-          req.headers.get("content-type") ?? "", body);
+          req.headers.get("content-type") ?? "", body, url.pathname);
         return new Response(null, { status });
       } catch (error) {
         return new Response(null, { status: error instanceof ResponseTooLargeError ? 413 : 500 });

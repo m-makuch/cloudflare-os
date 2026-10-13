@@ -17,6 +17,7 @@ import { SerialTaskQueue } from "@gadgets/gatekeeper-kit/serial-queue";
 import { obsContext } from "./observability.js";
 import {
   provisionNotificationInstallation,
+  updateNotificationDestination,
   provisionNotificationPolicy,
   removeNotificationConnection,
   removeNotificationPolicy,
@@ -63,38 +64,15 @@ type NotificationEnv = Cloudflare.Env & {
 };
 type HookTarget = RpcTarget & CloudflareNotificationHook;
 type NotificationsProps = { userObjectId: string; accountId: string };
-type HookProps = NotificationsProps & { hookId: string; alertType: string };
+type HookProps = NotificationsProps & { hookId: string; alertType: string; createPolicy?: boolean };
 type StoredHook = { props: HookProps; initiator: Fetcher<HookInitiator<HookTarget>> };
 type Installation = NotificationInstallation & NotificationsProps & { authHash: string };
+type AddressMigration = { apiKey: string; authHash: string; webhookUrl: string };
 type PolicyIntent = Partial<NotificationPolicy> & { alertType: string; needsReconcile?: boolean };
 
 function disposeHook(hook: StoredHook | undefined): void {
   (hook?.initiator as (Fetcher<HookInitiator<HookTarget>> & Partial<Disposable>) | undefined)
     ?.[Symbol.dispose]?.();
-}
-
-/** A fixed set of credential shards keeps unknown URLs from creating receiver objects. */
-export class CloudflareNotificationRegistry extends DurableObject<NotificationEnv> {
-  async authorize(name: string, apiKey: string): Promise<boolean> {
-    const hash = this.ctx.storage.kv.get<string>(name);
-    return hash !== undefined && matchesWebhookApiKey(apiKey, hash);
-  }
-  register(name: string, hash: string): void {
-    this.ctx.storage.kv.put(name, hash);
-  }
-  remove(name: string): void {
-    this.ctx.storage.kv.delete(name);
-  }
-}
-
-/** The credential shard holding a receiver's webhook verifier. */
-export function notificationRegistry(exports: Cloudflare.Exports, receiverName: string) {
-  return exports.CloudflareNotificationRegistry.getByName(receiverName.slice(0, 2));
-}
-
-function registry(ctx: DurableObjectState, props: NotificationsProps) {
-  return notificationRegistry(ctx.exports,
-    notificationReceiverName(props.userObjectId, props.accountId));
 }
 
 function receiver(ctx: DurableObjectState<NotificationsProps>, props: NotificationsProps) {
@@ -106,14 +84,6 @@ function receiver(ctx: DurableObjectState<NotificationsProps>, props: Notificati
 function auditIdentifier(value: string | undefined): string {
   if (value === undefined) return "not provided";
   return /^[A-Za-z0-9_./:-]{1,120}$/.test(value) ? value : "value omitted";
-}
-
-// The API returns policy IDs without dashes, but alert deliveries carry them as dashed UUIDs.
-function normalizeResourceId(id: string): string {
-  return id.replaceAll("-", "").toLowerCase();
-}
-function sameResourceId(a: string, b: string): boolean {
-  return normalizeResourceId(a) === normalizeResourceId(b);
 }
 
 function notificationObservation(notification: CloudflareNotification): ObservationDescription {
@@ -153,6 +123,7 @@ class CloudflareNotificationsSessionImpl
       ...this.#ctx.props,
       hookId: crypto.randomUUID(),
       alertType: subscription.alertType,
+      createPolicy: subscription.createPolicy ?? true,
     };
     const controller = this.#ctx.exports.CloudflareNotificationHookController({ props });
     await this.#queue.bindHook(
@@ -161,9 +132,9 @@ class CloudflareNotificationsSessionImpl
       callback,
       {
         title: `Cloudflare ${props.alertType} alerts for ${props.accountId}`,
-        description: `When enabled, create or share a Cloudflare notification policy for ${props.alertType} ` +
-          `in account ${props.accountId}, deliver its alerts to this workspace, and remove the policy ` +
-          "when the last hook for this alert type is disabled.",
+        description: `Receive every ${props.alertType} alert reaching this connection in account ${props.accountId}. ` +
+          (props.createPolicy ? "Create or share a managed policy and remove it when its last subscriber is disabled." :
+            "Use an existing policy or Cloudflare Send to destination; do not create a managed policy."),
       },
     );
   }
@@ -243,9 +214,8 @@ export class CloudflareNotificationReceiver extends DurableObject<NotificationEn
   #mutations = new SerialTaskQueue();
   #provisioning?: Promise<void>;
   #inFlight = new Map<string, Promise<boolean>>();
-  constructor(ctx: DurableObjectState, env: NotificationEnv) {
-    super(ctx, env);
-    ctx.storage.sql.exec(`CREATE TABLE IF NOT EXISTS notification_receipts (
+  #ensureReceipts(): void {
+    this.ctx.storage.sql.exec(`CREATE TABLE IF NOT EXISTS notification_receipts (
       notification_id TEXT NOT NULL, hook_id TEXT NOT NULL, delivered_at INTEGER NOT NULL,
       PRIMARY KEY(notification_id, hook_id))`);
   }
@@ -294,9 +264,7 @@ export class CloudflareNotificationReceiver extends DurableObject<NotificationEn
     const authHash = await hashWebhookApiKey(apiKey);
     this.ctx.storage.kv.put("pendingAuthHash", authHash);
     this.ctx.storage.kv.put("owner", props);
-    const credentialRegistry = registry(this.ctx, props);
     try {
-      await credentialRegistry.register(notificationReceiverName(props.userObjectId, props.accountId), authHash);
       const installation = await provisionNotificationInstallation(
         token,
         props.accountId,
@@ -309,12 +277,30 @@ export class CloudflareNotificationReceiver extends DurableObject<NotificationEn
         authHash,
       });
       this.ctx.storage.kv.put("setupComplete", true);
-    } catch (error) {
-      await credentialRegistry.remove(notificationReceiverName(props.userObjectId, props.accountId));
-      throw error;
     } finally {
       this.ctx.storage.kv.delete("pendingAuthHash");
     }
+  }
+
+  /** Move the existing destination in place, retaining its ID and policies across retries. */
+  async #reconcileAddress(props: NotificationsProps, installation: Installation): Promise<void> {
+    const webhookUrl = `${notificationWebhookBaseUrl(configuredNotificationBaseUrl(this.env))}/webhooks/${props.userObjectId}/${props.accountId}`;
+    // Older installations may not have recorded their URL. Their known destination ID is authoritative.
+    if (this.ctx.storage.kv.get("webhookUrl") === webhookUrl && !this.ctx.storage.kv.get("addressMigration")) return;
+    let migration = this.ctx.storage.kv.get<AddressMigration>("addressMigration");
+    if (!migration) {
+      const apiKey = generateWebhookApiKey();
+      migration = { apiKey, authHash: await hashWebhookApiKey(apiKey), webhookUrl };
+      // Retain the pending secret only until success so a lost PUT response can be retried exactly.
+      this.ctx.storage.kv.put("addressMigration", migration);
+    }
+    await updateNotificationDestination(await this.#token(props), props.accountId,
+      installation.webhookId, migration.webhookUrl, migration.apiKey);
+    installation.authHash = migration.authHash;
+    this.ctx.storage.kv.put("installation", installation);
+    this.ctx.storage.kv.put("webhookUrl", migration.webhookUrl);
+    this.ctx.storage.kv.delete("addressMigration");
+    if (migration.webhookUrl !== webhookUrl) await this.#reconcileAddress(props, installation);
   }
 
   async enable(props: HookProps, initiator: Fetcher<HookInitiator<HookTarget>>): Promise<void> {
@@ -340,10 +326,12 @@ export class CloudflareNotificationReceiver extends DurableObject<NotificationEn
         throw new Error("This notification connection has been disconnected.");
       const installation = this.ctx.storage.kv.get<Installation>("installation");
       if (!installation) throw new Error("Notification destination setup is incomplete.");
+      await this.#reconcileAddress(props, installation);
+      this.#ensureReceipts();
       const policyKey = `policy:${props.alertType}`;
       const priorPolicy = this.ctx.storage.kv.get<PolicyIntent>(policyKey);
-      if (!priorPolicy) this.ctx.storage.kv.put<PolicyIntent>(policyKey, { alertType: props.alertType });
-      if (!priorPolicy?.policyId || priorPolicy.needsReconcile) {
+      if (props.createPolicy !== false && !priorPolicy) this.ctx.storage.kv.put<PolicyIntent>(policyKey, { alertType: props.alertType });
+      if (props.createPolicy !== false && (!priorPolicy?.policyId || priorPolicy.needsReconcile)) {
         const policy = await provisionNotificationPolicy(
           await this.#token(props), props.accountId, installation.webhookId,
           props.alertType, props.userObjectId,
@@ -359,7 +347,6 @@ export class CloudflareNotificationReceiver extends DurableObject<NotificationEn
       // A connection-removal disable is best-effort and never retried by the Workshop, and an
       // interrupted enable leaves an intent with no hook; retry either here rather than leak it.
       for (const [, policy] of this.#policies()) {
-        if (policy.alertType === props.alertType) continue;
         await this.#removeUnusedPolicy(policy.alertType).catch((error: unknown) =>
           logger.warn("orphaned notification policy cleanup failed", {
             event: "notification.policy.cleanup.failed",
@@ -381,6 +368,7 @@ export class CloudflareNotificationReceiver extends DurableObject<NotificationEn
       await Promise.allSettled([...this.#inFlight]
         .filter(([deliveryKey]) => deliveryKey.endsWith(`:${hookId}`))
         .map(([, delivery]) => delivery));
+      this.#ensureReceipts();
       this.ctx.storage.sql.exec("DELETE FROM notification_receipts WHERE hook_id = ?", hookId);
       await this.#removeUnusedPolicy(alertType);
     });
@@ -392,7 +380,7 @@ export class CloudflareNotificationReceiver extends DurableObject<NotificationEn
     const policy = this.ctx.storage.kv.get<PolicyIntent>(policyKey);
     if (!policy) return;
     const hooks = this.#hooks();
-    const stillUsed = hooks.some((hook) => hook.props.alertType === alertType);
+    const stillUsed = hooks.some((hook) => hook.props.alertType === alertType && hook.props.createPolicy !== false);
     for (const hook of hooks) disposeHook(hook);
     if (stillUsed) return;
     const owner = this.ctx.storage.kv.get<NotificationsProps>("owner");
@@ -436,13 +424,13 @@ export class CloudflareNotificationReceiver extends DurableObject<NotificationEn
           skip(error);
         }
       }
-      await registry(this.ctx, owner).remove(notificationReceiverName(owner.userObjectId, owner.accountId));
     }
     // Keep a tombstone so outstanding controller capabilities cannot resurrect this receiver.
     for (const [key, value] of this.ctx.storage.kv.list()) {
       if (key !== "suspended") this.ctx.storage.kv.delete(key);
       if (key.startsWith("hook:")) disposeHook(value as StoredHook);
     }
+    this.#ensureReceipts();
     this.ctx.storage.sql.exec("DELETE FROM notification_receipts");
   }
 
@@ -474,14 +462,18 @@ export class CloudflareNotificationReceiver extends DurableObject<NotificationEn
     };
   }
 
-  async receiveWebhook(apiKey: string, contentType: string, body: string): Promise<number> {
+  async receiveWebhook(apiKey: string, contentType: string, body: string, requestPath?: string): Promise<number> {
     if (contentType.split(";")[0]?.trim().toLowerCase() !== "application/json") return 415;
     if (new TextEncoder().encode(body).byteLength > MAX_NOTIFICATION_BODY_BYTES) return 413;
     if (this.ctx.storage.kv.get("suspended")) return 410;
     const installation = this.ctx.storage.kv.get<Installation>("installation");
-    const expectedHash =
-      this.ctx.storage.kv.get<string>("pendingAuthHash") ?? installation?.authHash;
-    if (!expectedHash || !(await matchesWebhookApiKey(apiKey, expectedHash))) return 401;
+    const migration = this.ctx.storage.kv.get<AddressMigration>("addressMigration");
+    const hashes = [this.ctx.storage.kv.get<string>("pendingAuthHash"), installation?.authHash, migration?.authHash];
+    if (!(await Promise.all(hashes.map(hash => hash ? matchesWebhookApiKey(apiKey, hash) : false))).some(Boolean)) return 401;
+    if (requestPath) {
+      const urls = [this.ctx.storage.kv.get<string>("webhookUrl"), migration?.webhookUrl];
+      if (!urls.some(url => url && new URL(url).pathname === requestPath)) return 404;
+    }
     let notification: CloudflareNotification;
     try {
       if (isWebhookTest(JSON.parse(body))) {
@@ -496,28 +488,18 @@ export class CloudflareNotificationReceiver extends DurableObject<NotificationEn
     if (!(await this.#hasCredentials(installation!))) return 500;
     // Recheck after hashing yielded: a concurrent disconnect must win over new delivery.
     if (this.ctx.storage.kv.get("suspended")) return 410;
+    this.#ensureReceipts();
     this.ctx.storage.sql.exec(
       "DELETE FROM notification_receipts WHERE delivered_at < ?",
       Date.now() - RETENTION_MS,
     );
     const available = this.#hooks();
-    if (!notification.alertType && !notification.policyId && available.length) {
+    if (!notification.alertType && available.length) {
       for (const hook of available) disposeHook(hook);
-      // The policy cannot be identified, so acknowledging would permanently lose the alert.
+      // Without an alert type, acknowledging would permanently lose the alert.
       return 500;
     }
-    const hooks = available.filter(({ props }) => {
-      const policy = this.ctx.storage.kv.get<PolicyIntent>(`policy:${props.alertType}`);
-      if (notification.alertType && notification.alertType !== props.alertType) return false;
-      // Workers Issues sends manual and automatic notifications through the policy it
-      // creates for our destination, not the policy created for this subscription.
-      // The authenticated webhook is already scoped to this Cloudflare account.
-      if (props.alertType === "workers_observability_real_time_issue" &&
-          notification.alertType === props.alertType) return true;
-      if (notification.policyId && policy?.policyId)
-        return sameResourceId(notification.policyId, policy.policyId);
-      return notification.alertType === props.alertType;
-    });
+    const hooks = available.filter(({ props }) => notification.alertType === props.alertType);
     for (const hook of available) if (!hooks.includes(hook)) disposeHook(hook);
     if (!hooks.length) {
       logger.info("notification matched no enabled hook", {

@@ -546,6 +546,8 @@ export interface CloudflareNotificationSubscription {
   /** Use an alert type available to the connected Cloudflare account. Alert types that require
    * policy filters (for example, specific zones or health checks) are not supported yet. */
   alertType: string;
+  /** Create or share a managed policy (default true). Set false to use an existing policy or Send to. */
+  createPolicy?: boolean;
 }
 
 /** Persistent notification callback implemented by a workspace or Gadget. */
@@ -577,7 +579,8 @@ export interface CloudflareNotificationStatus {
 export interface CloudflareNotificationsSession {
   /**
    * Subscribe a persistent callback created with ctx.restore(). Choose one Cloudflare alert type;
-   * enabling the hook creates or shares its policy; the last disable removes it. A regular
+   * receive every alert of that type reaching the destination. By default enabling creates or
+   * shares a managed policy; its last managed subscriber disabling removes it. A regular
    * session-bound RpcStub cannot receive notifications after its session ends.
    */
   subscribe(callback: RpcStub<CloudflareNotificationHook>, subscription: CloudflareNotificationSubscription): Promise<void>;

@@ -227,3 +227,11 @@ export async function removeNotificationPolicy(
   if (known) policyIds.add(id(known.policyId));
   for (const policyId of policyIds) await request(token, `${root}/${policyId}`, "DELETE");
 }
+
+/** Update the owned destination in place so its policies keep the same webhook ID. */
+export async function updateNotificationDestination(
+  token: string, accountId: string, webhookId: string, webhookUrl: string, apiKey: string,
+): Promise<void> {
+  await request(token, `/accounts/${assertCloudflareAccountId(accountId)}/alerting/v3/destinations/webhooks/${id(webhookId)}`,
+    "PUT", { name: "Cloudflare OS", type: "generic", url: webhookUrl, secret: apiKey });
+}

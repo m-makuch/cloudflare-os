@@ -19,7 +19,7 @@ beforeEach(async () => {
   await setGadgetBehavior();
 });
 afterEach(() => vi.unstubAllGlobals());
-async function setup(name: string, alertType = "test_alert", hookId = "hook-1", seedPolicy = true) {
+async function setup(name: string, alertType = "test_alert", hookId = "hook-1", seedPolicy = true, createPolicy = true) {
   const account = env.USER_ACCOUNT.get(env.USER_ACCOUNT.idFromString(userObjectId));
   await runInDurableObject(account, (_instance, state) => {
     state.storage.kv.put("refreshToken", "test-refresh");
@@ -36,6 +36,7 @@ async function setup(name: string, alertType = "test_alert", hookId = "hook-1", 
       webhookId: "d".repeat(32),
     });
     state.storage.kv.put("setupComplete", true);
+    state.storage.kv.put("webhookUrl", `https://hooks.example/notifications/webhooks/${userObjectId}/${accountId}`);
     state.storage.kv.put("owner", { accountId, userObjectId });
     if (seedPolicy)
       state.storage.kv.put(`policy:${alertType}`, { alertType, policyId: "b".repeat(32) });
@@ -44,7 +45,7 @@ async function setup(name: string, alertType = "test_alert", hookId = "hook-1", 
     };
     // The narrow test initiator implements exactly the two methods the production receiver uses.
     await instance.enable(
-      { accountId, userObjectId, hookId, alertType },
+      { accountId, userObjectId, hookId, alertType, createPolicy },
       exports.NotificationTestHooks({ props: { hookId } }) as unknown as Parameters<
         typeof instance.enable
       >[1],
@@ -107,21 +108,13 @@ it("tests the destination, receives matching alerts once, and ignores other aler
   expect(await receivedAlerts()).toEqual(alerts);
 });
 
-it("delivers an authenticated notification with no optional account or alert type when its policy ID matches", async () => {
+it("retries policy-only alerts because routing requires an alert type", async () => {
   const stub = await setup("optional-fields");
-  expect(await sendAlert(stub, JSON.stringify({ policy_id: "b".repeat(32), ts: 1234567890, data: { signal: "degraded" } })))
-    .toBe(204);
-  const [alert] = await receivedAlerts();
-  expect(alert).toMatchObject({ accountId, data: { signal: "degraded" } });
-  expect(alert.alertType).toBeUndefined();
-  expect(await env.NOTIFICATION_TEST_HOOKS.readObservations()).toEqual([
-    expect.objectContaining({
-      title: "Cloudflare notification: not provided",
-    }),
-  ]);
+  expect(await sendAlert(stub, JSON.stringify({ policy_id: "b".repeat(32), ts: 1234567890, data: {} }))).toBe(500);
+  expect(await receivedAlerts()).toEqual([]);
 });
 
-it("matches the managed policy when the alert carries its ID as a dashed UUID", async () => {
+it("routes by alert type regardless of policy ID formatting", async () => {
   const stub = await setup("dashed-policy-id");
   // The API returns policy IDs without dashes; deliveries carry them dashed.
   const dashed = "BBBBBBBB-bbbb-bbbb-bbbb-bbbbbbbbbbbb";
@@ -133,14 +126,14 @@ it("matches the managed policy when the alert carries its ID as a dashed UUID", 
   expect(await receivedAlerts()).toEqual([expect.objectContaining({ policyId: dashed })]);
 });
 
-it("does not deliver an alert sent through another policy", async () => {
+it("delivers the same alert type sent through another policy", async () => {
   const stub = await setup("foreign-policy");
   const body = JSON.stringify({ ...JSON.parse(payload), policy_id: "e".repeat(32) });
 
   const status = await sendAlert(stub, body);
 
   expect(status).toBe(204);
-  expect(await receivedAlerts()).toEqual([]);
+  expect(await receivedAlerts()).toEqual([expect.objectContaining({ policyId: "e".repeat(32) })]);
 });
 
 it("delivers Real-Time Issues sent through the destination's policy", async () => {
@@ -175,11 +168,9 @@ it("rejects unauthenticated or invalid deliveries without invoking the Gadget", 
   expect(await receivedAlerts()).toEqual([]);
 });
 
-it("authenticates the routed webhook before admitting its body to a receiver", async () => {
+it("rejects unknown credentials without persisting receiver storage", async () => {
   const name = notificationReceiverName(userObjectId, accountId);
-  const registry = env.NOTIFICATION_REGISTRY.getByName(name.slice(0, 2));
   const stub = await setup(name);
-  await registry.register(name, await hashWebhookApiKey(secret));
   const url = `http://localhost/notifications/webhooks/${userObjectId}/${accountId}`;
   const send = (key: string, body: string) => SELF.fetch(url, {
     method: "POST",
@@ -195,8 +186,10 @@ it("authenticates the routed webhook before admitting its body to a receiver", a
   })).status).toBe(401);
   expect((await send(secret, payload)).status).toBe(204);
   expect(await receivedAlerts()).toHaveLength(1);
-  await registry.remove(name);
-  expect((await send(secret, payload)).status).toBe(401);
+  const unknown = env.NOTIFICATION_RECEIVER.getByName(notificationReceiverName("f".repeat(64), accountId));
+  expect(await runInDurableObject(unknown, (_instance, state) =>
+    state.storage.sql.exec("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'notification_receipts'").toArray())).toEqual([]);
+  expect(await runInDurableObject(unknown, (_instance, state) => [...state.storage.kv.list()])).toEqual([]);
   expect((await stub.getStatus()).installed).toBe(true);
 });
 
@@ -312,24 +305,14 @@ it("does not report interrupted setup as complete", async () => {
   expect(await stub.getStatus()).toMatchObject({ installed: false, webhookId: "d".repeat(32) });
 });
 
-// Revoke removes the credential under the owner's real receiver name, not the test DO's name.
-const ownerReceiverName = notificationReceiverName(userObjectId, accountId);
-async function registerCredential() {
-  const registry = env.NOTIFICATION_REGISTRY.getByName(ownerReceiverName.slice(0, 2));
-  await registry.register(ownerReceiverName, await hashWebhookApiKey(secret));
-  return registry;
-}
-
 it("completes disconnect locally when the grant can no longer manage the account", async () => {
   for (const [label, token] of [["denied", "test-access"], ["expired", null]] as const) {
     const name = `revoke-${label}`;
     const stub = await setup(name);
-    const registry = await registerCredential();
     const fetch = vi.fn(async () => new Response("{}", { status: 403 }));
     vi.stubGlobal("fetch", fetch);
     await stub.revokeWithToken(token);
     if (token === null) expect(fetch).not.toHaveBeenCalled();
-    expect(await registry.authorize(ownerReceiverName, secret)).toBe(false);
     expect(await stub.getStatus()).toMatchObject({ suspended: true, installed: false, subscribers: 0 });
     expect(await sendAlert(stub)).toBe(410);
   }
@@ -338,12 +321,9 @@ it("completes disconnect locally when the grant can no longer manage the account
 it("keeps state for retry when disconnect cleanup fails transiently", async () => {
   const name = "revoke-transient";
   const stub = await setup(name);
-  const registry = await registerCredential();
   vi.stubGlobal("fetch", vi.fn(async () => new Response("{}", { status: 503 })));
   const error = await stub.revokeWithToken("test-access").then(() => undefined, (caught: Error) => caught);
   expect(error?.message).toContain("HTTP 503");
-  expect(await registry.authorize(ownerReceiverName, secret)).toBe(true);
-  await registry.remove(ownerReceiverName);
   expect(await stub.getStatus()).toMatchObject({
     suspended: true,
     policies: [{ alertType: "test_alert", policyId: "b".repeat(32) }],
@@ -365,4 +345,60 @@ it("retries an orphaned policy's removal when another hook is enabled", async ()
   expect((await stub.getStatus()).policies).toEqual([
     { alertType: "test_alert", policyId: "b".repeat(32) },
   ]);
+});
+
+it("uses an existing destination without creating a policy and routes its alerts", async () => {
+  const fetch = vi.fn(async () => { throw new Error("No provider calls expected"); });
+  vi.stubGlobal("fetch", fetch);
+  const stub = await setup("external-policy", "test_alert", "hook-1", false, false);
+  expect(fetch).not.toHaveBeenCalled();
+  expect((await stub.getStatus()).policies).toEqual([]);
+  expect(await sendAlert(stub)).toBe(204);
+  expect(await receivedAlerts()).toHaveLength(1);
+  await stub.disable("hook-1", "test_alert");
+  expect(fetch).not.toHaveBeenCalled();
+});
+
+it("removes a managed policy when only external-policy subscribers remain", async () => {
+  vi.stubGlobal("fetch", vi.fn(async () => Response.json({ success: true, result: [] })));
+  const stub = await setup("mixed-policy");
+  await setup("mixed-policy", "test_alert", "hook-2", false, false);
+  await stub.disable("hook-1", "test_alert");
+  expect((await stub.getStatus()).policies).toEqual([]);
+  expect(await sendAlert(stub)).toBe(204);
+  expect(await receivedAlerts()).toEqual([expect.objectContaining({ subscriber: "hook-2" })]);
+});
+
+it("retries an interrupted address migration in place with the same pending secret", async () => {
+  const stub = await setup(notificationReceiverName(userObjectId, accountId));
+  await runInDurableObject(stub, (_instance, state) =>
+    state.storage.kv.put("webhookUrl", `https://hooks.example/old/webhooks/${userObjectId}/${accountId}`));
+  const oldPath = `/old/webhooks/${userObjectId}/${accountId}`;
+  expect((await SELF.fetch(`https://hooks.example${oldPath}`, {
+    method: "POST", headers: { "cf-webhook-auth": secret, "content-type": "application/json" }, body: payload,
+  })).status).toBe(204);
+  expect(await stub.receiveWebhook(secret, "application/json", payload, `/unrelated/webhooks/${userObjectId}/${accountId}`)).toBe(404);
+  const calls: { url: string; method?: string; body: { url: string; secret: string } }[] = [];
+  vi.stubGlobal("fetch", vi.fn(async (url: string, init: RequestInit) => {
+    calls.push({ url, method: init.method, body: JSON.parse(init.body as string) });
+    if (calls.length === 1) throw new Error("Lost update response");
+    return Response.json({ success: true, result: { id: "d".repeat(32) } });
+  }));
+  const enable = () => runInDurableObject(stub, async (instance, state) => {
+    const exports = state.exports as unknown as { NotificationTestHooks(options: object): Fetcher<NotificationTestHooks> };
+    await instance.enable({ accountId, userObjectId, hookId: "hook-2", alertType: "test_alert" },
+      exports.NotificationTestHooks({ props: { hookId: "hook-2" } }) as unknown as Parameters<typeof instance.enable>[1]);
+  });
+  await expect(enable()).rejects.toThrow("Lost update response");
+  expect(await sendAlert(stub)).toBe(204);
+  expect(await stub.receiveWebhook(calls[0]!.body.secret, "application/json", payload)).toBe(204);
+  await enable();
+  expect(calls).toHaveLength(2);
+  expect(calls[1]).toEqual(calls[0]);
+  expect(calls[0]!.url).toMatch(/destinations\/webhooks\/dddddddddddddddddddddddddddddddd$/);
+  expect(calls[0]!.method).toBe("PUT");
+  expect(await stub.receiveWebhook(calls[0]!.body.secret, "application/json", payload)).toBe(204);
+  expect(await sendAlert(stub)).toBe(401);
+  expect(await runInDurableObject(stub, (_instance, state) => state.storage.kv.get("addressMigration"))).toBeUndefined();
+  expect((await stub.getStatus()).webhookId).toBe("d".repeat(32));
 });

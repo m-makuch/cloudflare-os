@@ -123,7 +123,7 @@ export class TestHooks extends DurableObject<Env> {
 }
 // Export notification classes directly so the Workers test runner can discover them for ctx.exports.
 export { CloudflareNotificationReceiver, CloudflareNotificationsGatekeeper,
-  CloudflareNotificationHookController, CloudflareNotificationRegistry } from "../src/notifications.js";
+  CloudflareNotificationHookController } from "../src/notifications.js";
 
 const notificationEvents: string[] = [];
 const notificationObservations: ObservationDescription[] = [];

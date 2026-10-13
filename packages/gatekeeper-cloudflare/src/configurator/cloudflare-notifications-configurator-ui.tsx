@@ -73,10 +73,10 @@ export default {
             Details
           </summary>
           <p className="field-description" style={{ marginTop: "8px" }}>
-            Each hook subscribes to one alert type. Enabling the first hook for a type creates the
-            Cloudflare OS webhook destination and a managed notification policy for that type;
-            disabling the last one removes the policy. Alerts from other policies are ignored, even
-            if they use this webhook. Notifications Write access is required.
+            Each hook receives every alert of its type reaching this connection’s webhook destination.
+            By default, enabling a hook creates or shares a managed policy; disabling its last
+            managed subscriber removes that policy. A hook can also use an existing policy or
+            Cloudflare Send to without creating another policy. Notifications Write access is required.
           </p>
           {values.statusDetails && (
             <p className="field-description" style={{ overflowWrap: "anywhere" }}>
