@@ -67,8 +67,7 @@
         {
           "new_sqlite_classes": [
             "CloudflareNotificationsGatekeeper",
-            "CloudflareNotificationReceiver",
-            "CloudflareNotificationRegistry"
+            "CloudflareNotificationReceiver"
           ],
           "tag": "v2"
         }

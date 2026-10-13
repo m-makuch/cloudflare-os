@@ -25,7 +25,6 @@ export default defineConfig({
           NOTIFICATIONS_WEBHOOK_BASE_URL: "https://hooks.example/notifications" },
         serviceBindings: { NOTIFICATION_TEST_HOOKS: { name: kCurrentWorker, entrypoint: "NotificationTestHooks" } },
         durableObjects: {
-          NOTIFICATION_REGISTRY: { className: "CloudflareNotificationRegistry", useSQLite: true },
           NOTIFICATION_RECEIVER: { className: "CloudflareNotificationReceiver", useSQLite: true },
           USER_ACCOUNT: { className: "UserAccount", useSQLite: true },
           OBSERVABILITY_GATEKEEPER: {
