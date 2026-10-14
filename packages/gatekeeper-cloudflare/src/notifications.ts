@@ -1,3 +1,4 @@
+import { notificationPolicyKey, validateNotificationSubscription } from "./notification-policy.js";
 import { DurableObject, RpcStub, RpcTarget, WorkerEntrypoint } from "cloudflare:workers";
 import { validateRpc } from "capnweb-validate";
 import type {
@@ -43,6 +44,7 @@ import type {
   CloudflareNotificationsSession,
   CloudflareNotificationSubscription,
   CloudflareNotificationStatus,
+  CloudflareNotificationPolicySettings,
 } from "./types.js";
 import { VENDOR_ID } from "./vendor.js";
 import TYPES_CODE from "./types.txt";
@@ -64,11 +66,11 @@ type NotificationEnv = Cloudflare.Env & {
 };
 type HookTarget = RpcTarget & CloudflareNotificationHook;
 type NotificationsProps = { userObjectId: string; accountId: string };
-type HookProps = NotificationsProps & { hookId: string; alertType: string; createPolicy?: boolean };
+type HookProps = NotificationsProps & { hookId: string; alertType: string; createPolicy?: boolean; policy?: CloudflareNotificationPolicySettings; policyKey?: string };
 type StoredHook = { props: HookProps; initiator: Fetcher<HookInitiator<HookTarget>> };
 type Installation = NotificationInstallation & NotificationsProps & { authHash: string };
 type AddressMigration = { apiKey: string; authHash: string; webhookUrl: string };
-type PolicyIntent = Partial<NotificationPolicy> & { alertType: string; needsReconcile?: boolean };
+type PolicyIntent = Partial<NotificationPolicy> & { alertType: string; policy?: CloudflareNotificationPolicySettings; needsReconcile?: boolean };
 
 function disposeHook(hook: StoredHook | undefined): void {
   (hook?.initiator as (Fetcher<HookInitiator<HookTarget>> & Partial<Disposable>) | undefined)
@@ -116,14 +118,13 @@ class CloudflareNotificationsSessionImpl
     callback: RpcStub<HookTarget>,
     subscription: CloudflareNotificationSubscription,
   ): Promise<void> {
-    if (!subscription || typeof subscription.alertType !== "string" ||
-      !/^[a-z][a-z0-9_]{0,99}$/.test(subscription.alertType))
-      throw new Error("Choose one valid Cloudflare alert type for this hook.");
+    const policy = validateNotificationSubscription(subscription);
     const props: HookProps = {
       ...this.#ctx.props,
       hookId: crypto.randomUUID(),
       alertType: subscription.alertType,
       createPolicy: subscription.createPolicy ?? true,
+      ...(Object.keys(policy).length ? { policy } : {}),
     };
     const controller = this.#ctx.exports.CloudflareNotificationHookController({ props });
     await this.#queue.bindHook(
@@ -132,9 +133,9 @@ class CloudflareNotificationsSessionImpl
       callback,
       {
         title: `Cloudflare ${props.alertType} alerts for ${props.accountId}`,
-        description: `Receive every ${props.alertType} alert reaching this connection in account ${props.accountId}. ` +
-          (props.createPolicy ? "Create or share a managed policy and remove it when its last subscriber is disabled." :
-            "Use an existing policy or Cloudflare Send to destination; do not create a managed policy."),
+        description: `Receive ${props.alertType} alerts in account ${props.accountId}. ` +
+          (props.createPolicy ? `Create or share an enabled managed policy using this connection's webhook. Receive only that policy's alerts; remove it when its last subscriber is disabled.\n\nExact policy settings (JSON):\n\n${JSON.stringify(policy, null, 2).split("\n").map(line => `    ${line}`).join("\n")}` :
+            "Receive every alert of this type from existing policies or Cloudflare Send to destination; do not create a managed policy."),
       },
     );
   }
@@ -305,6 +306,7 @@ export class CloudflareNotificationReceiver extends DurableObject<NotificationEn
 
   async enable(props: HookProps, initiator: Fetcher<HookInitiator<HookTarget>>): Promise<void> {
     await this.#mutations.run(async () => {
+      validateNotificationSubscription({ alertType: props.alertType, createPolicy: props.createPolicy, policy: props.policy });
       const owner = this.ctx.storage.kv.get<NotificationsProps>("owner");
       if (owner && (owner.accountId !== props.accountId || owner.userObjectId !== props.userObjectId))
         throw new Error("Notification receiver belongs to another account.");
@@ -328,15 +330,16 @@ export class CloudflareNotificationReceiver extends DurableObject<NotificationEn
       if (!installation) throw new Error("Notification destination setup is incomplete.");
       await this.#reconcileAddress(props, installation);
       this.#ensureReceipts();
-      const policyKey = `policy:${props.alertType}`;
+      const policyKey = await notificationPolicyKey(props.alertType, props.policy);
+      props = { ...props, policyKey };
       const priorPolicy = this.ctx.storage.kv.get<PolicyIntent>(policyKey);
-      if (props.createPolicy !== false && !priorPolicy) this.ctx.storage.kv.put<PolicyIntent>(policyKey, { alertType: props.alertType });
+      if (props.createPolicy !== false && !priorPolicy) this.ctx.storage.kv.put<PolicyIntent>(policyKey, { alertType: props.alertType, policy: props.policy });
       if (props.createPolicy !== false && (!priorPolicy?.policyId || priorPolicy.needsReconcile)) {
         const policy = await provisionNotificationPolicy(
           await this.#token(props), props.accountId, installation.webhookId,
-          props.alertType, props.userObjectId,
+          props.alertType, props.userObjectId, props.policy,
         );
-        this.ctx.storage.kv.put<PolicyIntent>(policyKey, { alertType: props.alertType, ...policy });
+        this.ctx.storage.kv.put<PolicyIntent>(policyKey, { alertType: props.alertType, policy: props.policy, ...policy });
       }
       const replaced = this.ctx.storage.kv.get<StoredHook>(key);
       try {
@@ -346,8 +349,8 @@ export class CloudflareNotificationReceiver extends DurableObject<NotificationEn
       }
       // A connection-removal disable is best-effort and never retried by the Workshop, and an
       // interrupted enable leaves an intent with no hook; retry either here rather than leak it.
-      for (const [, policy] of this.#policies()) {
-        await this.#removeUnusedPolicy(policy.alertType).catch((error: unknown) =>
+      for (const [policyKey] of this.#policies()) {
+        await this.#removeUnusedPolicy(policyKey).catch((error: unknown) =>
           logger.warn("orphaned notification policy cleanup failed", {
             event: "notification.policy.cleanup.failed",
             accountId: props.accountId,
@@ -370,17 +373,18 @@ export class CloudflareNotificationReceiver extends DurableObject<NotificationEn
         .map(([, delivery]) => delivery));
       this.#ensureReceipts();
       this.ctx.storage.sql.exec("DELETE FROM notification_receipts WHERE hook_id = ?", hookId);
-      await this.#removeUnusedPolicy(alertType);
+      for (const [policyKey, policy] of this.#policies()) {
+        if (policy.alertType === alertType) await this.#removeUnusedPolicy(policyKey);
+      }
     });
   }
 
-  /** Delete the managed policy for an alert type once no hook uses it. Callers hold #mutations. */
-  async #removeUnusedPolicy(alertType: string): Promise<void> {
-    const policyKey = `policy:${alertType}`;
+  /** Delete a managed configuration once no hook uses it. Callers hold #mutations. */
+  async #removeUnusedPolicy(policyKey: string): Promise<void> {
     const policy = this.ctx.storage.kv.get<PolicyIntent>(policyKey);
     if (!policy) return;
     const hooks = this.#hooks();
-    const stillUsed = hooks.some((hook) => hook.props.alertType === alertType && hook.props.createPolicy !== false);
+    const stillUsed = hooks.some((hook) => (hook.props.policyKey ?? `policy:${hook.props.alertType}`) === policyKey && hook.props.createPolicy !== false);
     for (const hook of hooks) disposeHook(hook);
     if (stillUsed) return;
     const owner = this.ctx.storage.kv.get<NotificationsProps>("owner");
@@ -389,8 +393,8 @@ export class CloudflareNotificationReceiver extends DurableObject<NotificationEn
     if (!installation) throw new Error("Notification destination is missing.");
     this.ctx.storage.kv.put<PolicyIntent>(policyKey, { ...policy, needsReconcile: true });
     await removeNotificationPolicy(await this.#token(owner), owner.accountId,
-      owner.userObjectId, alertType, installation.webhookId,
-      policy.policyId ? { policyId: policy.policyId } : undefined);
+      owner.userObjectId, policy.alertType, installation.webhookId,
+      policy.policyId ? { policyId: policy.policyId } : undefined, policy.policy);
     this.ctx.storage.kv.delete(policyKey);
   }
   async suspend(): Promise<void> {
@@ -440,8 +444,8 @@ export class CloudflareNotificationReceiver extends DurableObject<NotificationEn
     for (const [key, policy] of this.#policies()) {
       if (!installation) throw new Error("Notification destination is missing.");
       await removeNotificationPolicy(token, owner.accountId, owner.userObjectId,
-        key.slice("policy:".length), installation.webhookId,
-        policy.policyId ? { policyId: policy.policyId } : undefined);
+        policy.alertType, installation.webhookId,
+        policy.policyId ? { policyId: policy.policyId } : undefined, policy.policy);
       this.ctx.storage.kv.delete(key);
     }
     if (webhookUrl)
@@ -455,7 +459,7 @@ export class CloudflareNotificationReceiver extends DurableObject<NotificationEn
       suspended: !!this.ctx.storage.kv.get("suspended"),
       webhookId: installation?.webhookId,
       policies: this.#policies().filter(([, policy]) => policy.policyId)
-        .map(([, policy]) => ({ alertType: policy.alertType, policyId: policy.policyId! })),
+        .map(([, policy]) => ({ alertType: policy.alertType, policyId: policy.policyId!, ...(policy.policy && Object.keys(policy.policy).length ? { policy: policy.policy } : {}) })),
       subscribers: this.#hookCount(),
       lastTestAt: this.ctx.storage.kv.get<string>("lastTestAt"),
       lastReceivedAt: this.ctx.storage.kv.get<string>("lastReceivedAt"),
@@ -494,12 +498,21 @@ export class CloudflareNotificationReceiver extends DurableObject<NotificationEn
       Date.now() - RETENTION_MS,
     );
     const available = this.#hooks();
-    if (!notification.alertType && available.length) {
+    const normalizedId = (id: string | undefined) => id?.replaceAll("-", "").toLowerCase();
+    // Historical hooks have no settings: resolve their existing alert-type-only policy in place.
+    // Never fall back to type routing for a managed hook, even during incomplete provisioning.
+    const missingRouting = available.some(({ props }) => props.createPolicy === false
+      ? !notification.alertType : !notification.policyId);
+    if (missingRouting) {
       for (const hook of available) disposeHook(hook);
-      // Without an alert type, acknowledging would permanently lose the alert.
       return 500;
     }
-    const hooks = available.filter(({ props }) => notification.alertType === props.alertType);
+    const hooks = available.filter(({ props }) => {
+      if (props.createPolicy === false) return notification.alertType === props.alertType;
+      const policy = this.ctx.storage.kv.get<PolicyIntent>(props.policyKey ?? `policy:${props.alertType}`);
+      return policy?.policyId !== undefined && normalizedId(notification.policyId) === normalizedId(policy.policyId) &&
+        (notification.alertType === undefined || notification.alertType === props.alertType);
+    });
     for (const hook of available) if (!hooks.includes(hook)) disposeHook(hook);
     if (!hooks.length) {
       logger.info("notification matched no enabled hook", {
