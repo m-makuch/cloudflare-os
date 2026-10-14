@@ -65,18 +65,6 @@ export default {
             {values.status}
           </p>
         )}
-        {values.accountId && (
-          <p className="field-description" style={{ margin: "0" }}>
-            <a
-              href={`https://dash.cloudflare.com/${encodeURIComponent(values.accountId)}/notifications`}
-              target="_blank"
-              rel="noopener noreferrer"
-              style={{ color: "inherit", textDecoration: "underline" }}
-            >
-              Configure policies in Cloudflare Dashboard
-            </a>
-          </p>
-        )}
         <p className="field-description" style={{ margin: "0" }}>
           After adding, enable a notification hook in Connections.
         </p>

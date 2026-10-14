@@ -430,7 +430,7 @@ export default function SandboxedResourceConfigurator({
         ref={iframeRef}
         srcDoc={frame.iframeHtml}
         onLoad={handleIframeLoad}
-        sandbox="allow-scripts allow-popups allow-popups-to-escape-sandbox"
+        sandbox="allow-scripts"
         title="Resource configurator"
         scrolling="no"
         style={{
