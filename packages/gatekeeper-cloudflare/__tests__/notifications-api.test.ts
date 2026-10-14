@@ -204,7 +204,7 @@ it("reports provider error codes without echoing provider messages", async () =>
   const error = await provisionNotificationPolicy("token", account, webhook, "test_alert", ownerId)
     .then(() => { throw new Error("expected provisioning to fail"); }, (caught: unknown) => caught as Error);
   expect(error.message).toContain("HTTP 400, codes 17000");
-  expect(error.message).toContain("require filters");
+  expect(error.message).toContain("supported filters");
   expect(error.message).not.toContain(ownerId);
   expect(isNotificationAccessDenied(error.cause)).toBe(false);
 });
@@ -217,4 +217,40 @@ it("classifies 401 and 403 as access denied, and other failures as retryable", a
     expect(error).toBeInstanceOf(NotificationsApiError);
     expect(isNotificationAccessDenied(error)).toBe(denied);
   }
+});
+
+
+it("sends exact approved settings and gives distinct configurations distinct ownership", async () => {
+  const settings = { alertInterval: "30m", filters: { product: ["workers"], limit: ["100"] } };
+  const calls = mock([[], { id: policy }]);
+  await provisionNotificationPolicy("token", account, webhook, "billing_usage_alert", ownerId, settings);
+  const body = JSON.parse(calls[1]!.init.body as string);
+  expect(body).toEqual({
+    name: "Cloudflare OS: billing_usage_alert", description: expect.stringMatching(new RegExp(`^Cloudflare OS managed v2 ${ownerId} [a-f0-9]{64}$`)),
+    alert_type: "billing_usage_alert", enabled: true, alert_interval: "30m",
+    filters: { limit: ["100"], product: ["workers"] }, mechanisms: { webhooks: [{ id: webhook }] },
+  });
+  const matching = { ...body, id: policy };
+  const retry = mock([[matching]]);
+  expect(await provisionNotificationPolicy("token", account, webhook, "billing_usage_alert", ownerId,
+    { filters: { limit: ["100"], product: ["workers"] }, alertInterval: "30m" })).toEqual({ policyId: policy });
+  expect(retry).toHaveLength(1);
+  const distinct = mock([[matching], { id: otherWebhook }]);
+  await provisionNotificationPolicy("token", account, webhook, "billing_usage_alert", ownerId,
+    { ...settings, filters: { ...settings.filters, limit: ["200"] } });
+  expect(JSON.parse(distinct[1]!.init.body as string).description).not.toBe(body.description);
+  const otherOwner = mock([[matching], { id: otherWebhook }]);
+  await provisionNotificationPolicy("token", account, webhook, "billing_usage_alert", "f".repeat(64), settings);
+  expect(JSON.parse(otherOwner[1]!.init.body as string).description).not.toBe(body.description);
+  mock([[{ ...matching, filters: { limit: ["200"], product: ["workers"] } }]]);
+  await expect(provisionNotificationPolicy("token", account, webhook, "billing_usage_alert", ownerId, settings)).rejects.toThrow("changed");
+  mock([[{ ...matching, mechanisms: { webhooks: [{ id: webhook }], email: [{ id: "other@example.com" }] } }]]);
+  await expect(provisionNotificationPolicy("token", account, webhook, "billing_usage_alert", ownerId, settings)).rejects.toThrow("changed");
+});
+
+it("rejects unsupported policy authority before making provider requests", async () => {
+  const calls = mock([]);
+  await expect(provisionNotificationPolicy("token", account, webhook, "test_alert", ownerId,
+    { enabled: false } as unknown as Parameters<typeof provisionNotificationPolicy>[5])).rejects.toThrow("Unsupported");
+  expect(calls).toEqual([]);
 });

@@ -1,3 +1,5 @@
+import { canonicalNotificationPolicy, notificationPolicyIdentity } from "./notification-policy.js";
+import type { CloudflareNotificationPolicySettings } from "./types.js";
 import { readTextCapped } from "@gadgets/gatekeeper-kit/response-body";
 import { assertCloudflareAccountId } from "./resources.js";
 
@@ -159,16 +161,26 @@ export async function removeNotificationConnection(
     await request(token, `${root}/destinations/webhooks/${webhookId}`, "DELETE");
 }
 
-function policyMarker(ownerId: string, alertType: string): string {
+async function policyMarker(ownerId: string, alertType: string, settings?: CloudflareNotificationPolicySettings): Promise<string> {
   if (!/^[a-f\d]{64}$/i.test(ownerId) || !/^[a-z][a-z0-9_]{0,99}$/.test(alertType))
     throw new Error("Invalid notification policy owner or alert type.");
-  return `Cloudflare OS managed ${ownerId} ${alertType}`;
+  const identity = await notificationPolicyIdentity(alertType, settings);
+  if (!identity) return `Cloudflare OS managed ${ownerId} ${alertType}`;
+  return `Cloudflare OS managed v2 ${ownerId} ${identity}`;
 }
 
 function policyWebhookIds(value: unknown): string[] {
   const mechanisms = object(value);
   if (!Array.isArray(mechanisms.webhooks)) return [];
   return mechanisms.webhooks.map((entry) => id(object(entry).id));
+}
+
+function hasOnlyPolicyDestination(value: unknown, destination: string): boolean {
+  const mechanisms = object(value);
+  const webhooks = policyWebhookIds(value);
+  return webhooks.length === 1 && webhooks[0] === destination &&
+    Object.entries(mechanisms).every(([key, entries]) => key === "webhooks" ||
+      (Array.isArray(entries) && entries.length === 0));
 }
 
 /** The marker survives an interrupted POST, so a retry can adopt only its own policy. */
@@ -178,15 +190,21 @@ export async function provisionNotificationPolicy(
   webhookId: string,
   alertType: string,
   ownerId: string,
+  settings?: CloudflareNotificationPolicySettings,
 ): Promise<NotificationPolicy> {
   const root = `/accounts/${assertCloudflareAccountId(accountId)}/alerting/v3/policies`;
   const destination = id(webhookId);
-  const description = policyMarker(ownerId, alertType);
+  const canonical = canonicalNotificationPolicy(settings);
+  const description = await policyMarker(ownerId, alertType, canonical);
   const matches = (await list(token, root)).filter((item) => item.description === description);
-  if (matches.length > 1) throw new Error("Multiple Cloudflare OS policies match this alert type.");
+  if (matches.length > 1) throw new Error("Multiple Cloudflare OS policies match this configuration.");
   if (matches[0]) {
     if (matches[0].alert_type !== alertType || matches[0].enabled !== true ||
-      !policyWebhookIds(matches[0].mechanisms).includes(destination))
+      JSON.stringify(canonicalNotificationPolicy({
+        alertInterval: matches[0].alert_interval as string | undefined,
+        filters: matches[0].filters as CloudflareNotificationPolicySettings["filters"],
+      })) !== JSON.stringify(canonical) ||
+      !hasOnlyPolicyDestination(matches[0].mechanisms, destination))
       throw new Error("The managed notification policy was changed in Cloudflare.");
     return { policyId: id(matches[0].id) };
   }
@@ -197,18 +215,20 @@ export async function provisionNotificationPolicy(
       description,
       alert_type: alertType,
       enabled: true,
+      ...(canonical.alertInterval === undefined ? {} : { alert_interval: canonical.alertInterval }),
+      ...(canonical.filters === undefined ? {} : { filters: canonical.filters }),
       mechanisms: { webhooks: [{ id: destination }] },
     }));
   } catch (error) {
     if (error instanceof NotificationsApiError && error.status === 400)
       throw new Error(`${error.message} Check that ${alertType} is available to this account; ` +
-        "alert types that require filters are not supported yet.", { cause: error });
+        "check the supported filters and re-alert interval for this alert type.", { cause: error });
     throw error;
   }
   return { policyId: id(policy.id) };
 }
 
-/** Remove only policies tagged for this connection and alert type, including a lost POST. */
+/** Remove only policies tagged for this connection and configuration, including a lost POST. */
 export async function removeNotificationPolicy(
   token: string,
   accountId: string,
@@ -216,9 +236,11 @@ export async function removeNotificationPolicy(
   alertType: string,
   webhookId: string,
   known?: NotificationPolicy,
+  settings?: CloudflareNotificationPolicySettings,
 ): Promise<void> {
   const root = `/accounts/${assertCloudflareAccountId(accountId)}/alerting/v3/policies`;
-  const description = policyMarker(ownerId, alertType);
+  const canonical = canonicalNotificationPolicy(settings);
+  const description = await policyMarker(ownerId, alertType, canonical);
   const destination = id(webhookId);
   const matches = (await list(token, root)).filter((item) =>
     item.description === description && item.alert_type === alertType &&

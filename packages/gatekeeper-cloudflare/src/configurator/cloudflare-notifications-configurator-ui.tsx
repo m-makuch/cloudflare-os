@@ -73,8 +73,9 @@ export default {
             Details
           </summary>
           <p className="field-description" style={{ marginTop: "8px" }}>
-            Each hook receives every alert of its type reaching this connection’s webhook destination.
-            By default, enabling a hook creates or shares a managed policy; disabling its last
+            Managed hooks receive their configured policy’s alerts; external hooks receive every alert of
+            their type reaching this connection’s webhook destination.
+            By default, enabling a hook creates or shares an identically configured managed policy; disabling its last
             managed subscriber removes that policy. A hook can also use an existing policy or
             Cloudflare Send to without creating another policy. Notifications Write access is required.
           </p>
