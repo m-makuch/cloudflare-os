@@ -23,6 +23,8 @@ import {
 } from '../features/native-app/DeviceSessionHandoff'
 import { NativeAppBridge } from '../features/native-app/NativeAppBridge'
 import { PageUpdateNotice } from '../features/stale-session/PageUpdateNotice'
+import { WorkersIssueSetupPage } from '../features/workers-issues/WorkersIssueSetupPage'
+import { parseWorkersIssueSetup, type WorkersIssueSetupRequest } from '../features/workers-issues/workersIssueSetup'
 
 export const Route = createRootRoute({
   component: RootComponent,
@@ -34,6 +36,8 @@ function RootComponent() {
   const { isAuthenticated, authenticatedApi, isLoading, error, logout, login } = useAuth(rpcStub)
   const pathname = useRouterState({ select: (s) => s.location.pathname })
   const workspace = useMatch({ from: '/workspace/$id', shouldThrow: false })
+  const search = useRouterState({ select: (s) => s.location.searchStr })
+  const workersIssueSetup = parseWorkersIssueSetup(search)
 
   // Routes that don't require auth (public routes)
   const isSignup = pathname === '/signup'
@@ -139,6 +143,7 @@ function RootComponent() {
               <AuthenticatedShell
                 authenticatedApi={authenticatedApi}
                 isWorkspaceEditor={isWorkspaceEditor}
+                workersIssueSetup={workersIssueSetup}
               />
             </UnreadStateBridge>
           </Toasty>
@@ -156,9 +161,11 @@ function RootComponent() {
 function AuthenticatedShell({
   authenticatedApi,
   isWorkspaceEditor,
+  workersIssueSetup,
 }: {
   authenticatedApi: RpcStub<AuthenticatedApi>
   isWorkspaceEditor: boolean
+  workersIssueSetup: WorkersIssueSetupRequest | null
 }) {
   // null = still checking, true = needs onboarding, false = onboarding done
   const [onboardingNeeded, setOnboardingNeeded] = useState<boolean | null>(null)
@@ -188,6 +195,8 @@ function AuthenticatedShell({
   if (onboardingNeeded) {
     return <OnboardingWizard onComplete={() => setOnboardingNeeded(false)} />
   }
+
+  if (workersIssueSetup) return <WorkersIssueSetupPage key={workersIssueSetup.state} request={workersIssueSetup} />
 
   // Normal app shell. The workspace editor is rendered fullscreen (no chrome); everything else
   // gets the persistent left-rail AppShell. Connection loss is surfaced by a chip in whichever of
