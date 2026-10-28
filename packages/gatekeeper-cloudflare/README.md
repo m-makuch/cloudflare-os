@@ -268,11 +268,19 @@ interrupted update exactly, accepting both the old and pending credentials until
 Enabling a hook reconciles a changed base URL by updating the existing destination in place,
 preserving its ID and policies. The receiver accepts its stored old path during migration; both
 origins must still route to this Worker for uninterrupted delivery during a hostname change.
+Hook enablement also reads the owned destination live, even when its configured address is unchanged.
+Only an explicit HTTP 404 is treated as provider deletion: setup is invalidated and exact-URL
+provisioning recreates or recovers the destination, rotates its secret, and retains subscribers.
+Managed policy intents are marked for reconciliation when their hooks are enabled again. External
+policies are not rewritten. Authorization failures, transient provider errors, and malformed lookup
+responses fail enablement without creating a replacement. A lost creation response can be recovered
+on retry or after restart without duplicating the destination.
 Provider requests are fixed-origin, bounded,
 time-limited, and do not follow redirects.
 
 A successful event returns **204 after all matching subscribers accept it**. Callback or authorization
-failure returns **500**, allowing ANS to retry. There is no local delivery queue, retry loop, or alarm.
+failure returns **500**, allowing ANS to retry. There is no local notification-delivery queue,
+retry loop, or alarm; the receiver's alarm is only for provider-policy cleanup.
 Callbacks should accept events promptly, for example by creating an agent task; long-running work and
 errors after that handoff belong to the consumer. The gatekeeper waits for the real callback result
 instead of racing it against a timer that could allow overlapping retries.
@@ -290,9 +298,14 @@ Like Workers Observability reads, these observations are not marked as restricte
 permanently stop the workspace from taking actions, so an alert could never lead to a pushed fix.
 Notifications bindings are private to their owner. Disabling a hook
 stops future handoffs and removes the managed policy when no other managed-policy hook uses its configuration. The shared
-webhook remains for other policies. If that removal fails, the next hook enabled on the connection
-retries it. Disconnecting Cloudflare stops ingress and delivery, then removes this connection's
-provider resources. Transient cleanup failures retain credentials for retry. If the grant has expired
+webhook remains for other policies. Before removing a hook or attempting policy creation/deletion,
+the receiver arms a durable cleanup alarm. Unused policy intents survive failures and restarts;
+cleanup retries after one minute, with exponential backoff capped at one hour. Each retry shares
+the enable/disable mutation lock and rechecks current subscribers, so it cannot delete a policy
+needed by a re-enabled hook. Successful cleanup clears the alarm. Enabling another hook also
+reconciles unused policies, but is not required to recover. Disconnecting Cloudflare cancels this
+alarm, stops ingress and delivery, then removes this connection's provider resources.
+Transient disconnect-cleanup failures retain credentials for retry. If the grant has expired
 or no longer has access to the account, provider resources cannot be removed, so disconnect completes
 locally and logs `notification.revoke.cleanup.skipped`; delete the `Cloudflare OS` destination and
 policies in the dashboard. Provider-side setup is reconciled by the exact webhook URL, allowing recovery from

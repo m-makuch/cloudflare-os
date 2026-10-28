@@ -33,7 +33,7 @@ export class CloudflareAccountConfiguratorUI extends RpcTarget
     if (!token) return [];
     const needle = query.trim().toLowerCase();
     return (await listAccounts(token))
-      .filter(account => !needle || account.accountName.toLowerCase().includes(needle))
+      .filter(account => !needle || account.accountId === needle || account.accountName.toLowerCase().includes(needle))
       .slice(0, OPTION_LIMIT)
       .map(account => ({ value: account.accountId, title: account.accountName }));
   }

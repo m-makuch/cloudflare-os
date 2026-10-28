@@ -1,5 +1,5 @@
 import { env } from "cloudflare:workers";
-import { runInDurableObject, SELF } from "cloudflare:test";
+import { abortAllDurableObjects, runDurableObjectAlarm, runInDurableObject, SELF } from "cloudflare:test";
 import { afterEach, beforeEach, expect, it, vi } from "vitest";
 import { hashWebhookApiKey, notificationReceiverName } from "../../src/notifications-webhook.js";
 import type { CloudflareNotificationPolicySettings } from "../../src/types.js";
@@ -18,8 +18,22 @@ const payload = JSON.stringify({
 
 beforeEach(async () => {
   await setGadgetBehavior();
+  mockProvider();
 });
 afterEach(() => vi.unstubAllGlobals());
+function mockProvider(handler: (url: string, init: RequestInit) => Promise<Response> = async () => {
+  throw new Error("Unexpected provider request");
+}) {
+  const fetch = vi.fn(async (url: string, init: RequestInit) => {
+    if (init.method === "GET" && /\/destinations\/webhooks\/[a-f\d]{32}$/.test(url))
+      return Response.json({ success: true, result: {
+        id: "d".repeat(32), url: `https://hooks.example/notifications/webhooks/${userObjectId}/${accountId}`,
+      } });
+    return handler(url, init);
+  });
+  vi.stubGlobal("fetch", fetch);
+  return fetch;
+}
 async function setup(name: string, alertType = "test_alert", hookId = "hook-1", seedPolicy = true, createPolicy = true, policy?: CloudflareNotificationPolicySettings) {
   const account = env.USER_ACCOUNT.get(env.USER_ACCOUNT.idFromString(userObjectId));
   await runInDurableObject(account, (_instance, state) => {
@@ -56,6 +70,19 @@ async function setup(name: string, alertType = "test_alert", hookId = "hook-1", 
 }
 function sendAlert(stub: Awaited<ReturnType<typeof setup>>, body = payload) {
   return stub.receiveWebhook(secret, "application/json", body);
+}
+async function enableAdditionalHook(name: string) {
+  const stub = env.NOTIFICATION_RECEIVER.getByName(name);
+  await runInDurableObject(stub, async (instance, state) => {
+    const exports = state.exports as unknown as { NotificationTestHooks(options: object): Fetcher<NotificationTestHooks> };
+    await instance.enable({ accountId, userObjectId, hookId: "hook-2", alertType: "test_alert", createPolicy: false },
+      exports.NotificationTestHooks({ props: { hookId: "hook-2" } }) as unknown as Parameters<typeof instance.enable>[1]);
+  });
+}
+async function expectDisableFailure(stub: Awaited<ReturnType<typeof setup>>, message: string) {
+  const error = await stub.disable("hook-1", "test_alert")
+    .then(() => undefined, (caught: Error) => caught);
+  expect(error?.message).toContain(message);
 }
 
 // Reset the test Gadget's recorded calls and choose how it behaves on the next delivery.
@@ -240,7 +267,7 @@ it("stops handing off after a hook is disabled or the connection is disconnected
 it("creates one policy for two hooks and removes it after the last hook is disabled", async () => {
   const calls: { url: string; method: string; body?: unknown }[] = [];
   let policyExists = false;
-  vi.stubGlobal("fetch", vi.fn(async (input: string, init: RequestInit) => {
+  mockProvider(async (input: string, init: RequestInit) => {
     const method = init.method ?? "GET";
     calls.push({ url: input, method, body: init.body ? JSON.parse(init.body as string) : undefined });
     if (method === "POST") {
@@ -257,7 +284,7 @@ it("creates one policy for two hooks and removes it after the last hook is disab
       alert_type: "test_alert",
       mechanisms: { webhooks: [{ id: "d".repeat(32) }] },
     }] : [] });
-  }));
+  });
   const stub = await setup("managed-policy", "test_alert", "hook-1", false);
   await setup("managed-policy", "test_alert", "hook-2", false);
   expect(calls.filter((call) => call.method === "POST")).toHaveLength(1);
@@ -271,6 +298,119 @@ it("creates one policy for two hooks and removes it after the last hook is disab
   await stub.disable("hook-2", "test_alert");
   expect(calls.filter((call) => call.method === "DELETE")).toHaveLength(1);
   expect((await stub.getStatus()).policies).toEqual([]);
+  expect(await runInDurableObject(stub, (_instance, state) => state.storage.getAlarm())).toBeNull();
+});
+
+it.each(["unavailable", "lost response"])("retries last-subscriber cleanup after restart when DELETE has %s", async (failure) => {
+  const name = `cleanup-${failure}`;
+  const stub = await setup(name);
+  let deletes = 0;
+  vi.stubGlobal("fetch", vi.fn(async (_url: string, init: RequestInit) => {
+    if (init.method !== "DELETE") return Response.json({ success: true, result: [] });
+    deletes++;
+    if (deletes === 1) {
+      if (failure === "lost response") throw new Error("Lost DELETE response");
+      return new Response("{}", { status: 503 });
+    }
+    // A lost response may mean that ANS already deleted the policy.
+    return failure === "lost response"
+      ? new Response("{}", { status: 404 })
+      : Response.json({ success: true });
+  }));
+  await expectDisableFailure(stub, failure === "lost response" ? "Lost DELETE response" : "HTTP 503");
+  expect((await stub.getStatus()).subscribers).toBe(0);
+  expect(await sendAlert(stub)).toBe(204);
+  expect(await receivedAlerts()).toEqual([]);
+  expect(await runInDurableObject(stub, async (_instance, state) => ({
+    pending: state.storage.kv.get("policy:test_alert"), alarm: await state.storage.getAlarm(),
+  }))).toMatchObject({
+    pending: { needsReconcile: true }, alarm: expect.any(Number),
+  });
+
+  await abortAllDurableObjects();
+  const restarted = env.NOTIFICATION_RECEIVER.getByName(name);
+  expect(await runDurableObjectAlarm(restarted)).toBe(true);
+  expect(deletes).toBe(2);
+  expect((await restarted.getStatus()).policies).toEqual([]);
+  expect(await runInDurableObject(restarted, (_instance, state) => state.storage.getAlarm())).toBeNull();
+});
+
+it("keeps retrying with capped backoff and clears the retry state after recovery", async () => {
+  const stub = await setup("cleanup-backoff");
+  let available = false;
+  vi.stubGlobal("fetch", vi.fn(async () => available
+    ? Response.json({ success: true, result: [] })
+    : new Response("{}", { status: 503 })));
+  await expectDisableFailure(stub, "HTTP 503");
+  for (const delay of [120_000, 240_000, 480_000, 960_000, 1_920_000, 3_600_000, 3_600_000]) {
+    const before = Date.now();
+    expect(await runDurableObjectAlarm(stub)).toBe(true);
+    const pending = await runInDurableObject(stub, async (_instance, state) => ({
+      delay: state.storage.kv.get("policyCleanupRetryDelay"), alarm: await state.storage.getAlarm(),
+    }));
+    expect(pending.delay).toBe(delay);
+    expect(pending.alarm).toBeGreaterThanOrEqual(before + delay);
+    expect((await stub.getStatus()).policies).toHaveLength(1);
+  }
+  available = true;
+  expect(await runDurableObjectAlarm(stub)).toBe(true);
+  expect((await stub.getStatus()).policies).toEqual([]);
+  expect(await runInDurableObject(stub, async (_instance, state) => ({
+    delay: state.storage.kv.get("policyCleanupRetryDelay"), alarm: await state.storage.getAlarm(),
+  }))).toEqual({ delay: undefined, alarm: null });
+});
+
+it("does not delete a policy needed by a subscriber enabled before the cleanup retry", async () => {
+  const name = "cleanup-reenabled";
+  const stub = await setup(name);
+  const fetch = mockProvider(async (_url: string, init: RequestInit) => {
+    if (init.method === "DELETE") throw new Error("Lost DELETE response");
+    if (init.method === "POST") return Response.json({ success: true, result: { id: "e".repeat(32) } });
+    return Response.json({ success: true, result: [] });
+  });
+  await expectDisableFailure(stub, "Lost DELETE response");
+  await setup(name, "test_alert", "hook-2", false);
+  expect((await stub.getStatus()).policies).toEqual([{ alertType: "test_alert", policyId: "e".repeat(32) }]);
+  expect(await runDurableObjectAlarm(stub)).toBe(false);
+  fetch.mockClear();
+  // A stale, already-dispatched alarm must also recheck the current subscribers.
+  await runInDurableObject(stub, instance => instance.alarm());
+  expect(fetch).not.toHaveBeenCalled();
+  expect((await stub.getStatus()).subscribers).toBe(1);
+});
+
+it("continues cleaning other unused policies when one policy's retry fails", async () => {
+  const stub = await setup("cleanup-independent");
+  await runInDurableObject(stub, (_instance, state) =>
+    state.storage.kv.put("policy:orphan_alert", { alertType: "orphan_alert", policyId: "e".repeat(32) }));
+  const deleted: string[] = [];
+  vi.stubGlobal("fetch", vi.fn(async (url: string, init: RequestInit) => {
+    if (init.method === "DELETE") {
+      if (url.endsWith("b".repeat(32))) return new Response("{}", { status: 503 });
+      deleted.push(url);
+    }
+    return Response.json({ success: true, result: [] });
+  }));
+  await expectDisableFailure(stub, "HTTP 503");
+  expect(await runDurableObjectAlarm(stub)).toBe(true);
+  expect(deleted).toEqual([expect.stringContaining(`/policies/${"e".repeat(32)}`)]);
+  expect((await stub.getStatus()).policies).toEqual([{ alertType: "test_alert", policyId: "b".repeat(32) }]);
+  expect(await runInDurableObject(stub, (_instance, state) => state.storage.getAlarm())).not.toBeNull();
+  await stub.revokeWithToken(null);
+});
+
+it("cancels pending cleanup on disconnect and ignores a stale alarm", async () => {
+  const stub = await setup("cleanup-disconnect");
+  const fetch = vi.fn(async () => new Response("{}", { status: 503 }));
+  vi.stubGlobal("fetch", fetch);
+  await expectDisableFailure(stub, "HTTP 503");
+  expect(await runInDurableObject(stub, (_instance, state) => state.storage.getAlarm())).not.toBeNull();
+  await stub.revokeWithToken(null);
+  expect(await runDurableObjectAlarm(stub)).toBe(false);
+  fetch.mockClear();
+  await runInDurableObject(stub, instance => instance.alarm());
+  expect(fetch).not.toHaveBeenCalled();
+  expect(await stub.getStatus()).toMatchObject({ suspended: true, installed: false, policies: [] });
 });
 
 it("clears a late successful receipt after disabling its hook", async () => {
@@ -310,8 +450,7 @@ it("completes disconnect locally when the grant can no longer manage the account
   for (const [label, token] of [["denied", "test-access"], ["expired", null]] as const) {
     const name = `revoke-${label}`;
     const stub = await setup(name);
-    const fetch = vi.fn(async () => new Response("{}", { status: 403 }));
-    vi.stubGlobal("fetch", fetch);
+    const fetch = mockProvider(async () => new Response("{}", { status: 403 }));
     await stub.revokeWithToken(token);
     if (token === null) expect(fetch).not.toHaveBeenCalled();
     expect(await stub.getStatus()).toMatchObject({ suspended: true, installed: false, subscribers: 0 });
@@ -337,10 +476,10 @@ it("retries an orphaned policy's removal when another hook is enabled", async ()
   await runInDurableObject(env.NOTIFICATION_RECEIVER.getByName(name), (_instance, state) =>
     state.storage.kv.put("policy:orphan_alert", { alertType: "orphan_alert", policyId: orphanId }));
   const deleted: string[] = [];
-  vi.stubGlobal("fetch", vi.fn(async (input: string, init: RequestInit) => {
+  mockProvider(async (input: string, init: RequestInit) => {
     if (init.method === "DELETE") deleted.push(input);
     return Response.json({ success: true, result: [] });
-  }));
+  });
   const stub = await setup(name);
   expect(deleted).toEqual([expect.stringMatching(new RegExp(`/policies/${orphanId}$`))]);
   expect((await stub.getStatus()).policies).toEqual([
@@ -349,19 +488,64 @@ it("retries an orphaned policy's removal when another hook is enabled", async ()
 });
 
 it("uses an existing destination without creating a policy and routes its alerts", async () => {
-  const fetch = vi.fn(async () => { throw new Error("No provider calls expected"); });
-  vi.stubGlobal("fetch", fetch);
+  const fetch = mockProvider();
   const stub = await setup("external-policy", "test_alert", "hook-1", false, false);
-  expect(fetch).not.toHaveBeenCalled();
+  expect(fetch).toHaveBeenCalledTimes(1);
+  expect(fetch.mock.calls[0]![1].method).toBe("GET");
   expect((await stub.getStatus()).policies).toEqual([]);
   expect(await sendAlert(stub)).toBe(204);
   expect(await receivedAlerts()).toHaveLength(1);
   await stub.disable("hook-1", "test_alert");
-  expect(fetch).not.toHaveBeenCalled();
+  expect(fetch).toHaveBeenCalledTimes(1);
+});
+
+it.each([false, true])("recreates a deleted destination without losing existing subscribers (lost response: %s)", async (loseResponse) => {
+  const name = `deleted-destination-${loseResponse}`;
+  let stub = await setup(name, "test_alert", "hook-1", false, false);
+  const replacementId = "e".repeat(32);
+  let created: { id: string; url: string; secret: string } | undefined;
+  let posts = 0;
+  const fetch = vi.fn(async (url: string, init: RequestInit) => {
+    if (url.endsWith(`/webhooks/${"d".repeat(32)}`)) return new Response(null, { status: 404 });
+    if (init.method === "GET")
+      return Response.json({ success: true, result: url.endsWith(`/webhooks/${replacementId}`) ? created : created ? [created] : [] });
+    if (init.method === "POST") {
+      posts++;
+      created = { ...JSON.parse(init.body as string), id: replacementId };
+      if (loseResponse) throw new Error("Lost destination creation response");
+    } else if (init.method === "PUT") {
+      created = { ...JSON.parse(init.body as string), id: replacementId };
+    } else throw new Error("Unexpected provider request");
+    return Response.json({ success: true, result: { id: replacementId } });
+  });
+  vi.stubGlobal("fetch", fetch);
+  if (loseResponse) {
+    await expect(enableAdditionalHook(name)).rejects.toThrow("Lost destination creation response");
+    expect(await stub.getStatus()).toMatchObject({ installed: false, subscribers: 1 });
+    await abortAllDurableObjects();
+    stub = env.NOTIFICATION_RECEIVER.getByName(name);
+  }
+  await enableAdditionalHook(name);
+  expect(posts).toBe(1);
+  expect(await stub.getStatus()).toMatchObject({ installed: true, webhookId: replacementId, subscribers: 2, policies: [] });
+  expect(await sendAlert(stub)).toBe(401);
+  expect(await stub.receiveWebhook(created!.secret, "application/json", payload)).toBe(204);
+  expect((await receivedAlerts()).map(alert => alert.subscriber).toSorted()).toEqual(["hook-1", "hook-2"]);
+  expect(fetch.mock.calls.every(([url]) => !url.includes("/policies"))).toBe(true);
+});
+
+it.each([403, 503])("does not replace a destination or enable a hook when its live lookup fails with HTTP %s", async (status) => {
+  const name = `destination-lookup-${status}`;
+  const stub = await setup(name, "test_alert", "hook-1", false, false);
+  const fetch = vi.fn(async () => new Response(null, { status }));
+  vi.stubGlobal("fetch", fetch);
+  await expect(enableAdditionalHook(name)).rejects.toThrow(`HTTP ${status}`);
+  expect(fetch).toHaveBeenCalledTimes(1);
+  expect(await stub.getStatus()).toMatchObject({ webhookId: "d".repeat(32), subscribers: 1 });
 });
 
 it("removes a managed policy when only external-policy subscribers remain", async () => {
-  vi.stubGlobal("fetch", vi.fn(async () => Response.json({ success: true, result: [] })));
+  mockProvider(async () => Response.json({ success: true, result: [] }));
   const stub = await setup("mixed-policy");
   await setup("mixed-policy", "test_alert", "hook-2", false, false);
   await stub.disable("hook-1", "test_alert");
@@ -380,11 +564,11 @@ it("retries an interrupted address migration in place with the same pending secr
   })).status).toBe(204);
   expect(await stub.receiveWebhook(secret, "application/json", payload, `/unrelated/webhooks/${userObjectId}/${accountId}`)).toBe(404);
   const calls: { url: string; method?: string; body: { url: string; secret: string } }[] = [];
-  vi.stubGlobal("fetch", vi.fn(async (url: string, init: RequestInit) => {
+  mockProvider(async (url: string, init: RequestInit) => {
     calls.push({ url, method: init.method, body: JSON.parse(init.body as string) });
     if (calls.length === 1) throw new Error("Lost update response");
     return Response.json({ success: true, result: { id: "d".repeat(32) } });
-  }));
+  });
   const enable = () => runInDurableObject(stub, async (instance, state) => {
     const exports = state.exports as unknown as { NotificationTestHooks(options: object): Fetcher<NotificationTestHooks> };
     await instance.enable({ accountId, userObjectId, hookId: "hook-2", alertType: "test_alert" },
@@ -409,7 +593,7 @@ it("isolates configured policies, shares canonical settings, and cleans up only 
   const policies = new Map<string, Record<string, unknown>>();
   const deleted: string[] = [];
   let nextId = 1;
-  vi.stubGlobal("fetch", vi.fn(async (url: string, init: RequestInit) => {
+  mockProvider(async (url: string, init: RequestInit) => {
     if (init.method === "POST") {
       const id = String(nextId++).padStart(32, "0");
       policies.set(id, { ...JSON.parse(init.body as string), id });
@@ -422,7 +606,7 @@ it("isolates configured policies, shares canonical settings, and cleans up only 
       return Response.json({ success: true });
     }
     return Response.json({ success: true, result: [...policies.values()] });
-  }));
+  });
   const first = { filters: { product: ["workers"], limit: ["100"] }, alertInterval: "30m" };
   const second = { filters: { product: ["workers"], limit: ["200"] }, alertInterval: "30m" };
   const stub = await setup("configured", "test_alert", "a", false, true, first);
@@ -451,18 +635,21 @@ it("isolates configured policies, shares canonical settings, and cleans up only 
 it("recovers a configured policy after a lost POST without duplicating or widening it", async () => {
   let created: Record<string, unknown> | undefined;
   let posts = 0;
-  vi.stubGlobal("fetch", vi.fn(async (_url: string, init: RequestInit) => {
+  mockProvider(async (_url: string, init: RequestInit) => {
     if (init.method === "POST") {
       posts++;
       created = { ...JSON.parse(init.body as string), id: "b".repeat(32) };
       throw new Error("Lost POST response");
     }
     return Response.json({ success: true, result: created ? [created] : [] });
-  }));
+  });
   const policy = { filters: { limit: ["100"], product: ["workers"] } };
   await expect(setup("lost-configured", "test_alert", "hook-1", false, true, policy)).rejects.toThrow("Lost POST");
+  const pending = env.NOTIFICATION_RECEIVER.getByName("lost-configured");
+  expect(await runInDurableObject(pending, (_instance, state) => state.storage.getAlarm())).not.toBeNull();
   const stub = await setup("lost-configured", "test_alert", "hook-1", false, true, policy);
   expect(posts).toBe(1);
+  expect(await runInDurableObject(stub, (_instance, state) => state.storage.getAlarm())).toBeNull();
   expect(await sendAlert(stub)).toBe(204);
   expect(await receivedAlerts()).toHaveLength(1);
 });
