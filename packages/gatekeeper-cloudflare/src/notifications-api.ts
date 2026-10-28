@@ -8,12 +8,26 @@ const API = "https://api.cloudflare.com/client/v4";
 export type NotificationInstallation = { webhookId: string };
 export type NotificationPolicy = { policyId: string };
 
-/** A non-success provider response. Only numeric codes are kept: messages can quote inputs back. */
+/** A provider failure with numeric codes and a fixed operation label, never provider messages or URLs. */
 export class NotificationsApiError extends Error {
-  constructor(readonly status: number, readonly codes: number[]) {
-    super(`Cloudflare Notifications request failed (HTTP ${status}` +
-      (codes.length ? `, codes ${codes.join(", ")}` : "") + ")." +
-      (status === 401 || status === 403 ? " Check Notifications Write access to this account." : ""));
+  constructor(
+    readonly status: number,
+    readonly codes: number[],
+    readonly operation?: string,
+  ) {
+    super(
+      `Cloudflare Notifications request failed (HTTP ${status}` +
+        (codes.length ? `, codes ${codes.join(", ")}` : "") +
+        ")." +
+        (operation ? ` Operation: ${operation}.` : "") +
+        (status === 401 || status === 403
+          ? " Check Notifications Write access to this account."
+          : "") +
+        (status === 422 &&
+        (operation === "POST webhook destination" || operation === "PUT webhook destination")
+          ? " Cloudflare rejected the webhook configuration. Check that this installation's public HTTPS notification receiver URL is valid and resolves in DNS, then retry."
+          : ""),
+    );
     this.name = "NotificationsApiError";
   }
 }
@@ -27,8 +41,10 @@ async function errorCodes(response: Response): Promise<number[]> {
   try {
     const envelope = object(JSON.parse(await readTextCapped(response)));
     if (!Array.isArray(envelope.errors)) return [];
-    return envelope.errors.map((entry) => object(entry).code)
-      .filter((code): code is number => Number.isSafeInteger(code)).slice(0, 10);
+    return envelope.errors
+      .map((entry) => object(entry).code)
+      .filter((code): code is number => Number.isSafeInteger(code))
+      .slice(0, 10);
   } catch {
     return [];
   }
@@ -70,7 +86,12 @@ async function requestEnvelope(
     await response.body?.cancel();
     return { success: true };
   }
-  if (!response.ok) throw new NotificationsApiError(response.status, await errorCodes(response));
+  if (!response.ok)
+    throw new NotificationsApiError(
+      response.status,
+      await errorCodes(response),
+      `${method} ${path.includes("/destinations/webhooks") ? "webhook destination" : "notification policy"}`,
+    );
   const envelope = object(JSON.parse(await readTextCapped(response)));
   if (envelope.success !== true) throw new Error("Cloudflare Notifications rejected the request.");
   return envelope;
@@ -93,7 +114,8 @@ async function list(token: string, path: string): Promise<Record<string, unknown
     if (!Array.isArray(envelope.result))
       throw new Error("Cloudflare Notifications returned an invalid resource list.");
     items.push(...envelope.result.map(object));
-    if (items.length > 20_000) throw new Error("Cloudflare Notifications resource list is too large.");
+    if (items.length > 20_000)
+      throw new Error("Cloudflare Notifications resource list is too large.");
     // These endpoints currently document an unpaginated array. Follow pagination if Cloudflare
     // supplies v4 result_info, and fail closed if it is incomplete or inconsistent.
     if (envelope.result_info === undefined) {
@@ -104,19 +126,47 @@ async function list(token: string, path: string): Promise<Record<string, unknown
     const current = info.page;
     const perPage = info.per_page;
     const totalCount = info.total_count;
-    const totalPages = info.total_pages === undefined &&
-      Number.isSafeInteger(totalCount) && Number.isSafeInteger(perPage) &&
+    const totalPages =
+      info.total_pages === undefined &&
+      Number.isSafeInteger(totalCount) &&
+      Number.isSafeInteger(perPage) &&
       (perPage as number) > 0
-      ? Math.max(1, Math.ceil((totalCount as number) / (perPage as number)))
-      : info.total_pages;
+        ? Math.max(1, Math.ceil((totalCount as number) / (perPage as number)))
+        : info.total_pages;
     const lastPage = totalPages === 0 && page === 1 && items.length === 0 ? 1 : totalPages;
-    if (!Number.isSafeInteger(current) || current !== page ||
-      !Number.isSafeInteger(lastPage) || (lastPage as number) < page ||
-      (lastPage as number) > 1_000)
+    if (
+      !Number.isSafeInteger(current) ||
+      current !== page ||
+      !Number.isSafeInteger(lastPage) ||
+      (lastPage as number) < page ||
+      (lastPage as number) > 1_000
+    )
       throw new Error("Cloudflare Notifications returned invalid pagination metadata.");
     if (page === lastPage) return items;
   }
   throw new Error("Cloudflare Notifications resource list exceeded the page limit.");
+}
+
+/** Read the owned destination's current URL; only an explicit 404 means it was deleted. */
+export async function getNotificationDestinationUrl(
+  token: string,
+  accountId: string,
+  webhookId: string,
+): Promise<string | null> {
+  try {
+    const destination = object(
+      await request(
+        token,
+        `/accounts/${assertCloudflareAccountId(accountId)}/alerting/v3/destinations/webhooks/${id(webhookId)}`,
+      ),
+    );
+    if (typeof destination.url !== "string")
+      throw new Error("Cloudflare Notifications returned an invalid destination URL.");
+    return destination.url;
+  } catch (error) {
+    if (error instanceof NotificationsApiError && error.status === 404) return null;
+    throw error;
+  }
 }
 
 /** Reconcile by the exact connection URL, never adopt another connection's similarly named webhook.
@@ -161,7 +211,11 @@ export async function removeNotificationConnection(
     await request(token, `${root}/destinations/webhooks/${webhookId}`, "DELETE");
 }
 
-async function policyMarker(ownerId: string, alertType: string, settings?: CloudflareNotificationPolicySettings): Promise<string> {
+async function policyMarker(
+  ownerId: string,
+  alertType: string,
+  settings?: CloudflareNotificationPolicySettings,
+): Promise<string> {
   if (!/^[a-f\d]{64}$/i.test(ownerId) || !/^[a-z][a-z0-9_]{0,99}$/.test(alertType))
     throw new Error("Invalid notification policy owner or alert type.");
   const identity = await notificationPolicyIdentity(alertType, settings);
@@ -178,9 +232,13 @@ function policyWebhookIds(value: unknown): string[] {
 function hasOnlyPolicyDestination(value: unknown, destination: string): boolean {
   const mechanisms = object(value);
   const webhooks = policyWebhookIds(value);
-  return webhooks.length === 1 && webhooks[0] === destination &&
-    Object.entries(mechanisms).every(([key, entries]) => key === "webhooks" ||
-      (Array.isArray(entries) && entries.length === 0));
+  return (
+    webhooks.length === 1 &&
+    webhooks[0] === destination &&
+    Object.entries(mechanisms).every(
+      ([key, entries]) => key === "webhooks" || (Array.isArray(entries) && entries.length === 0),
+    )
+  );
 }
 
 /** The marker survives an interrupted POST, so a retry can adopt only its own policy. */
@@ -197,32 +255,45 @@ export async function provisionNotificationPolicy(
   const canonical = canonicalNotificationPolicy(settings);
   const description = await policyMarker(ownerId, alertType, canonical);
   const matches = (await list(token, root)).filter((item) => item.description === description);
-  if (matches.length > 1) throw new Error("Multiple Cloudflare OS policies match this configuration.");
+  if (matches.length > 1)
+    throw new Error("Multiple Cloudflare OS policies match this configuration.");
   if (matches[0]) {
-    if (matches[0].alert_type !== alertType || matches[0].enabled !== true ||
-      JSON.stringify(canonicalNotificationPolicy({
-        alertInterval: matches[0].alert_interval as string | undefined,
-        filters: matches[0].filters as CloudflareNotificationPolicySettings["filters"],
-      })) !== JSON.stringify(canonical) ||
-      !hasOnlyPolicyDestination(matches[0].mechanisms, destination))
+    if (
+      matches[0].alert_type !== alertType ||
+      matches[0].enabled !== true ||
+      JSON.stringify(
+        canonicalNotificationPolicy({
+          alertInterval: matches[0].alert_interval as string | undefined,
+          filters: matches[0].filters as CloudflareNotificationPolicySettings["filters"],
+        }),
+      ) !== JSON.stringify(canonical) ||
+      !hasOnlyPolicyDestination(matches[0].mechanisms, destination)
+    )
       throw new Error("The managed notification policy was changed in Cloudflare.");
     return { policyId: id(matches[0].id) };
   }
   let policy: Record<string, unknown>;
   try {
-    policy = object(await request(token, root, "POST", {
-      name: `Cloudflare OS: ${alertType}`,
-      description,
-      alert_type: alertType,
-      enabled: true,
-      ...(canonical.alertInterval === undefined ? {} : { alert_interval: canonical.alertInterval }),
-      ...(canonical.filters === undefined ? {} : { filters: canonical.filters }),
-      mechanisms: { webhooks: [{ id: destination }] },
-    }));
+    policy = object(
+      await request(token, root, "POST", {
+        name: `Cloudflare OS: ${alertType}`,
+        description,
+        alert_type: alertType,
+        enabled: true,
+        ...(canonical.alertInterval === undefined
+          ? {}
+          : { alert_interval: canonical.alertInterval }),
+        ...(canonical.filters === undefined ? {} : { filters: canonical.filters }),
+        mechanisms: { webhooks: [{ id: destination }] },
+      }),
+    );
   } catch (error) {
     if (error instanceof NotificationsApiError && error.status === 400)
-      throw new Error(`${error.message} Check that ${alertType} is available to this account; ` +
-        "check the supported filters and re-alert interval for this alert type.", { cause: error });
+      throw new Error(
+        `${error.message} Check that ${alertType} is available to this account; ` +
+          "check the supported filters and re-alert interval for this alert type.",
+        { cause: error },
+      );
     throw error;
   }
   return { policyId: id(policy.id) };
@@ -242,9 +313,12 @@ export async function removeNotificationPolicy(
   const canonical = canonicalNotificationPolicy(settings);
   const description = await policyMarker(ownerId, alertType, canonical);
   const destination = id(webhookId);
-  const matches = (await list(token, root)).filter((item) =>
-    item.description === description && item.alert_type === alertType &&
-    policyWebhookIds(item.mechanisms).includes(destination));
+  const matches = (await list(token, root)).filter(
+    (item) =>
+      item.description === description &&
+      item.alert_type === alertType &&
+      policyWebhookIds(item.mechanisms).includes(destination),
+  );
   const policyIds = new Set(matches.map((item) => id(item.id)));
   if (known) policyIds.add(id(known.policyId));
   for (const policyId of policyIds) await request(token, `${root}/${policyId}`, "DELETE");
@@ -252,8 +326,16 @@ export async function removeNotificationPolicy(
 
 /** Update the owned destination in place so its policies keep the same webhook ID. */
 export async function updateNotificationDestination(
-  token: string, accountId: string, webhookId: string, webhookUrl: string, apiKey: string,
+  token: string,
+  accountId: string,
+  webhookId: string,
+  webhookUrl: string,
+  apiKey: string,
 ): Promise<void> {
-  await request(token, `/accounts/${assertCloudflareAccountId(accountId)}/alerting/v3/destinations/webhooks/${id(webhookId)}`,
-    "PUT", { name: "Cloudflare OS", type: "generic", url: webhookUrl, secret: apiKey });
+  await request(
+    token,
+    `/accounts/${assertCloudflareAccountId(accountId)}/alerting/v3/destinations/webhooks/${id(webhookId)}`,
+    "PUT",
+    { name: "Cloudflare OS", type: "generic", url: webhookUrl, secret: apiKey },
+  );
 }

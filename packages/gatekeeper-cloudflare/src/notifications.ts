@@ -18,6 +18,7 @@ import { SerialTaskQueue } from "@gadgets/gatekeeper-kit/serial-queue";
 import { obsContext } from "./observability.js";
 import {
   provisionNotificationInstallation,
+  getNotificationDestinationUrl,
   updateNotificationDestination,
   provisionNotificationPolicy,
   removeNotificationConnection,
@@ -59,6 +60,8 @@ const observers = privateObservers(
 const RETENTION_MS = 15 * 24 * 60 * 60 * 1000;
 const MAX_RETAINED_DELIVERIES = 10_000;
 const MAX_HOOKS = 100;
+const POLICY_CLEANUP_RETRY_MS = 60_000;
+const MAX_POLICY_CLEANUP_RETRY_MS = 60 * 60_000;
 
 type NotificationEnv = Cloudflare.Env & {
   BASE_URL?: string;
@@ -245,6 +248,22 @@ export class CloudflareNotificationReceiver extends DurableObject<NotificationEn
   #policies(): [string, PolicyIntent][] {
     return [...this.ctx.storage.kv.list<PolicyIntent>({ prefix: "policy:" })];
   }
+  #unusedPolicies(): [string, PolicyIntent][] {
+    const hooks = this.#hooks();
+    const used = new Set(hooks.filter(({ props }) => props.createPolicy !== false)
+      .map(({ props }) => props.policyKey ?? `policy:${props.alertType}`));
+    for (const hook of hooks) disposeHook(hook);
+    return this.#policies().filter(([key]) => !used.has(key));
+  }
+  async #schedulePolicyCleanup(): Promise<void> {
+    if (await this.ctx.storage.getAlarm() === null)
+      await this.ctx.storage.setAlarm(Date.now() + POLICY_CLEANUP_RETRY_MS);
+  }
+  async #clearIdleCleanupAlarm(): Promise<void> {
+    if (this.#unusedPolicies().length) return;
+    await this.ctx.storage.deleteAlarm();
+    this.ctx.storage.kv.delete("policyCleanupRetryDelay");
+  }
   async #token(owner: NotificationsProps): Promise<string> {
     const account = this.#account(owner.userObjectId);
     if (!(await account.getGrantedScopes()).includes(NOTIFICATIONS_SCOPE))
@@ -286,8 +305,21 @@ export class CloudflareNotificationReceiver extends DurableObject<NotificationEn
   /** Move the existing destination in place, retaining its ID and policies across retries. */
   async #reconcileAddress(props: NotificationsProps, installation: Installation): Promise<void> {
     const webhookUrl = `${notificationWebhookBaseUrl(configuredNotificationBaseUrl(this.env))}/webhooks/${props.userObjectId}/${props.accountId}`;
+    const providerUrl = await getNotificationDestinationUrl(
+      await this.#token(props), props.accountId, installation.webhookId);
+    if (providerUrl === null) {
+      // Provider deletion invalidates the persisted setup marker. Reuse provisioning's exact-URL
+      // recovery so a lost creation response cannot create duplicate destinations on retry.
+      this.ctx.storage.kv.delete("setupComplete");
+      this.ctx.storage.kv.delete("addressMigration");
+      for (const [key, policy] of this.#policies())
+        this.ctx.storage.kv.put<PolicyIntent>(key, { ...policy, needsReconcile: true });
+      await this.#provision(props);
+      Object.assign(installation, this.ctx.storage.kv.get<Installation>("installation")!);
+      return;
+    }
     // Older installations may not have recorded their URL. Their known destination ID is authoritative.
-    if (this.ctx.storage.kv.get("webhookUrl") === webhookUrl && !this.ctx.storage.kv.get("addressMigration")) return;
+    if (providerUrl === webhookUrl && this.ctx.storage.kv.get("webhookUrl") === webhookUrl && !this.ctx.storage.kv.get("addressMigration")) return;
     let migration = this.ctx.storage.kv.get<AddressMigration>("addressMigration");
     if (!migration) {
       const apiKey = generateWebhookApiKey();
@@ -318,7 +350,8 @@ export class CloudflareNotificationReceiver extends DurableObject<NotificationEn
       disposeHook(existing);
       if (!alreadyEnabled && this.#hookCount() >= MAX_HOOKS)
         throw new Error("This notification connection has reached its subscriber limit.");
-      if (!this.ctx.storage.kv.get("setupComplete")) {
+      const needsProvisioning = !this.ctx.storage.kv.get("setupComplete");
+      if (needsProvisioning) {
         this.#provisioning = this.#provision(props).finally(() => {
           this.#provisioning = undefined;
         });
@@ -328,13 +361,15 @@ export class CloudflareNotificationReceiver extends DurableObject<NotificationEn
         throw new Error("This notification connection has been disconnected.");
       const installation = this.ctx.storage.kv.get<Installation>("installation");
       if (!installation) throw new Error("Notification destination setup is incomplete.");
-      await this.#reconcileAddress(props, installation);
+      if (!needsProvisioning) await this.#reconcileAddress(props, installation);
       this.#ensureReceipts();
       const policyKey = await notificationPolicyKey(props.alertType, props.policy);
       props = { ...props, policyKey };
       const priorPolicy = this.ctx.storage.kv.get<PolicyIntent>(policyKey);
       if (props.createPolicy !== false && !priorPolicy) this.ctx.storage.kv.put<PolicyIntent>(policyKey, { alertType: props.alertType, policy: props.policy });
       if (props.createPolicy !== false && (!priorPolicy?.policyId || priorPolicy.needsReconcile)) {
+        // An interrupted POST may have created a policy without installing its hook.
+        await this.#schedulePolicyCleanup();
         const policy = await provisionNotificationPolicy(
           await this.#token(props), props.accountId, installation.webhookId,
           props.alertType, props.userObjectId, props.policy,
@@ -357,6 +392,7 @@ export class CloudflareNotificationReceiver extends DurableObject<NotificationEn
             error,
           }));
       }
+      await this.#clearIdleCleanupAlarm();
     });
   }
 
@@ -366,6 +402,8 @@ export class CloudflareNotificationReceiver extends DurableObject<NotificationEn
       const existing = this.ctx.storage.kv.get<StoredHook>(key);
       if (existing && existing.props.alertType !== alertType)
         throw new Error("Notification hook alert type mismatch.");
+      // Arm recovery before removing the hook: the Workshop need not call disable again.
+      if (this.#policies().length) await this.#schedulePolicyCleanup();
       this.ctx.storage.kv.delete(key);
       disposeHook(existing);
       await Promise.allSettled([...this.#inFlight]
@@ -376,6 +414,7 @@ export class CloudflareNotificationReceiver extends DurableObject<NotificationEn
       for (const [policyKey, policy] of this.#policies()) {
         if (policy.alertType === alertType) await this.#removeUnusedPolicy(policyKey);
       }
+      await this.#clearIdleCleanupAlarm();
     });
   }
 
@@ -383,19 +422,39 @@ export class CloudflareNotificationReceiver extends DurableObject<NotificationEn
   async #removeUnusedPolicy(policyKey: string): Promise<void> {
     const policy = this.ctx.storage.kv.get<PolicyIntent>(policyKey);
     if (!policy) return;
-    const hooks = this.#hooks();
-    const stillUsed = hooks.some((hook) => (hook.props.policyKey ?? `policy:${hook.props.alertType}`) === policyKey && hook.props.createPolicy !== false);
-    for (const hook of hooks) disposeHook(hook);
-    if (stillUsed) return;
+    if (!this.#unusedPolicies().some(([key]) => key === policyKey)) return;
     const owner = this.ctx.storage.kv.get<NotificationsProps>("owner");
     if (!owner) throw new Error("Notification policy owner is missing.");
     const installation = this.ctx.storage.kv.get<Installation>("installation");
     if (!installation) throw new Error("Notification destination is missing.");
     this.ctx.storage.kv.put<PolicyIntent>(policyKey, { ...policy, needsReconcile: true });
+    await this.#schedulePolicyCleanup();
     await removeNotificationPolicy(await this.#token(owner), owner.accountId,
       owner.userObjectId, policy.alertType, installation.webhookId,
       policy.policyId ? { policyId: policy.policyId } : undefined, policy.policy);
     this.ctx.storage.kv.delete(policyKey);
+  }
+
+  /** Retry unused managed-policy cleanup independently of subscribers, under the mutation lock. */
+  async alarm(): Promise<void> {
+    await this.#mutations.run(async () => {
+      if (this.ctx.storage.kv.get("suspended")) return;
+      const delay = Math.min(
+        (this.ctx.storage.kv.get<number>("policyCleanupRetryDelay") ?? POLICY_CLEANUP_RETRY_MS) * 2,
+        MAX_POLICY_CLEANUP_RETRY_MS,
+      );
+      this.ctx.storage.kv.put("policyCleanupRetryDelay", delay);
+      // Schedule before contacting ANS, so interruption does not exhaust the runtime's retries.
+      await this.ctx.storage.setAlarm(Date.now() + delay);
+      for (const [key] of this.#unusedPolicies()) {
+        await this.#removeUnusedPolicy(key).catch((error: unknown) =>
+          logger.warn("notification policy cleanup retry failed", {
+            event: "notification.policy.cleanup.failed",
+            error,
+          }));
+      }
+      await this.#clearIdleCleanupAlarm();
+    });
   }
   async suspend(): Promise<void> {
     this.ctx.storage.kv.put("suspended", true);
@@ -403,6 +462,7 @@ export class CloudflareNotificationReceiver extends DurableObject<NotificationEn
     await this.#mutations.run(async () => {
       await Promise.all(this.#inFlight.values());
       await this.#provisioning?.catch(() => undefined);
+      await this.ctx.storage.deleteAlarm();
     });
   }
   /**
