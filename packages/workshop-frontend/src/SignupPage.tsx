@@ -10,6 +10,7 @@ import { useDocumentTitle } from "./useDocumentTitle";
 import OAuthButtons from "./components/auth/OAuthButtons";
 import SiteLogo from "./components/SiteLogo";
 import { useConnectionLost } from "./RpcContext";
+import { workersIssueSetupSearch } from "./features/workers-issues/workersIssueSetup";
 import {
   deviceSessionDestination,
   deviceSessionSearch,
@@ -32,7 +33,9 @@ export default function SignupPage({ rpcStub }: SignupPageProps) {
   const [error, setError] = useState<string | null>(null);
 
   const handleSignupSuccess = () => {
-    window.location.href = deviceSessionDestination("/", window.location.search);
+    const url = new URL(deviceSessionDestination("/", window.location.search), window.location.origin);
+    for (const [key, value] of Object.entries(workersIssueSetupSearch(window.location.search))) url.searchParams.set(key, value);
+    window.location.href = url.href;
   };
 
   const usernameError =
@@ -232,7 +235,7 @@ export default function SignupPage({ rpcStub }: SignupPageProps) {
             Already have an account?{" "}
             <Link
               to="/"
-              search={deviceSessionSearch(window.location.search)}
+              search={{ ...deviceSessionSearch(window.location.search), ...workersIssueSetupSearch(window.location.search) }}
               className="text-kumo-brand hover:underline font-medium"
             >
               Sign in
