@@ -1,0 +1,29 @@
+packages/bundled-blueprints/blueprints/workers-issues/__tests__/server.test.ts
+  s_47fc53b092f7e8::t_087b7a283a352e 1-124
+packages/bundled-blueprints/blueprints/workers-issues/files/README.md
+  s_47fc53b092f7e8::t_4fdf0ae130d930 1-29
+packages/bundled-blueprints/blueprints/workers-issues/files/client.js
+  s_47fc53b092f7e8::t_cd26a2a95bc491 1-46
+packages/bundled-blueprints/blueprints/workers-issues/files/issueIdentity.js
+  s_47fc53b092f7e8::t_5445f3337bf5d7 1-15
+packages/bundled-blueprints/blueprints/workers-issues/files/protocol.d.ts
+  s_47fc53b092f7e8::t_8e737a8817a902 1-8
+packages/bundled-blueprints/blueprints/workers-issues/files/server.js
+  s_47fc53b092f7e8::t_b5bc2f4b855a05 1-135
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "2f12d691f28f1d03e9def019d14f4cd543271d3f",
+  "prompts": {},
+  "sessions": {
+    "s_47fc53b092f7e8": {
+      "agent_id": {
+        "tool": "opencode",
+        "id": "ses_e810f1f6effecE2fJEyEvoWXT1",
+        "model": "gpt-6.1-sol"
+      },
+      "human_author": "Maksym Makuch <maksym@cloudflare.com>"
+    }
+  }
+}
