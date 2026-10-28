@@ -1,0 +1,33 @@
+packages/workshop-frontend/src/LoginPage.tsx
+  s_47fc53b092f7e8::t_eea55d4fa2cb5f 14,160
+packages/workshop-frontend/src/SignupPage.tsx
+  s_47fc53b092f7e8::t_4bcac28debab55 13,36-38,238
+packages/workshop-frontend/src/features/workers-issues/WorkersIssueSetupPage.tsx
+  s_47fc53b092f7e8::t_dd4a7473ab8e4a 1-309
+packages/workshop-frontend/src/features/workers-issues/useWorkersIssueConnections.ts
+  s_47fc53b092f7e8::t_897fa80d059977 1-163
+packages/workshop-frontend/src/features/workers-issues/workersIssueSetup.test.ts
+  s_47fc53b092f7e8::t_e6fe6c59074cb5 1-92
+packages/workshop-frontend/src/features/workers-issues/workersIssueSetup.ts
+  s_47fc53b092f7e8::t_d3482b70ec51c8 1-114
+packages/workshop-frontend/src/routes/__root.tsx
+  s_47fc53b092f7e8::t_8de982003e1cd8 25-26,37-38,142,159,163,194-195
+packages/workshop-frontend/src/routes/index.tsx
+  s_47fc53b092f7e8::t_a1a2156f91c2f2 26,32,38
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "1e948e0867d1a92b98d59582dd35ec16066dd203",
+  "prompts": {},
+  "sessions": {
+    "s_47fc53b092f7e8": {
+      "agent_id": {
+        "tool": "opencode",
+        "id": "ses_e810f1f6effecE2fJEyEvoWXT1",
+        "model": "gpt-6.1-sol"
+      },
+      "human_author": "Maksym Makuch <maksym@cloudflare.com>"
+    }
+  }
+}
