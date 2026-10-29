@@ -1,0 +1,45 @@
+packages/bundled-blueprints/blueprints/workers-issues/__tests__/server.test.ts
+  s_47fc53b092f7e8::t_a4952e5e98140c 2-4,6-7,13-16,20-22,26,28-38,41-43,46,56-65,67-74,80,83-84,90-91,93-95,98,103-105,108-114,117,120-122,124-125,128-134,138,140,144-145,147-149,152,154-159,163-170,173,178-182,186-187,189,193-267
+packages/bundled-blueprints/blueprints/workers-issues/files/client.ts
+  s_47fc53b092f7e8::t_734ce2aec868fd 2-6,11-12,56-57,72-86,88,92-93,110-112,124-127,137-138,153-154,158-159,161-207,215-221,231,237-242,244-255,259-262,270-275,289-307
+packages/bundled-blueprints/blueprints/workers-issues/files/server.ts
+  s_47fc53b092f7e8::t_714d90ea0b04be 3-8,27-33,37-44,75-76,78-79,86-92,94-98,101-109,111-125,131-133,137-141,145-148,156-163,184,190,205-209,212-214,221,224-251,253-254,257,260-277,281,285-290,296-316
+packages/gatekeeper-cloudflare/__tests__/notifications-webhook.test.ts
+  s_47fc53b092f7e8::t_f62ef44d733e7e 72-86,88-95,115-120,142-144,151-152
+packages/gatekeeper-cloudflare/__tests__/workerd/notifications.test.ts
+  s_47fc53b092f7e8::t_50424ab620ba3e 2-7,24-32,38-42,45-51,57-64,81-84,101-110,115-123,127-130,148-154,178-180,185,193-195,224-228,261-266,269-278,280,282-296,300,303,305,307,311,320,326,335-338,352-356,365-377,383-384,387-389,398-434,436-445,450-457,463-464,473-478,486-487,492-494,498,506-510,512-521,525-530,539-541,545,552-555,560-567,571-575,585-586,597-600,606-610,618-625,637-638,663-713,715-726,741-745,747-763,770-781,792-794,820-823,829-833,836-839,862-864,866-868,877-879,881-888,893-895,900-906,909-918,921-923,926-933,941-944,950-956,961,968-970,972-984,988-1131
+packages/gatekeeper-cloudflare/src/notifications-webhook.ts
+  s_47fc53b092f7e8::t_5267392b82a6a4 10-18,25-41,76,79,91-95,98-101,104,107-111,119-120
+packages/gatekeeper-cloudflare/src/notifications.ts
+  s_47fc53b092f7e8::t_8a0bebda838897 65-68,76-82,86-90,93-95,113-115,156-167,242,245,252-255,279-283,289-293,298-310,313-329,373-376,389-394,402-408,418-422,424-427,453-457,462-467,469-473,489-490,500-501,503,510,529-537,543-544,547-553,559,561,567-568,575,590-595,613,621-629,638-649,654-660,664-667,671-672,676-686,689,691-704,716,728,730-738,740-747,757-761,763-883,901-910,914,916
+packages/workshop-frontend/src/features/workers-issues/WorkersIssueSetupPage.test.tsx
+  s_47fc53b092f7e8::t_338fd8f7bcd9f3 46-49,71,81,84-103,124-125,209-210,354-388
+packages/workshop-frontend/src/features/workers-issues/WorkersIssueSetupPage.tsx
+  s_47fc53b092f7e8::t_9b2feb0bfe9ca8 225-228,264-265
+packages/workshop-frontend/src/features/workers-issues/provisionWorkersIssueInbox.ts
+  s_47fc53b092f7e8::t_7d1ff38d1be7aa 43-82,84-85,87-89,105-110
+packages/workshop-frontend/src/features/workers-issues/workersIssueSetup.test.ts
+  s_47fc53b092f7e8::t_ec3591b94ce087 2,18,21-30
+packages/workshop-frontend/src/features/workers-issues/workersIssueSetup.ts
+  s_47fc53b092f7e8::t_8fb39bc0690f1f 19-20
+packages/workshop-frontend/src/routeTree.gen.ts
+  s_47fc53b092f7e8::t_481c5a1535f883 27,105-109,132,151,171,192,211,230,250,361-367,394
+packages/workshop-frontend/src/routes/setup.workers-issues.tsx
+  s_47fc53b092f7e8::t_7ccc112c6762d2 1-26
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "57b8f0b622f949a39360d34aebe3d5cb5270f353",
+  "prompts": {},
+  "sessions": {
+    "s_47fc53b092f7e8": {
+      "agent_id": {
+        "tool": "opencode",
+        "id": "ses_e810f1f6effecE2fJEyEvoWXT1",
+        "model": "gpt-6.1-sol"
+      },
+      "human_author": "Maksym Makuch <maksym@cloudflare.com>"
+    }
+  }
+}
