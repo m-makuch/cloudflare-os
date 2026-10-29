@@ -1,6 +1,11 @@
 import { DurableObject, RpcStub, RpcTarget, restore } from "cloudflare:workers";
 import { isRecord, issueIdentity } from "./lib/issueIdentity.ts";
-import type { Investigation, WorkerIssueInbox, WorkerScope } from "./lib/protocol.ts";
+import type {
+  Investigation,
+  InvestigationSummary,
+  WorkerIssueInbox,
+  WorkerScope,
+} from "./lib/protocol.ts";
 
 // The gadget runtime supplies persistent callbacks ahead of the published experimental typings.
 declare module "cloudflare:workers" {
@@ -19,16 +24,24 @@ interface InvestigationTask extends RpcTarget {
 /** Only capabilities explicitly bound to this gadget, never the host Worker's environment. */
 interface GadgetEnv {
   CLOUDFLARE_NOTIFICATIONS: {
-    subscribe(callback: RpcStub<NotificationCallback>, subscription: {
-      alertType: string;
-      createPolicy: boolean;
-    }): Promise<void>;
+    subscribe(
+      callback: RpcStub<NotificationCallback>,
+      subscription: {
+        alertType: string;
+        createPolicy: boolean;
+      },
+    ): Promise<void>;
     getStatus(): ReturnType<WorkerIssueInbox["getNotificationStatus"]>;
   };
   INVESTIGATOR?: {
-    spawnCallable(title: string, options: { types: string; mainType: string }): Promise<Disposable & {
-      investigate(task: RpcStub<InvestigationTask>): Promise<void>;
-    }>;
+    spawnCallable(
+      title: string,
+      options: { types: string; mainType: string },
+    ): Promise<
+      Disposable & {
+        investigate(task: RpcStub<InvestigationTask>): Promise<void>;
+      }
+    >;
   };
 }
 
@@ -59,60 +72,80 @@ export class Gadget extends DurableObject<GadgetEnv, unknown> implements WorkerI
     ctx.storage.sql.exec(`CREATE TABLE IF NOT EXISTS investigations (
       run_key TEXT PRIMARY KEY, issue_id TEXT NOT NULL, notification TEXT NOT NULL,
       status TEXT NOT NULL, report TEXT, created_at INTEGER NOT NULL)`);
+    ctx.storage.sql.exec(`CREATE TABLE IF NOT EXISTS investigation_attempts (
+      run_key TEXT PRIMARY KEY, token TEXT NOT NULL)`);
     ctx.storage.sql.exec(`UPDATE investigations SET status = 'delivery_unknown'
-      WHERE status IN ('allocating', 'dispatching')`);
+      WHERE status = 'dispatching'`);
+    ctx.storage.sql.exec("UPDATE investigations SET status = 'failed' WHERE status = 'allocating'");
   }
 
   [restore](params: unknown) {
     if (!isRecord(params)) throw new Error("Unknown persistent callback.");
     const inbox = this;
     if (params.kind === "notification") {
-      return new RpcStub(new class extends RpcTarget implements NotificationCallback {
-        onNotification(notification: unknown): Promise<void> {
-          return inbox.onNotification(notification);
-        }
-      }());
+      return new RpcStub(
+        new (class extends RpcTarget implements NotificationCallback {
+          onNotification(notification: unknown): Promise<void> {
+            return inbox.onNotification(notification);
+          }
+        })(),
+      );
     }
-    if (params.kind === "investigation" && typeof params.key === "string" && this.getRun(params.key)) {
+    if (
+      params.kind === "investigation" &&
+      typeof params.key === "string" &&
+      this.getRun(params.key)
+    ) {
       const key = params.key;
       const storage = this.ctx.storage;
-      return new RpcStub(new class extends RpcTarget implements InvestigationTask {
-        async getContext(): Promise<unknown> {
-          const run = inbox.getRun(key);
-          if (!run) throw new Error("Investigation no longer exists.");
-          return {
-            ...await storage.get<WorkerScope>("scope"),
-            notification: JSON.parse(run.notification),
-          };
-        }
-
-        async complete(report: string): Promise<void> {
-          if (typeof report !== "string" || !report.trim() || report.length > 64_000) {
-            throw new Error("Provide a non-empty investigation report of at most 64000 characters.");
+      return new RpcStub(
+        new (class extends RpcTarget implements InvestigationTask {
+          async getContext(): Promise<unknown> {
+            const run = inbox.getRun(key);
+            if (!run) throw new Error("Investigation no longer exists.");
+            return {
+              ...(await storage.get<WorkerScope>("scope")),
+              notification: JSON.parse(run.notification),
+            };
           }
-          storage.sql.exec(
-            "UPDATE investigations SET report = ?, status = 'completed' WHERE run_key = ?",
-            report,
-            key,
-          );
-        }
-      }());
+
+          async complete(report: string): Promise<void> {
+            if (typeof report !== "string" || !report.trim() || report.length > 64_000) {
+              throw new Error(
+                "Provide a non-empty investigation report of at most 64000 characters.",
+              );
+            }
+            storage.sql.exec(
+              "UPDATE investigations SET report = ?, status = 'completed' WHERE run_key = ?",
+              report,
+              key,
+            );
+          }
+        })(),
+      );
     }
     throw new Error("Unknown persistent callback.");
   }
 
   getRun(key: string): StoredInvestigation | undefined {
-    return this.ctx.storage.sql.exec<StoredInvestigation>(
-      "SELECT * FROM investigations WHERE run_key = ?", key,
-    ).toArray()[0];
+    return this.ctx.storage.sql
+      .exec<StoredInvestigation>("SELECT * FROM investigations WHERE run_key = ?", key)
+      .toArray()[0];
   }
 
   async initialize(scope: WorkerScope): Promise<void> {
-    if (!scope || !/^[a-f\d]{32}$/.test(scope.accountId) || !/^[a-z\d_-]{1,63}$/i.test(scope.workerName)) {
+    if (
+      !scope ||
+      !/^[a-f\d]{32}$/.test(scope.accountId) ||
+      !/^[a-z\d_-]{1,63}$/i.test(scope.workerName)
+    ) {
       throw new Error("Invalid Worker scope.");
     }
     const previous = await this.ctx.storage.get<WorkerScope>("scope");
-    if (previous && (previous.accountId !== scope.accountId || previous.workerName !== scope.workerName)) {
+    if (
+      previous &&
+      (previous.accountId !== scope.accountId || previous.workerName !== scope.workerName)
+    ) {
       throw new Error("This investigation inbox belongs to a different Worker.");
     }
     if (this.initializing) {
@@ -120,9 +153,14 @@ export class Gadget extends DurableObject<GadgetEnv, unknown> implements WorkerI
       return this.initialize(scope);
     }
     this.initializing = (async () => {
-      await this.ctx.storage.put("scope", { accountId: scope.accountId, workerName: scope.workerName });
-      if (!await this.ctx.storage.get("subscribed")) {
-        using callback: RpcStub<NotificationCallback> = await this.ctx.restore({ kind: "notification" });
+      await this.ctx.storage.put("scope", {
+        accountId: scope.accountId,
+        workerName: scope.workerName,
+      });
+      if (!(await this.ctx.storage.get("subscribed"))) {
+        using callback: RpcStub<NotificationCallback> = await this.ctx.restore({
+          kind: "notification",
+        });
         await this.env.CLOUDFLARE_NOTIFICATIONS.subscribe(callback, {
           alertType: "workers_observability_real_time_issue",
           createPolicy: false,
@@ -143,13 +181,13 @@ export class Gadget extends DurableObject<GadgetEnv, unknown> implements WorkerI
 
   async getSetupStatus() {
     return {
-      ...await this.ctx.storage.get<WorkerScope>("scope"),
+      ...(await this.ctx.storage.get<WorkerScope>("scope")),
       investigationsEnabled: Boolean(await this.ctx.storage.get("investigationsEnabled")),
     };
   }
 
   async enableInvestigations() {
-    if (!await this.ctx.storage.get("scope") || !this.env.INVESTIGATOR) {
+    if (!(await this.ctx.storage.get("scope")) || !this.env.INVESTIGATOR) {
       throw new Error("Connect the Worker-scoped investigator before enabling investigations.");
     }
     await this.ctx.storage.put("investigationsEnabled", true);
@@ -164,43 +202,117 @@ export class Gadget extends DurableObject<GadgetEnv, unknown> implements WorkerI
     const enabled = Boolean(await this.ctx.storage.get("investigationsEnabled"));
     const existing = this.getRun(identity.key);
     if (existing) {
-      if (existing.issue_id !== identity.issueId) throw new Error("Conflicting issue notification identity.");
+      if (existing.issue_id !== identity.issueId) {
+        // Durable diagnostic, with no attacker-controlled payload copied into server logs.
+        const conflicts = (await this.ctx.storage.get<number>("identityConflicts")) ?? 0;
+        await this.ctx.storage.put("identityConflicts", conflicts + 1);
+      }
       return;
     }
+    // Schedule before insertion: accepted pending work must survive process loss before alarm dispatch.
+    if (enabled) await this.ctx.storage.setAlarm(Date.now() + 1);
+    if (this.getRun(identity.key)) return this.onNotification(notification);
     // Persist the claim before any asynchronous allocation. An ambiguous send is never replayed.
     this.ctx.storage.sql.exec(
       "INSERT INTO investigations VALUES (?, ?, ?, ?, NULL, ?)",
       identity.key,
       identity.issueId,
       JSON.stringify(notification),
-      enabled ? "allocating" : "received",
+      enabled ? "pending" : "received",
       Date.now(),
     );
-    if (!enabled) return;
+  }
+
+  async alarm(): Promise<void> {
+    const pending = this.ctx.storage.sql
+      .exec<StoredInvestigation>(
+        "SELECT * FROM investigations WHERE status = 'pending' ORDER BY created_at LIMIT 10",
+      )
+      .toArray();
+    // More work or a crash must not strand later entries. No allocation runs inside the webhook.
+    if (pending.length) await this.ctx.storage.setAlarm(Date.now() + 1000);
+    await Promise.all(pending.map((run) => this.dispatch(run)));
+    // Let the final scheduled alarm fire once with no pending work. Deleting it here could race
+    // a notification scheduling a new run while allocation yielded.
+  }
+
+  async dispatch(run: StoredInvestigation): Promise<void> {
+    if (this.getRun(run.run_key)?.status !== "pending") return;
+    const token = crypto.randomUUID();
+    this.ctx.storage.sql.exec(
+      "INSERT OR REPLACE INTO investigation_attempts VALUES (?, ?)",
+      run.run_key,
+      token,
+    );
+    this.ctx.storage.sql.exec(
+      "UPDATE investigations SET status = 'allocating' WHERE run_key = ?",
+      run.run_key,
+    );
+    let dispatched = false;
     try {
+      const scope = await this.ctx.storage.get<WorkerScope>("scope");
+      if (!scope) throw new Error("Worker scope is unavailable.");
       if (!this.env.INVESTIGATOR) throw new Error("Investigator binding is unavailable.");
       using agent = await this.env.INVESTIGATOR.spawnCallable(
-        `Investigate ${scope.workerName}: ${identity.issueId}`,
+        `Investigate ${scope.workerName}: ${run.issue_id}`,
         { types: TASK_TYPES, mainType: "Investigator" },
       );
-      using task: RpcStub<InvestigationTask> = await this.ctx.restore({ kind: "investigation", key: identity.key });
-      this.ctx.storage.sql.exec(`UPDATE investigations SET status = 'dispatching' WHERE run_key = ?`, identity.key);
+      using task: RpcStub<InvestigationTask> = await this.ctx.restore({
+        kind: "investigation",
+        key: run.run_key,
+      });
+      // A binding change can instantiate a new facet while allocation is still awaiting RPC.
+      // Only the current attempt may dispatch; a late allocation from a retried facet is discarded.
+      const current = this.ctx.storage.sql
+        .exec<{ token: string }>(
+          "SELECT token FROM investigation_attempts WHERE run_key = ?",
+          run.run_key,
+        )
+        .toArray()[0];
+      if (current?.token !== token || this.getRun(run.run_key)?.status !== "allocating") return;
+      this.ctx.storage.sql.exec(
+        "UPDATE investigations SET status = 'dispatching' WHERE run_key = ?",
+        run.run_key,
+      );
+      dispatched = true;
       await agent.investigate(task);
       this.ctx.storage.sql.exec(
         "UPDATE investigations SET status = 'queued' WHERE run_key = ? AND status = 'dispatching'",
-        identity.key,
+        run.run_key,
       );
     } catch {
       this.ctx.storage.sql.exec(
-        "UPDATE investigations SET status = 'delivery_unknown' WHERE run_key = ? AND status != 'completed'",
-        identity.key,
+        `UPDATE investigations SET status = ? WHERE run_key = ? AND status IN ('allocating', 'dispatching')
+         AND EXISTS (SELECT 1 FROM investigation_attempts WHERE run_key = ? AND token = ?)`,
+        dispatched ? "delivery_unknown" : "failed",
+        run.run_key,
+        run.run_key,
+        token,
       );
     }
   }
 
   async listInvestigations() {
-    return this.ctx.storage.sql.exec<Investigation>(
-      "SELECT run_key, issue_id, status, report, created_at FROM investigations ORDER BY created_at DESC LIMIT 100",
-    ).toArray();
+    return this.ctx.storage.sql
+      .exec<Omit<InvestigationSummary, "has_report"> & { has_report: number }>(
+        "SELECT run_key, issue_id, status, report IS NOT NULL AS has_report, created_at FROM investigations ORDER BY created_at DESC LIMIT 100",
+      )
+      .toArray()
+      .map((run) => ({ ...run, has_report: !!run.has_report }));
+  }
+
+  async getInvestigationReport(runKey: string): Promise<string | null> {
+    return this.getRun(runKey)?.report ?? null;
+  }
+
+  async retryInvestigation(runKey: string): Promise<void> {
+    if (this.getRun(runKey)?.status !== "failed")
+      throw new Error("Only a failed allocation can be retried.");
+    await this.ctx.storage.setAlarm(Date.now() + 1);
+    // Recheck after the alarm write yields; a concurrent retry must not restart an active run.
+    this.ctx.storage.sql.exec(
+      "UPDATE investigations SET status = 'pending' WHERE run_key = ? AND status = 'failed'",
+      runKey,
+    );
   }
 }

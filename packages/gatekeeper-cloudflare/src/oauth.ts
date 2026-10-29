@@ -32,7 +32,7 @@ export function persistentScopesForResources(resourceUrlPatterns?: string[]): st
     ...BILLING_SCOPES,
     ...observabilityScopesForResources(resourceUrlPatterns?.filter(
       pattern => pattern !== NOTIFICATIONS_RESOURCE.urlPattern)),
-    ...(resourceUrlPatterns === undefined || resourceUrlPatterns.includes(NOTIFICATIONS_RESOURCE.urlPattern)
+    ...(resourceUrlPatterns?.includes(NOTIFICATIONS_RESOURCE.urlPattern)
       ? [NOTIFICATIONS_SCOPE] : []),
   ];
 }

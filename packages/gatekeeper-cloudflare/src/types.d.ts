@@ -517,14 +517,15 @@ export interface CloudflareObservabilitySession {
 
 /** A notification from the bound Cloudflare account, across any alert type. */
 export interface CloudflareNotification {
-  /** Retry identifier. Use it to make your handler idempotent; delivery is at least once. */
+  /** Hash of the JSON envelope. Identical retries share it; regenerated timestamps or evidence do
+   * not. Use product correlation and event-state identifiers for logical-run idempotency. */
   id: string;
   /** The account selected for this binding. */
   accountId: string;
   /** Cloudflare alert type, when the provider includes one. */
   alertType?: string;
   /** Generation time as an ISO 8601 timestamp. */
-  timestamp: string;
+  timestamp?: string;
   /** Notification policy identifier, when provided. */
   policyId?: string;
   /** Human-readable policy name, when provided. */
@@ -787,13 +788,21 @@ export interface CloudflareNotificationSubscription {
 
 /** Persistent notification callback implemented by a workspace or Gadget. */
 export interface CloudflareNotificationHook {
-  /** Accept an event promptly and idempotently. Throw to return HTTP 500 so ANS can retry.
+  /** Accept an event promptly and idempotently. Throw to retry this subscriber's durable handoff.
    * Start long-running work separately; ordering and exactly-once execution are not guaranteed. */
   onNotification(notification: CloudflareNotification): Promise<void>;
 }
 
 /** Delivery health and setup identifiers for this connection. */
 export interface CloudflareNotificationStatus {
+  /** Ability to use the Notifications grant; unavailable means a transient health-check failure. */
+  credentials: "ready" | "reconnect_required" | "unavailable";
+  /** Durable handoffs not yet accepted by their subscribers. */
+  pendingDeliveries: number;
+  /** Pending handoffs that have failed at least once. */
+  retryingDeliveries: number;
+  /** Maximum enabled hooks on this connection/account. */
+  subscriberLimit: number;
   /** Whether webhook setup has completed. */
   installed: boolean;
   /** Whether delivery has been stopped during disconnect. */

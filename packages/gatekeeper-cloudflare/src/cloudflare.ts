@@ -141,17 +141,19 @@ export default {
     } catch {
       // A misconfigured notification address must not break OAuth routes.
     }
-    // Retain old configured paths during an address migration; the receiver checks its stored URL.
-    notificationPath ??= parseNotificationWebhookPath(url.pathname, url.pathname.split("/webhooks/")[0]!);
+    // The standard gatekeeper path is the only historical fallback, never an arbitrary base.
+    notificationPath ??= parseNotificationWebhookPath(url.pathname, basePath);
     if (notificationPath) {
       if (req.method !== "POST") return new Response(null, { status: 405, headers: { Allow: "POST" } });
       const apiKey = req.headers.get("cf-webhook-auth");
-      if (!apiKey) return new Response(null, { status: 401 });
+      if (!apiKey || !/^[a-f\d]{64}$/i.test(apiKey)) return new Response(null, { status: 401 });
       try {
         const name = notificationReceiverName(notificationPath.userObjectId, notificationPath.accountId);
+        const receiver = ctx.exports.CloudflareNotificationReceiver.getByName(name);
+        const authenticated = await receiver.authenticateWebhook(apiKey, url.pathname);
+        if (authenticated !== 204) return new Response(null, { status: authenticated });
         const body = await readTextCapped(new Response(req.body, { headers: req.headers }),
           MAX_NOTIFICATION_BODY_BYTES);
-        const receiver = ctx.exports.CloudflareNotificationReceiver.getByName(name);
         const status = await receiver.receiveWebhook(apiKey,
           req.headers.get("content-type") ?? "", body, url.pathname);
         return new Response(null, { status });
@@ -159,6 +161,7 @@ export default {
         return new Response(null, { status: error instanceof ResponseTooLargeError ? 413 : 500 });
       }
     }
+    if (url.pathname.includes("/webhooks/")) return new Response(null, { status: 404 });
     if (!url.pathname.startsWith(basePath + "/") && url.pathname !== basePath) {
       throw new Error(`Request path ${url.pathname} does not match BASE_URL path ${basePath}`);
     }
@@ -379,6 +382,7 @@ export class UserAccount extends DurableObject<Env> {
 
   /** Makes the grant staged under `stageId` live; see GatekeeperUser.commitReconnect. */
   async commitReconnect(stageId: string): Promise<void> {
+    if (this.ctx.storage.kv.get("revoking")) throw new Error("Cloudflare disconnect cleanup is still pending. Connect a new account after disconnect completes.");
     const grant = commitStagedCredentials<StoredGrant>(this.ctx.storage.kv, Date.now(), stageId);
     if (!grant) throw new Error("No reconnect is awaiting confirmation. Please try again.");
     this.#writeGrant(grant);
@@ -389,6 +393,7 @@ export class UserAccount extends DurableObject<Env> {
     this.ctx.storage.kv.put<string>("refreshToken", grant.refreshToken);
     this.ctx.storage.kv.put<StoredAccessToken>("accessToken", grant.accessToken);
     this.ctx.storage.kv.put<string[]>("grantedScopes", grant.grantedScopes);
+    this.ctx.storage.kv.delete("credentialsExpired");
   }
 
   hasRefreshToken() {
@@ -402,6 +407,7 @@ export class UserAccount extends DurableObject<Env> {
    * token, or throws.
    */
   async getAccessToken(): Promise<string | null> {
+    if (this.ctx.storage.kv.get("credentialsExpired")) return null;
     const refreshToken = this.ctx.storage.kv.get<string>("refreshToken");
     if (!refreshToken) return null;
 
@@ -437,6 +443,7 @@ export class UserAccount extends DurableObject<Env> {
     if ("error" in outcome) {
       const { error } = outcome;
       if (isGrantDeath(error)) {
+        this.ctx.storage.kv.put("credentialsExpired", true);
         logger.info("refresh rejected; grant expired", { event: "credentials.refresh.expired", error });
         const callback = this.ctx.storage.kv.get<Fetcher<GatekeeperConnectCallback>>("callback");
         callback?.credentialsExpired().catch(err =>
@@ -467,6 +474,10 @@ export class UserAccount extends DurableObject<Env> {
   }
 
   async alarm(): Promise<void> {
+    if (this.ctx.storage.kv.get("revoking")) {
+      await this.revoke();
+      return;
+    }
     // Drop the account if the flow never completed, or if this was a transient auth-only sign-in
     // grant (used once to read the email for login).
     if (!this.hasRefreshToken() || this.ctx.storage.kv.get<boolean>("ephemeral")) {
@@ -479,8 +490,15 @@ export class UserAccount extends DurableObject<Env> {
     this.ctx.storage.kv.put(`notifications:${assertCloudflareAccountId(accountId)}`, true);
   }
 
+  /** Local grant fence for ingress; never refresh OAuth on the webhook hot path. */
+  hasNotificationGrant(): boolean {
+    return !this.ctx.storage.kv.get("revoking") && !this.ctx.storage.kv.get("credentialsExpired") &&
+      this.hasRefreshToken() && this.ctx.storage.kv.get<string[]>("grantedScopes")?.includes(NOTIFICATIONS_SCOPE) === true;
+  }
+
   async revoke(): Promise<void> {
     this.ctx.storage.kv.put("revoking", true);
+    await this.ctx.storage.setAlarm(Date.now() + 60_000);
     // Stop delivery before deleting provider resources. A transient cleanup failure retains
     // credentials for retry; a dead grant (null token) or denied access cleans up locally only.
     const accounts = [...this.ctx.storage.kv.list({ prefix: "notifications:" })].map(([key]) => key);
@@ -592,9 +610,16 @@ export class GatekeeperUserImpl extends WorkerEntrypoint<Env, GatekeeperUserImpl
             summary: "Delivery stopped",
             details: "Finish disconnecting this Cloudflare connection, then reconnect.",
           };
+          if (status.installed && status.credentials !== "ready") return {
+            summary: status.credentials === "reconnect_required" ? "Cloudflare authorization expired" : "Could not check Cloudflare authorization",
+            details: status.credentials === "reconnect_required"
+              ? "Reconnect this Cloudflare connection with Notifications access to resume delivery."
+              : "Reopen this connection to retry its authorization health check.",
+          };
           if (status.installed) return {
-            summary: `Connected · ${status.subscribers} active subscription${status.subscribers === 1 ? "" : "s"}`,
+            summary: `Connected · ${status.subscribers}/${status.subscriberLimit} active subscriptions`,
             details: `Destination ${status.webhookId}. ` +
+              `${status.pendingDeliveries} pending handoffs (${status.retryingDeliveries} attempted). ` +
               (status.lastTestAt ? `Last webhook test: ${status.lastTestAt}.` : "No webhook test received yet."),
           };
           try {
@@ -605,7 +630,7 @@ export class GatekeeperUserImpl extends WorkerEntrypoint<Env, GatekeeperUserImpl
               details: "Ask the deployment administrator to configure a public HTTPS notification address on port 443 before enabling this connection.",
             };
           }
-          return { summary: "Ready to connect" };
+          return { summary: "Ready to connect", details: `Up to ${status.subscriberLimit} notification subscriptions per connection/account.` };
         })) };
     }
     if (resourceUrlPattern === ACCOUNT_OBSERVABILITY_RESOURCE.urlPattern) {

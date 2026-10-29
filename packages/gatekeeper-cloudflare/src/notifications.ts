@@ -62,6 +62,10 @@ const MAX_RETAINED_DELIVERIES = 10_000;
 const MAX_HOOKS = 100;
 const POLICY_CLEANUP_RETRY_MS = 60_000;
 const MAX_POLICY_CLEANUP_RETRY_MS = 60 * 60_000;
+const DELIVERY_RETRY_MS = 60_000;
+const HANDOFF_TIMEOUT_MS = 10_000;
+const MAX_PENDING_DELIVERIES = 1000;
+const MAX_PENDING_BYTES = 16 * 1024 * 1024;
 
 type NotificationEnv = Cloudflare.Env & {
   BASE_URL?: string;
@@ -69,15 +73,26 @@ type NotificationEnv = Cloudflare.Env & {
 };
 type HookTarget = RpcTarget & CloudflareNotificationHook;
 type NotificationsProps = { userObjectId: string; accountId: string };
-type HookProps = NotificationsProps & { hookId: string; alertType: string; createPolicy?: boolean; policy?: CloudflareNotificationPolicySettings; policyKey?: string };
+type HookProps = NotificationsProps & {
+  hookId: string;
+  alertType: string;
+  createPolicy?: boolean;
+  policy?: CloudflareNotificationPolicySettings;
+  policyKey?: string;
+};
 type StoredHook = { props: HookProps; initiator: Fetcher<HookInitiator<HookTarget>> };
 type Installation = NotificationInstallation & NotificationsProps & { authHash: string };
 type AddressMigration = { apiKey: string; authHash: string; webhookUrl: string };
-type PolicyIntent = Partial<NotificationPolicy> & { alertType: string; policy?: CloudflareNotificationPolicySettings; needsReconcile?: boolean };
+type PolicyIntent = Partial<NotificationPolicy> & {
+  alertType: string;
+  policy?: CloudflareNotificationPolicySettings;
+  needsReconcile?: boolean;
+};
 
 function disposeHook(hook: StoredHook | undefined): void {
-  (hook?.initiator as (Fetcher<HookInitiator<HookTarget>> & Partial<Disposable>) | undefined)
-    ?.[Symbol.dispose]?.();
+  (hook?.initiator as (Fetcher<HookInitiator<HookTarget>> & Partial<Disposable>) | undefined)?.[
+    Symbol.dispose
+  ]?.();
 }
 
 function receiver(ctx: DurableObjectState<NotificationsProps>, props: NotificationsProps) {
@@ -95,7 +110,9 @@ function notificationObservation(notification: CloudflareNotification): Observat
   const alertType = auditIdentifier(notification.alertType);
   return {
     title: `Cloudflare notification: ${alertType}`,
-    description: `Receive an authenticated Cloudflare notification for account ${notification.accountId}. ` +
+    containsRestrictedData: true,
+    description:
+      `Receive an authenticated Cloudflare notification for account ${notification.accountId}. ` +
       `Alert type: ${alertType}; policy ID: ${auditIdentifier(notification.policyId)}; ` +
       `event state: ${auditIdentifier(notification.event)}. The body includes free-form text and ` +
       "product-specific evidence.",
@@ -136,9 +153,18 @@ class CloudflareNotificationsSessionImpl
       callback,
       {
         title: `Cloudflare ${props.alertType} alerts for ${props.accountId}`,
-        description: `Receive ${props.alertType} alerts in account ${props.accountId}. ` +
-          (props.createPolicy ? `Create or share an enabled managed policy using this connection's webhook. Receive only that policy's alerts; remove it when its last subscriber is disabled.\n\nExact policy settings (JSON):\n\n${JSON.stringify(policy, null, 2).split("\n").map(line => `    ${line}`).join("\n")}` :
-            "Receive every alert of this type from existing policies or Cloudflare Send to destination; do not create a managed policy."),
+        description:
+          `Receive ${props.alertType} alerts in account ${props.accountId}. ` +
+          (props.createPolicy
+            ? `Create or share an enabled managed policy using this connection's webhook. Receive only that policy's alerts; remove it when its last subscriber is disabled.\n\nExact policy settings (JSON):\n\n${JSON.stringify(
+                policy,
+                null,
+                2,
+              )
+                .split("\n")
+                .map((line) => `    ${line}`)
+                .join("\n")}`
+            : "Receive every alert of this type from existing policies or Cloudflare Send to destination; do not create a managed policy."),
       },
     );
   }
@@ -213,14 +239,19 @@ export class CloudflareNotificationHookController
   }
 }
 
-/** Webhook handoff per connection/account. ANS owns retries; only successful receipts are stored. */
+/** Bounded durable handoffs per subscriber; HTTP acceptance does not wait on workspace callbacks. */
 export class CloudflareNotificationReceiver extends DurableObject<NotificationEnv> {
   #mutations = new SerialTaskQueue();
+  #alarms = new SerialTaskQueue();
   #provisioning?: Promise<void>;
   #inFlight = new Map<string, Promise<boolean>>();
   #ensureReceipts(): void {
     this.ctx.storage.sql.exec(`CREATE TABLE IF NOT EXISTS notification_receipts (
       notification_id TEXT NOT NULL, hook_id TEXT NOT NULL, delivered_at INTEGER NOT NULL,
+      PRIMARY KEY(notification_id, hook_id))`);
+    this.ctx.storage.sql.exec(`CREATE TABLE IF NOT EXISTS notification_deliveries (
+      notification_id TEXT NOT NULL, hook_id TEXT NOT NULL, notification TEXT NOT NULL,
+      attempts INTEGER NOT NULL DEFAULT 0, next_attempt INTEGER NOT NULL,
       PRIMARY KEY(notification_id, hook_id))`);
   }
 
@@ -245,24 +276,57 @@ export class CloudflareNotificationReceiver extends DurableObject<NotificationEn
     for (const hook of hooks) disposeHook(hook);
     return hooks.length;
   }
+  #hasHook(hookId: string): boolean {
+    const hook = this.ctx.storage.kv.get<StoredHook>(`hook:${hookId}`);
+    disposeHook(hook);
+    return hook !== undefined;
+  }
   #policies(): [string, PolicyIntent][] {
     return [...this.ctx.storage.kv.list<PolicyIntent>({ prefix: "policy:" })];
   }
   #unusedPolicies(): [string, PolicyIntent][] {
     const hooks = this.#hooks();
-    const used = new Set(hooks.filter(({ props }) => props.createPolicy !== false)
-      .map(({ props }) => props.policyKey ?? `policy:${props.alertType}`));
+    const used = new Set(
+      hooks
+        .filter(({ props }) => props.createPolicy !== false)
+        .map(({ props }) => props.policyKey ?? `policy:${props.alertType}`),
+    );
     for (const hook of hooks) disposeHook(hook);
     return this.#policies().filter(([key]) => !used.has(key));
   }
   async #schedulePolicyCleanup(): Promise<void> {
-    if (await this.ctx.storage.getAlarm() === null)
-      await this.ctx.storage.setAlarm(Date.now() + POLICY_CLEANUP_RETRY_MS);
+    const at =
+      this.ctx.storage.kv.get<number>("policyCleanupAt") ??
+      Date.now() +
+        (this.ctx.storage.kv.get<number>("policyCleanupRetryDelay") ?? POLICY_CLEANUP_RETRY_MS);
+    this.ctx.storage.kv.put("policyCleanupAt", at);
+    await this.#scheduleAlarm(at);
+  }
+  async #scheduleAlarm(at: number): Promise<void> {
+    await this.#alarms.run(() => this.#scheduleAlarmUnlocked(at));
+  }
+  async #scheduleAlarmUnlocked(at: number): Promise<void> {
+    const current = await this.ctx.storage.getAlarm();
+    if (current === null || current > at) await this.ctx.storage.setAlarm(at);
   }
   async #clearIdleCleanupAlarm(): Promise<void> {
-    if (this.#unusedPolicies().length) return;
-    await this.ctx.storage.deleteAlarm();
-    this.ctx.storage.kv.delete("policyCleanupRetryDelay");
+    await this.#alarms.run(async () => {
+      const cleanupPending = this.#unusedPolicies().length > 0;
+      this.#ensureReceipts();
+      const pending = this.ctx.storage.sql
+        .exec<{ at: number | null }>("SELECT MIN(next_attempt) AS at FROM notification_deliveries")
+        .one().at;
+      const cleanupAt = cleanupPending
+        ? (this.ctx.storage.kv.get<number>("policyCleanupAt") ?? Date.now())
+        : Infinity;
+      const at = Math.min(pending ?? Infinity, cleanupAt);
+      if (at === Infinity) await this.ctx.storage.deleteAlarm();
+      else await this.ctx.storage.setAlarm(at);
+      if (!cleanupPending) {
+        this.ctx.storage.kv.delete("policyCleanupRetryDelay");
+        this.ctx.storage.kv.delete("policyCleanupAt");
+      }
+    });
   }
   async #token(owner: NotificationsProps): Promise<string> {
     const account = this.#account(owner.userObjectId);
@@ -306,7 +370,10 @@ export class CloudflareNotificationReceiver extends DurableObject<NotificationEn
   async #reconcileAddress(props: NotificationsProps, installation: Installation): Promise<void> {
     const webhookUrl = `${notificationWebhookBaseUrl(configuredNotificationBaseUrl(this.env))}/webhooks/${props.userObjectId}/${props.accountId}`;
     const providerUrl = await getNotificationDestinationUrl(
-      await this.#token(props), props.accountId, installation.webhookId);
+      await this.#token(props),
+      props.accountId,
+      installation.webhookId,
+    );
     if (providerUrl === null) {
       // Provider deletion invalidates the persisted setup marker. Reuse provisioning's exact-URL
       // recovery so a lost creation response cannot create duplicate destinations on retry.
@@ -319,7 +386,12 @@ export class CloudflareNotificationReceiver extends DurableObject<NotificationEn
       return;
     }
     // Older installations may not have recorded their URL. Their known destination ID is authoritative.
-    if (providerUrl === webhookUrl && this.ctx.storage.kv.get("webhookUrl") === webhookUrl && !this.ctx.storage.kv.get("addressMigration")) return;
+    if (
+      providerUrl === webhookUrl &&
+      this.ctx.storage.kv.get("webhookUrl") === webhookUrl &&
+      !this.ctx.storage.kv.get("addressMigration")
+    )
+      return;
     let migration = this.ctx.storage.kv.get<AddressMigration>("addressMigration");
     if (!migration) {
       const apiKey = generateWebhookApiKey();
@@ -327,8 +399,13 @@ export class CloudflareNotificationReceiver extends DurableObject<NotificationEn
       // Retain the pending secret only until success so a lost PUT response can be retried exactly.
       this.ctx.storage.kv.put("addressMigration", migration);
     }
-    await updateNotificationDestination(await this.#token(props), props.accountId,
-      installation.webhookId, migration.webhookUrl, migration.apiKey);
+    await updateNotificationDestination(
+      await this.#token(props),
+      props.accountId,
+      installation.webhookId,
+      migration.webhookUrl,
+      migration.apiKey,
+    );
     installation.authHash = migration.authHash;
     this.ctx.storage.kv.put("installation", installation);
     this.ctx.storage.kv.put("webhookUrl", migration.webhookUrl);
@@ -338,9 +415,16 @@ export class CloudflareNotificationReceiver extends DurableObject<NotificationEn
 
   async enable(props: HookProps, initiator: Fetcher<HookInitiator<HookTarget>>): Promise<void> {
     await this.#mutations.run(async () => {
-      validateNotificationSubscription({ alertType: props.alertType, createPolicy: props.createPolicy, policy: props.policy });
+      validateNotificationSubscription({
+        alertType: props.alertType,
+        createPolicy: props.createPolicy,
+        policy: props.policy,
+      });
       const owner = this.ctx.storage.kv.get<NotificationsProps>("owner");
-      if (owner && (owner.accountId !== props.accountId || owner.userObjectId !== props.userObjectId))
+      if (
+        owner &&
+        (owner.accountId !== props.accountId || owner.userObjectId !== props.userObjectId)
+      )
         throw new Error("Notification receiver belongs to another account.");
       if (this.ctx.storage.kv.get("suspended"))
         throw new Error("This notification connection has been disconnected.");
@@ -366,15 +450,27 @@ export class CloudflareNotificationReceiver extends DurableObject<NotificationEn
       const policyKey = await notificationPolicyKey(props.alertType, props.policy);
       props = { ...props, policyKey };
       const priorPolicy = this.ctx.storage.kv.get<PolicyIntent>(policyKey);
-      if (props.createPolicy !== false && !priorPolicy) this.ctx.storage.kv.put<PolicyIntent>(policyKey, { alertType: props.alertType, policy: props.policy });
+      if (props.createPolicy !== false && !priorPolicy)
+        this.ctx.storage.kv.put<PolicyIntent>(policyKey, {
+          alertType: props.alertType,
+          policy: props.policy,
+        });
       if (props.createPolicy !== false && (!priorPolicy?.policyId || priorPolicy.needsReconcile)) {
         // An interrupted POST may have created a policy without installing its hook.
         await this.#schedulePolicyCleanup();
         const policy = await provisionNotificationPolicy(
-          await this.#token(props), props.accountId, installation.webhookId,
-          props.alertType, props.userObjectId, props.policy,
+          await this.#token(props),
+          props.accountId,
+          installation.webhookId,
+          props.alertType,
+          props.userObjectId,
+          props.policy,
         );
-        this.ctx.storage.kv.put<PolicyIntent>(policyKey, { alertType: props.alertType, policy: props.policy, ...policy });
+        this.ctx.storage.kv.put<PolicyIntent>(policyKey, {
+          alertType: props.alertType,
+          policy: props.policy,
+          ...policy,
+        });
       }
       const replaced = this.ctx.storage.kv.get<StoredHook>(key);
       try {
@@ -390,7 +486,8 @@ export class CloudflareNotificationReceiver extends DurableObject<NotificationEn
             event: "notification.policy.cleanup.failed",
             accountId: props.accountId,
             error,
-          }));
+          }),
+        );
       }
       await this.#clearIdleCleanupAlarm();
     });
@@ -400,17 +497,17 @@ export class CloudflareNotificationReceiver extends DurableObject<NotificationEn
     await this.#mutations.run(async () => {
       const key = `hook:${hookId}`;
       const existing = this.ctx.storage.kv.get<StoredHook>(key);
-      if (existing && existing.props.alertType !== alertType)
+      if (existing && existing.props.alertType !== alertType) {
+        disposeHook(existing);
         throw new Error("Notification hook alert type mismatch.");
+      }
       // Arm recovery before removing the hook: the Workshop need not call disable again.
       if (this.#policies().length) await this.#schedulePolicyCleanup();
       this.ctx.storage.kv.delete(key);
       disposeHook(existing);
-      await Promise.allSettled([...this.#inFlight]
-        .filter(([deliveryKey]) => deliveryKey.endsWith(`:${hookId}`))
-        .map(([, delivery]) => delivery));
       this.#ensureReceipts();
       this.ctx.storage.sql.exec("DELETE FROM notification_receipts WHERE hook_id = ?", hookId);
+      this.ctx.storage.sql.exec("DELETE FROM notification_deliveries WHERE hook_id = ?", hookId);
       for (const [policyKey, policy] of this.#policies()) {
         if (policy.alertType === alertType) await this.#removeUnusedPolicy(policyKey);
       }
@@ -429,38 +526,54 @@ export class CloudflareNotificationReceiver extends DurableObject<NotificationEn
     if (!installation) throw new Error("Notification destination is missing.");
     this.ctx.storage.kv.put<PolicyIntent>(policyKey, { ...policy, needsReconcile: true });
     await this.#schedulePolicyCleanup();
-    await removeNotificationPolicy(await this.#token(owner), owner.accountId,
-      owner.userObjectId, policy.alertType, installation.webhookId,
-      policy.policyId ? { policyId: policy.policyId } : undefined, policy.policy);
+    await removeNotificationPolicy(
+      await this.#token(owner),
+      owner.accountId,
+      owner.userObjectId,
+      policy.alertType,
+      installation.webhookId,
+      policy.policyId ? { policyId: policy.policyId } : undefined,
+      policy.policy,
+    );
     this.ctx.storage.kv.delete(policyKey);
   }
 
   /** Retry unused managed-policy cleanup independently of subscribers, under the mutation lock. */
   async alarm(): Promise<void> {
+    if (this.ctx.storage.kv.get("suspended")) return;
+    await this.deliverPending();
     await this.#mutations.run(async () => {
       if (this.ctx.storage.kv.get("suspended")) return;
+      if (
+        !this.#unusedPolicies().length ||
+        (this.ctx.storage.kv.get<number>("policyCleanupAt") ?? 0) > Date.now()
+      ) {
+        await this.#clearIdleCleanupAlarm();
+        return;
+      }
       const delay = Math.min(
         (this.ctx.storage.kv.get<number>("policyCleanupRetryDelay") ?? POLICY_CLEANUP_RETRY_MS) * 2,
         MAX_POLICY_CLEANUP_RETRY_MS,
       );
       this.ctx.storage.kv.put("policyCleanupRetryDelay", delay);
+      this.ctx.storage.kv.put("policyCleanupAt", Date.now() + delay);
       // Schedule before contacting ANS, so interruption does not exhaust the runtime's retries.
-      await this.ctx.storage.setAlarm(Date.now() + delay);
+      await this.#scheduleAlarm(Date.now() + delay);
       for (const [key] of this.#unusedPolicies()) {
         await this.#removeUnusedPolicy(key).catch((error: unknown) =>
           logger.warn("notification policy cleanup retry failed", {
             event: "notification.policy.cleanup.failed",
             error,
-          }));
+          }),
+        );
       }
       await this.#clearIdleCleanupAlarm();
     });
   }
   async suspend(): Promise<void> {
     this.ctx.storage.kv.put("suspended", true);
-    // Wait for provider setup and already-started callbacks before deleting their resources.
+    // Fence late callback completions without waiting on an unresponsive subscriber.
     await this.#mutations.run(async () => {
-      await Promise.all(this.#inFlight.values());
       await this.#provisioning?.catch(() => undefined);
       await this.ctx.storage.deleteAlarm();
     });
@@ -474,11 +587,12 @@ export class CloudflareNotificationReceiver extends DurableObject<NotificationEn
     await this.suspend();
     const owner = this.ctx.storage.kv.get<NotificationsProps>("owner");
     if (owner) {
-      const skip = (reason: unknown) => logger.warn("notification provider cleanup skipped", {
-        event: "notification.revoke.cleanup.skipped",
-        accountId: owner.accountId,
-        error: reason,
-      });
+      const skip = (reason: unknown) =>
+        logger.warn("notification provider cleanup skipped", {
+          event: "notification.revoke.cleanup.skipped",
+          accountId: owner.accountId,
+          error: reason,
+        });
       if (!token) skip("Cloudflare credentials are no longer available.");
       else {
         try {
@@ -496,6 +610,7 @@ export class CloudflareNotificationReceiver extends DurableObject<NotificationEn
     }
     this.#ensureReceipts();
     this.ctx.storage.sql.exec("DELETE FROM notification_receipts");
+    this.ctx.storage.sql.exec("DELETE FROM notification_deliveries");
   }
 
   async #removeProviderResources(token: string, owner: NotificationsProps): Promise<void> {
@@ -503,9 +618,15 @@ export class CloudflareNotificationReceiver extends DurableObject<NotificationEn
     const webhookUrl = this.ctx.storage.kv.get<string>("webhookUrl");
     for (const [key, policy] of this.#policies()) {
       if (!installation) throw new Error("Notification destination is missing.");
-      await removeNotificationPolicy(token, owner.accountId, owner.userObjectId,
-        policy.alertType, installation.webhookId,
-        policy.policyId ? { policyId: policy.policyId } : undefined, policy.policy);
+      await removeNotificationPolicy(
+        token,
+        owner.accountId,
+        owner.userObjectId,
+        policy.alertType,
+        installation.webhookId,
+        policy.policyId ? { policyId: policy.policyId } : undefined,
+        policy.policy,
+      );
       this.ctx.storage.kv.delete(key);
     }
     if (webhookUrl)
@@ -514,30 +635,73 @@ export class CloudflareNotificationReceiver extends DurableObject<NotificationEn
 
   async getStatus(): Promise<CloudflareNotificationStatus> {
     const installation = this.ctx.storage.kv.get<Installation>("installation");
+    this.#ensureReceipts();
+    const pending = this.ctx.storage.sql
+      .exec<{ pending: number; retrying: number }>(
+        "SELECT COUNT(*) AS pending, COALESCE(SUM(attempts > 0), 0) AS retrying FROM notification_deliveries",
+      )
+      .one();
+    const credentials = installation
+      ? await this.#hasCredentials(installation).then(
+          (ready) => (ready ? ("ready" as const) : ("reconnect_required" as const)),
+          () => "unavailable" as const,
+        )
+      : ("reconnect_required" as const);
     return {
       installed: !!this.ctx.storage.kv.get("setupComplete"),
       suspended: !!this.ctx.storage.kv.get("suspended"),
       webhookId: installation?.webhookId,
-      policies: this.#policies().filter(([, policy]) => policy.policyId)
-        .map(([, policy]) => ({ alertType: policy.alertType, policyId: policy.policyId!, ...(policy.policy && Object.keys(policy.policy).length ? { policy: policy.policy } : {}) })),
+      policies: this.#policies()
+        .filter(([, policy]) => policy.policyId)
+        .map(([, policy]) => ({
+          alertType: policy.alertType,
+          policyId: policy.policyId!,
+          ...(policy.policy && Object.keys(policy.policy).length ? { policy: policy.policy } : {}),
+        })),
       subscribers: this.#hookCount(),
       lastTestAt: this.ctx.storage.kv.get<string>("lastTestAt"),
       lastReceivedAt: this.ctx.storage.kv.get<string>("lastReceivedAt"),
+      credentials,
+      pendingDeliveries: pending.pending,
+      retryingDeliveries: pending.retrying,
+      subscriberLimit: MAX_HOOKS,
     };
   }
 
-  async receiveWebhook(apiKey: string, contentType: string, body: string, requestPath?: string): Promise<number> {
-    if (contentType.split(";")[0]?.trim().toLowerCase() !== "application/json") return 415;
-    if (new TextEncoder().encode(body).byteLength > MAX_NOTIFICATION_BODY_BYTES) return 413;
+  /** Authenticate headers and the installed path before the HTTP entrypoint reads a request body. */
+  async authenticateWebhook(apiKey: string, requestPath?: string): Promise<number> {
     if (this.ctx.storage.kv.get("suspended")) return 410;
     const installation = this.ctx.storage.kv.get<Installation>("installation");
     const migration = this.ctx.storage.kv.get<AddressMigration>("addressMigration");
-    const hashes = [this.ctx.storage.kv.get<string>("pendingAuthHash"), installation?.authHash, migration?.authHash];
-    if (!(await Promise.all(hashes.map(hash => hash ? matchesWebhookApiKey(apiKey, hash) : false))).some(Boolean)) return 401;
+    const hashes = [
+      this.ctx.storage.kv.get<string>("pendingAuthHash"),
+      installation?.authHash,
+      migration?.authHash,
+    ];
+    if (
+      !(
+        await Promise.all(hashes.map((hash) => (hash ? matchesWebhookApiKey(apiKey, hash) : false)))
+      ).some(Boolean)
+    )
+      return 401;
     if (requestPath) {
       const urls = [this.ctx.storage.kv.get<string>("webhookUrl"), migration?.webhookUrl];
-      if (!urls.some(url => url && new URL(url).pathname === requestPath)) return 404;
+      if (!urls.some((url) => url && new URL(url).pathname === requestPath)) return 404;
     }
+    return 204;
+  }
+
+  async receiveWebhook(
+    apiKey: string,
+    contentType: string,
+    body: string,
+    requestPath?: string,
+  ): Promise<number> {
+    const authenticated = await this.authenticateWebhook(apiKey, requestPath);
+    if (authenticated !== 204) return authenticated;
+    if (contentType.split(";")[0]?.trim().toLowerCase() !== "application/json") return 415;
+    if (new TextEncoder().encode(body).byteLength > MAX_NOTIFICATION_BODY_BYTES) return 413;
+    const installation = this.ctx.storage.kv.get<Installation>("installation");
     let notification: CloudflareNotification;
     try {
       if (isWebhookTest(JSON.parse(body))) {
@@ -549,7 +713,7 @@ export class CloudflareNotificationReceiver extends DurableObject<NotificationEn
     } catch {
       return 400;
     }
-    if (!(await this.#hasCredentials(installation!))) return 500;
+    if (!(await this.#account(installation!.userObjectId).hasNotificationGrant())) return 503;
     // Recheck after hashing yielded: a concurrent disconnect must win over new delivery.
     if (this.ctx.storage.kv.get("suspended")) return 410;
     this.#ensureReceipts();
@@ -561,17 +725,26 @@ export class CloudflareNotificationReceiver extends DurableObject<NotificationEn
     const normalizedId = (id: string | undefined) => id?.replaceAll("-", "").toLowerCase();
     // Historical hooks have no settings: resolve their existing alert-type-only policy in place.
     // Never fall back to type routing for a managed hook, even during incomplete provisioning.
-    const missingRouting = available.some(({ props }) => props.createPolicy === false
-      ? !notification.alertType : !notification.policyId);
-    if (missingRouting) {
-      for (const hook of available) disposeHook(hook);
-      return 500;
-    }
+    let missingRouting = false;
     const hooks = available.filter(({ props }) => {
+      if (notification.alertType !== undefined && notification.alertType !== props.alertType)
+        return false;
+      if (
+        (props.createPolicy === false && !notification.alertType) ||
+        (props.createPolicy !== false && !notification.policyId)
+      ) {
+        missingRouting = true;
+        return false;
+      }
       if (props.createPolicy === false) return notification.alertType === props.alertType;
-      const policy = this.ctx.storage.kv.get<PolicyIntent>(props.policyKey ?? `policy:${props.alertType}`);
-      return policy?.policyId !== undefined && normalizedId(notification.policyId) === normalizedId(policy.policyId) &&
-        (notification.alertType === undefined || notification.alertType === props.alertType);
+      const policy = this.ctx.storage.kv.get<PolicyIntent>(
+        props.policyKey ?? `policy:${props.alertType}`,
+      );
+      return (
+        policy?.policyId !== undefined &&
+        normalizedId(notification.policyId) === normalizedId(policy.policyId) &&
+        (notification.alertType === undefined || notification.alertType === props.alertType)
+      );
     });
     for (const hook of available) if (!hooks.includes(hook)) disposeHook(hook);
     if (!hooks.length) {
@@ -581,11 +754,133 @@ export class CloudflareNotificationReceiver extends DurableObject<NotificationEn
         policyId: auditIdentifier(notification.policyId),
       });
     }
-    const results = await Promise.all(hooks.map((hook) => this.#handoff(hook, notification)));
-    if (results.some((delivered) => !delivered)) return 500;
+    if (missingRouting)
+      logger.warn("notification missing subscriber routing information", {
+        event: "notification.routing.incomplete",
+      });
+    if (missingRouting && !hooks.length) return 500;
     if (this.ctx.storage.kv.get("suspended")) return 410;
-    this.ctx.storage.kv.put("lastReceivedAt", new Date().toISOString());
-    return 204;
+    const serialized = JSON.stringify(notification);
+    try {
+      return await this.#alarms.run(async () => {
+        // Serialize scheduling with enqueue/idle cleanup, so a cleared alarm cannot strand an INSERT.
+        if (hooks.length) await this.#scheduleAlarmUnlocked(Date.now() + 1000);
+        if (this.ctx.storage.kv.get("suspended")) return 410;
+        const newHooks = hooks.filter(({ props }) => {
+          const current = this.ctx.storage.kv.get<StoredHook>(`hook:${props.hookId}`);
+          disposeHook(current);
+          return (
+            !!current &&
+            !this.ctx.storage.sql
+              .exec(
+                `SELECT 1 FROM notification_receipts WHERE notification_id = ? AND hook_id = ?
+       UNION ALL SELECT 1 FROM notification_deliveries WHERE notification_id = ? AND hook_id = ?`,
+                notification.id,
+                props.hookId,
+                notification.id,
+                props.hookId,
+              )
+              .toArray().length
+          );
+        });
+        const queued = this.ctx.storage.sql
+          .exec<{ count: number; bytes: number }>(
+            "SELECT COUNT(*) AS count, COALESCE(SUM(length(CAST(notification AS BLOB))), 0) AS bytes FROM notification_deliveries",
+          )
+          .one();
+        if (
+          queued.count + newHooks.length > MAX_PENDING_DELIVERIES ||
+          queued.bytes + new TextEncoder().encode(serialized).byteLength * newHooks.length >
+            MAX_PENDING_BYTES
+        )
+          return 503;
+        for (const { props } of newHooks) {
+          this.ctx.storage.sql.exec(
+            "INSERT OR IGNORE INTO notification_deliveries VALUES (?, ?, ?, 0, ?)",
+            notification.id,
+            props.hookId,
+            serialized,
+            Date.now(),
+          );
+        }
+        this.ctx.storage.kv.put("lastReceivedAt", new Date().toISOString());
+        return 204;
+      });
+    } finally {
+      for (const hook of hooks) disposeHook(hook);
+    }
+  }
+
+  /** Attempt each due subscriber independently; failures stay queued across restarts. */
+  async deliverPending(): Promise<void> {
+    if (this.ctx.storage.kv.get("suspended")) return;
+    this.#ensureReceipts();
+    const owner = this.ctx.storage.kv.get<NotificationsProps>("owner");
+    if (owner && !(await this.#account(owner.userObjectId).hasNotificationGrant())) {
+      const nextAttempt = Date.now() + DELIVERY_RETRY_MS;
+      this.ctx.storage.sql.exec(
+        "UPDATE notification_deliveries SET next_attempt = ? WHERE next_attempt < ?",
+        nextAttempt,
+        nextAttempt,
+      );
+      await this.#scheduleAlarm(nextAttempt);
+      return;
+    }
+    if (this.ctx.storage.kv.get("suspended")) return;
+    const pending = this.ctx.storage.sql
+      .exec<{
+        notification_id: string;
+        hook_id: string;
+        notification: string;
+        attempts: number;
+      }>("SELECT * FROM notification_deliveries WHERE next_attempt <= ? LIMIT 100", Date.now())
+      .toArray();
+    if (pending.length) await this.#scheduleAlarm(Date.now() + DELIVERY_RETRY_MS);
+    await Promise.all(
+      pending.map(async (entry) => {
+        const hook = this.ctx.storage.kv.get<StoredHook>(`hook:${entry.hook_id}`);
+        if (!hook) {
+          this.ctx.storage.sql.exec(
+            "DELETE FROM notification_deliveries WHERE notification_id = ? AND hook_id = ?",
+            entry.notification_id,
+            entry.hook_id,
+          );
+          return;
+        }
+        this.ctx.storage.sql.exec(
+          "UPDATE notification_deliveries SET attempts = attempts + 1, next_attempt = ? WHERE notification_id = ? AND hook_id = ?",
+          Date.now() +
+            Math.min(
+              DELIVERY_RETRY_MS * 2 ** Math.min(entry.attempts, 6),
+              MAX_POLICY_CLEANUP_RETRY_MS,
+            ),
+          entry.notification_id,
+          entry.hook_id,
+        );
+        // Keep the real in-flight promise fenced even after timeout. A hung subscriber must not
+        // prevent future alarm batches or policy cleanup from running.
+        let timer: ReturnType<typeof setTimeout> | undefined;
+        let delivered: boolean;
+        try {
+          delivered = await Promise.race([
+            this.#handoff(hook, JSON.parse(entry.notification)),
+            new Promise<boolean>((resolve) => {
+              timer = setTimeout(() => resolve(false), HANDOFF_TIMEOUT_MS);
+            }),
+          ]);
+        } finally {
+          if (timer !== undefined) clearTimeout(timer);
+        }
+        if (delivered) {
+          this.ctx.storage.sql.exec(
+            "DELETE FROM notification_deliveries WHERE notification_id = ? AND hook_id = ?",
+            entry.notification_id,
+            entry.hook_id,
+          );
+        }
+      }),
+    );
+    await this.#clearIdleCleanupAlarm();
   }
 
   #handoff(stored: StoredHook, notification: CloudflareNotification): Promise<boolean> {
@@ -603,16 +898,22 @@ export class CloudflareNotificationReceiver extends DurableObject<NotificationEn
   async #deliver(stored: StoredHook, notification: CloudflareNotification): Promise<boolean> {
     const hookId = stored.props.hookId;
     try {
-      if (this.ctx.storage.sql.exec(
-        "SELECT 1 FROM notification_receipts WHERE notification_id = ? AND hook_id = ?",
-        notification.id, hookId,
-      ).toArray().length) return true;
+      if (
+        this.ctx.storage.sql
+          .exec(
+            "SELECT 1 FROM notification_receipts WHERE notification_id = ? AND hook_id = ?",
+            notification.id,
+            hookId,
+          )
+          .toArray().length
+      )
+        return true;
       // The persistent initiator checks current workspace authority on every handoff.
       using hook = await stored.initiator.startHook();
       await hook.approvalQueue.authorizeObservation(notificationObservation(notification));
-      if (this.ctx.storage.kv.get("suspended") || !this.ctx.storage.kv.get(`hook:${hookId}`))
-        return false;
+      if (this.ctx.storage.kv.get("suspended") || !this.#hasHook(hookId)) return false;
       await hook.callback.onNotification(notification);
+      if (this.ctx.storage.kv.get("suspended") || !this.#hasHook(hookId)) return true;
       this.ctx.storage.sql.exec(
         "INSERT OR IGNORE INTO notification_receipts VALUES (?, ?, ?)",
         notification.id,

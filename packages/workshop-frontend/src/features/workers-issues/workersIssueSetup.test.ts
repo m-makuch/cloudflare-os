@@ -1,5 +1,5 @@
 // @vitest-environment jsdom
-import { describe, expect, it, vi } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   parseWorkersIssueSetup,
   respondToWorkersIssueSetup,
@@ -15,8 +15,19 @@ const request = {
 };
 const search = (value: unknown) =>
   new URLSearchParams({ workers_issue_setup: JSON.stringify(value) }).toString();
+afterEach(() => vi.unstubAllEnvs());
 
 describe("dashboard issue setup context", () => {
+  it.each(["http://localhost:3000", "https://127.0.0.1:7443", "http://[::1]:3000"])(
+    "allows %s only in development builds",
+    (dashboardOrigin) => {
+      vi.stubEnv("DEV", true);
+      expect(parseWorkersIssueSetup(search({ ...request, dashboardOrigin }))).not.toBeNull();
+      vi.stubEnv("DEV", false);
+      expect(parseWorkersIssueSetup(search({ ...request, dashboardOrigin }))).toBeNull();
+      expect(parseWorkersIssueSetup(search(request))).toEqual(request);
+    },
+  );
   it("preserves the Worker and issue across sign-in without accepting unrelated parameters", () => {
     expect(parseWorkersIssueSetup(search(request))).toEqual(request);
     expect(workersIssueSetupSearch(`${search(request)}&redirect=https://evil.example`)).toEqual({

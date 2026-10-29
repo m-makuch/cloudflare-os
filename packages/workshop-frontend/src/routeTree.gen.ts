@@ -24,6 +24,7 @@ import { Route as BlueprintIdRouteImport } from './routes/blueprint.$id'
 import { Route as ConnectHandoffRouteImport } from './routes/connect.handoff'
 import { Route as GadgetIdRouteImport } from './routes/gadget.$id'
 import { Route as GatekeepersAppIdRouteImport } from './routes/gatekeepers_.$appId'
+import { Route as SetupWorkersIssuesRouteImport } from './routes/setup.workers-issues'
 import { Route as WorkspaceIdRouteImport } from './routes/workspace.$id'
 
 const IndexRoute = IndexRouteImport.update({
@@ -101,6 +102,11 @@ const GatekeepersAppIdRoute = GatekeepersAppIdRouteImport.update({
   path: '/gatekeepers/$appId',
   getParentRoute: () => rootRouteImport,
 } as any)
+const SetupWorkersIssuesRoute = SetupWorkersIssuesRouteImport.update({
+  id: '/setup/workers-issues',
+  path: '/setup/workers-issues',
+  getParentRoute: () => rootRouteImport,
+} as any)
 const WorkspaceIdRoute = WorkspaceIdRouteImport.update({
   id: '/workspace/$id',
   path: '/workspace/$id',
@@ -123,6 +129,7 @@ export interface FileRoutesByFullPath {
   '/connect/handoff': typeof ConnectHandoffRoute
   '/gadget/$id': typeof GadgetIdRoute
   '/gatekeepers/$appId': typeof GatekeepersAppIdRoute
+  '/setup/workers-issues': typeof SetupWorkersIssuesRoute
   '/workspace/$id': typeof WorkspaceIdRoute
 }
 export interface FileRoutesByTo {
@@ -141,6 +148,7 @@ export interface FileRoutesByTo {
   '/connect/handoff': typeof ConnectHandoffRoute
   '/gadget/$id': typeof GadgetIdRoute
   '/gatekeepers/$appId': typeof GatekeepersAppIdRoute
+  '/setup/workers-issues': typeof SetupWorkersIssuesRoute
   '/workspace/$id': typeof WorkspaceIdRoute
 }
 export interface FileRoutesById {
@@ -160,6 +168,7 @@ export interface FileRoutesById {
   '/connect/handoff': typeof ConnectHandoffRoute
   '/gadget/$id': typeof GadgetIdRoute
   '/gatekeepers_/$appId': typeof GatekeepersAppIdRoute
+  '/setup/workers-issues': typeof SetupWorkersIssuesRoute
   '/workspace/$id': typeof WorkspaceIdRoute
 }
 export interface FileRouteTypes {
@@ -180,6 +189,7 @@ export interface FileRouteTypes {
     | '/connect/handoff'
     | '/gadget/$id'
     | '/gatekeepers/$appId'
+    | '/setup/workers-issues'
     | '/workspace/$id'
   fileRoutesByTo: FileRoutesByTo
   to:
@@ -198,6 +208,7 @@ export interface FileRouteTypes {
     | '/connect/handoff'
     | '/gadget/$id'
     | '/gatekeepers/$appId'
+    | '/setup/workers-issues'
     | '/workspace/$id'
   id:
     | '__root__'
@@ -216,6 +227,7 @@ export interface FileRouteTypes {
     | '/connect/handoff'
     | '/gadget/$id'
     | '/gatekeepers_/$appId'
+    | '/setup/workers-issues'
     | '/workspace/$id'
   fileRoutesById: FileRoutesById
 }
@@ -235,6 +247,7 @@ export interface RootRouteChildren {
   ConnectHandoffRoute: typeof ConnectHandoffRoute
   GadgetIdRoute: typeof GadgetIdRoute
   GatekeepersAppIdRoute: typeof GatekeepersAppIdRoute
+  SetupWorkersIssuesRoute: typeof SetupWorkersIssuesRoute
   WorkspaceIdRoute: typeof WorkspaceIdRoute
 }
 
@@ -345,6 +358,13 @@ declare module '@tanstack/react-router' {
       preLoaderRoute: typeof GatekeepersAppIdRouteImport
       parentRoute: typeof rootRouteImport
     }
+    '/setup/workers-issues': {
+      id: '/setup/workers-issues'
+      path: '/setup/workers-issues'
+      fullPath: '/setup/workers-issues'
+      preLoaderRoute: typeof SetupWorkersIssuesRouteImport
+      parentRoute: typeof rootRouteImport
+    }
     '/workspace/$id': {
       id: '/workspace/$id'
       path: '/workspace/$id'
@@ -371,6 +391,7 @@ const rootRouteChildren: RootRouteChildren = {
   ConnectHandoffRoute: ConnectHandoffRoute,
   GadgetIdRoute: GadgetIdRoute,
   GatekeepersAppIdRoute: GatekeepersAppIdRoute,
+  SetupWorkersIssuesRoute: SetupWorkersIssuesRoute,
   WorkspaceIdRoute: WorkspaceIdRoute,
 }
 export const routeTree = rootRouteImport

@@ -24,6 +24,6 @@ it("requests independent resources and accurately describes partial grants", () 
   expect(grantedCloudflareResourcePatterns([NOTIFICATIONS_SCOPE])).toEqual([
     NOTIFICATIONS_RESOURCE.urlPattern,
   ]);
-  expect(persistentScopesForResources()).toContain(NOTIFICATIONS_SCOPE);
+  expect(persistentScopesForResources()).not.toContain(NOTIFICATIONS_SCOPE);
   expect(() => persistentScopesForResources(["https://evil.example/*"])).toThrow();
 });

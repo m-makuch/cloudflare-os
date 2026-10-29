@@ -23,7 +23,6 @@ import {
 import { useDocumentTitle } from "../useDocumentTitle";
 import { homePromptFromSearch } from "../homePrompt";
 import { composerDraftStorageKey } from "../features/chat/composer/draft/composerDraft";
-import { workersIssueSetupSearch } from "../features/workers-issues/workersIssueSetup";
 
 type HomeSearch = {
   prompt?: string;
@@ -35,7 +34,8 @@ type HomeSearch = {
 export const Route = createFileRoute("/")({
   component: HomePage,
   validateSearch: (search: Record<string, unknown>): HomeSearch => ({
-    ...workersIssueSetupSearch(new URLSearchParams(typeof search.workers_issue_setup === 'string' ? { workers_issue_setup: search.workers_issue_setup } : {}).toString()),
+    workers_issue_setup: typeof search.workers_issue_setup === "string" && search.workers_issue_setup.length <= 2048
+      ? search.workers_issue_setup : undefined,
     prompt: homePromptFromSearch(search.prompt),
     cfos_native_state: typeof search.cfos_native_state === "string"
       ? search.cfos_native_state : undefined,

@@ -16,7 +16,8 @@ const isDashboardOrigin = (value: string): boolean => {
       url.origin === value &&
       ((url.protocol === "https:" &&
         ["dash.cloudflare.com", "dash.staging.cloudflare.com"].includes(url.hostname)) ||
-        (["localhost", "127.0.0.1", "[::1]"].includes(url.hostname) &&
+        (import.meta.env.DEV &&
+          ["localhost", "127.0.0.1", "[::1]"].includes(url.hostname) &&
           ["http:", "https:"].includes(url.protocol)))
     );
   } catch {

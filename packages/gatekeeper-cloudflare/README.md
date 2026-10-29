@@ -200,15 +200,16 @@ or billing/sign-in flow. The account resource is `https://dash.cloudflare.com/<a
 1. Allow **Notifications Write** (`notifications.write`) on your Cloudflare OAuth client. Make it
    optional if that client also supports sign-in or billing. Existing connections request this grant
    when the Notifications resource is first selected; billing-only and auth-only grants do not gain it.
-   A connection that selects no specific resources requests every resource scope, including this one,
-   so allow it on the OAuth client before upgrading a deployment.
+    Notifications is opt-in: an unspecified resource selection does not request this scope. Other
+    Cloudflare connections and deployments do not need it until Notifications is selected.
 2. Add **Cloudflare Notifications** to a workspace and select the account.
 3. Register a persistent callback with one Cloudflare alert type, then enable the resulting hook in
    **Connections**. Enabling creates an authenticated generic webhook destination and an enabled
    Cloudflare notification policy for that alert type by default. Managed hooks for the same type and settings
    share the policy; `createPolicy: false` uses only the destination.
 4. Use Cloudflare's **Save and Test** to verify ingress. `getStatus()` reports destination and policy
-   IDs, plus last test and receive times. It never returns credentials.
+IDs, authorization health, pending/retrying handoff counts, the subscriber limit, and last test and
+receive times. It never returns credentials. An installed destination alone is not proof of a healthy grant.
 
 ```ts
 await env.CLOUDFLARE_NOTIFICATIONS.subscribe(callback, {
@@ -238,13 +239,14 @@ The gatekeeper controls the enabled state, name, ownership description, existing
 webhook destination. No provider policy is created until the user enables the approved hook.
 `createPolicy: false` cannot include policy settings.
 
-The callback receives the bound account and notification time, optional alert type,
+The callback receives the bound account, optional notification time and alert type,
 policy/name/text/correlation/event-state metadata, and the original product-specific `data`.
 When the provider includes `account_id`, it must match the binding. Managed hooks route only by
 their managed policy ID (dashed and undashed IDs compare equally); a supplied alert type must also
 match. External hooks (`createPolicy: false`) receive every alert of their type reaching this
-connection, including Workers Issues **Send to**. A missing identifier required by an active hook
-returns HTTP 500 instead of acknowledging a potentially lost notification.
+connection, including Workers Issues **Send to**. Routing is evaluated per subscriber, after alert-type
+filtering; an unrelated hook never blocks delivery. Missing routing information is logged and returns
+HTTP 500 when no enabled subscriber can be routed safely.
 
 Identical alert types and canonical settings share a policy only within one connected owner/account.
 Object key order does not affect identity; array order is preserved because ANS does not specify
@@ -258,16 +260,19 @@ policy; external listeners do not retain managed policies and remain active afte
 
 ### Delivery and lifecycle
 
-The HTTP entrypoint rejects malformed owner/account paths and missing `cf-webhook-auth` before
-calling a receiver. The receiver authenticates before writing storage and creates receipt tables
+The HTTP entrypoint rejects malformed owner/account paths and malformed `cf-webhook-auth` before
+calling a receiver, and authenticates against the installed verifier before reading a body. Only the
+configured notification base path and standard gatekeeper base path are routed to receivers. The
+receiver authenticates before writing storage and creates receipt tables
 lazily, so unknown credentials leave no persistent state. It accepts Cloudflare's documented
 `{"text":"…"}` test message and checks any reported account ID. Request bodies are capped at
 512 KiB while streaming. API keys are random 256-bit values; only their SHA-256 verifier is retained
 once setup completes. An address migration temporarily stores the pending secret to retry an
 interrupted update exactly, accepting both the old and pending credentials until it succeeds.
 Enabling a hook reconciles a changed base URL by updating the existing destination in place,
-preserving its ID and policies. The receiver accepts its stored old path during migration; both
-origins must still route to this Worker for uninterrupted delivery during a hostname change.
+preserving its ID and policies. The standard gatekeeper path remains a migration fallback, subject to
+the stored-path check. Arbitrary historical custom paths require an explicit deployment routing
+transition. Both origins must route to this Worker during a hostname change.
 Hook enablement also reads the owned destination live, even when its configured address is unchanged.
 Only an explicit HTTP 404 is treated as provider deletion: setup is invalidated and exact-URL
 provisioning recreates or recovers the destination, rotates its secret, and retains subscribers.
@@ -278,24 +283,29 @@ on retry or after restart without duplicating the destination.
 Provider requests are fixed-origin, bounded,
 time-limited, and do not follow redirects.
 
-A successful event returns **204 after all matching subscribers accept it**. Callback or authorization
-failure returns **500**, allowing ANS to retry. There is no local notification-delivery queue,
-retry loop, or alarm; the receiver's alarm is only for provider-policy cleanup.
-Callbacks should accept events promptly, for example by creating an agent task; long-running work and
-errors after that handoff belong to the consumer. The gatekeeper waits for the real callback result
-instead of racing it against a timer that could allow overlapping retries.
+A successful event returns **204 after durable enqueue**, without waiting on workspace callbacks.
+Each matching subscriber has an independent persistent handoff, retried by alarm with one-minute
+exponential backoff capped at one hour. The connection/account queue holds up to 1,000 handoffs and
+16 MiB of serialized payloads; exceeding either bound returns **503**, allowing ANS to retry acceptance.
+Payloads are removed after successful handoff or hook removal. Slow callbacks are time-bounded per
+alarm batch; their actual in-flight promises remain fenced to prevent overlapping attempts in the
+same runtime. Callbacks must accept promptly and idempotently, then schedule long-running work separately.
+Ingress uses a local grant fence rather than refreshing OAuth for every event; status checks detect
+expired grants and surface reconnect-required or transiently unavailable health.
 
 Successful handoffs are remembered per subscriber, so an ANS retry skips subscribers that already
 accepted the event. A SHA-256 of the JSON envelope identifies duplicates while keeping different
 policies and start/end events distinct. Receipts contain no payloads and are retained for up to 15 days,
 bounded to the newest 10,000 receipts per connection/account. Concurrent duplicates share a handoff.
-A crash or timeout after a callback commits can still cause redelivery: use `notification.id` to make
-side effects idempotent. Delivery order is not guaranteed, and delivery stops if ANS exhausts its retries.
+A crash or timeout after a callback commits can still cause redelivery. `notification.id` deduplicates
+identical envelopes, not logical events whose timestamp or evidence was regenerated; use product
+correlation and event-state keys for logical-run idempotency. Delivery order is not guaranteed.
 
 A connection supports 100 hooks. Each callback is preceded by a Cloudflare-specific Workshop
 observation describing the bound account, reported alert type, policy ID, and event state.
-Like Workers Observability reads, these observations are not marked as restricted data: that would
-permanently stop the workspace from taking actions, so an alert could never lead to a pushed fix.
+Notification observations are marked as restricted data: authenticated delivery can still contain
+attacker-controlled text and telemetry. Write-capable remediation requires separate security review;
+this integration does not bypass the platform's restricted-data handling.
 Notifications bindings are private to their owner. Disabling a hook
 stops future handoffs and removes the managed policy when no other managed-policy hook uses its configuration. The shared
 webhook remains for other policies. Before removing a hook or attempting policy creation/deletion,
@@ -305,7 +315,9 @@ the enable/disable mutation lock and rechecks current subscribers, so it cannot 
 needed by a re-enabled hook. Successful cleanup clears the alarm. Enabling another hook also
 reconciles unused policies, but is not required to recover. Disconnecting Cloudflare cancels this
 alarm, stops ingress and delivery, then removes this connection's provider resources.
-Transient disconnect-cleanup failures retain credentials for retry. If the grant has expired
+Transient disconnect-cleanup failures retain credentials and arm the account's durable alarm for
+retry. Reauthorization cannot replace a grant while cleanup is pending. A fresh connection has a new
+account identity; old receiver tombstones prevent stale capabilities from resurrecting it. If the grant has expired
 or no longer has access to the account, provider resources cannot be removed, so disconnect completes
 locally and logs `notification.revoke.cleanup.skipped`; delete the `Cloudflare OS` destination and
 policies in the dashboard. Provider-side setup is reconciled by the exact webhook URL, allowing recovery from
@@ -352,8 +364,9 @@ Access credentials, and each request is authenticated by `cf-webhook-auth` inste
 Connect the test Cloudflare account, enable a notification subscription, and use **Save and Test** on
 its webhook destination in Cloudflare. Confirm that the test timestamp appears in the connection's
 Details. For event delivery, trigger the policy created for that alert type and verify the
-subscriber receives it. Test a failing subscriber to verify HTTP 500 and ANS redelivery, then confirm
-successful subscribers are not invoked again.
+subscriber receives it. Test a failing subscriber to verify HTTP 204 acceptance followed by independent
+durable retry, then confirm successful subscribers are not invoked again. Exercise queue exhaustion
+separately to verify HTTP 503 acceptance backpressure.
 
 Local development remains useful for UI changes and automated tests; live webhook verification runs
 against the deployed instance.
