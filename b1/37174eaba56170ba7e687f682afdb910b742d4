@@ -1,0 +1,29 @@
+packages/gatekeeper-cloudflare/README.md
+  s_47fc53b092f7e8::t_900f0490ceee7b 271-277,282-283,301-308
+packages/gatekeeper-cloudflare/__tests__/notifications-api.test.ts
+  s_47fc53b092f7e8::t_be049e17eda1da 4,21-40,72-99,166-168,181-184,188-190,193-195,197-199,204-213,216-218,225-242,244-246,256-258,263-280,286-289,291-302,310-315,317-323,332-339,342-350,354-359,362-365,368-375,378-405,410-414
+packages/gatekeeper-cloudflare/__tests__/workerd/notifications.test.ts
+  s_47fc53b092f7e8::t_78293777fe742d 2,21,24-36,74-86,270,287,301-413,453,479,482,491,493-494,499-544,548,567,571,596,609,638,645,648-649,652
+packages/gatekeeper-cloudflare/src/cloudflare-configurators.ts
+  s_47fc53b092f7e8::t_7c39055620d028 36
+packages/gatekeeper-cloudflare/src/notifications-api.ts
+  s_47fc53b092f7e8::t_ecd408de55329e 11,13-30,44-47,89-94,117-118,129-132,134-135,137-143,150-171,214-218,235-241,258-259,261-271,277-289,292-296,316-321,329-333,335-340
+packages/gatekeeper-cloudflare/src/notifications.ts
+  s_47fc53b092f7e8::t_bbc0c2875814f5 21,63-64,251-266,308-320,322,353-354,364,371-372,395,405-406,417,425,431,437-458,465
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "b137174eaba56170ba7e687f682afdb910b742d4",
+  "prompts": {},
+  "sessions": {
+    "s_47fc53b092f7e8": {
+      "agent_id": {
+        "tool": "opencode",
+        "id": "ses_e810f1f6effecE2fJEyEvoWXT1",
+        "model": "gpt-6.1-sol"
+      },
+      "human_author": "Maksym Makuch <maksym@cloudflare.com>"
+    }
+  }
+}
