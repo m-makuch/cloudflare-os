@@ -1,11 +1,12 @@
 // @vitest-environment node
 import { DatabaseSync, type SQLInputValue } from 'node:sqlite';
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { Gadget } from '../files/server.js';
+import { Gadget } from '../files/server.ts';
 
 const { restore } = vi.hoisted(() => ({ restore: Symbol('restore') }));
 vi.mock('cloudflare:workers', () => ({
   restore,
+  RpcTarget: class {},
   DurableObject: class {
     ctx: unknown;
     env: unknown;
@@ -47,7 +48,10 @@ const setup = () => {
     restore: async (params: object) => Object.assign(Reflect.get(gadget, restore).call(gadget, params).target, { [Symbol.dispose]() {} }),
   };
   const env = { INVESTIGATOR: { spawnCallable }, CLOUDFLARE_NOTIFICATIONS: { subscribe, getStatus: vi.fn() } };
-  const restart = () => { gadget = new Gadget(context, env); return gadget; };
+  const restart = () => {
+    gadget = new Gadget(context as unknown as DurableObjectState, env);
+    return gadget;
+  };
   return { gadget: restart(), restart, spawnCallable, investigate, subscribe };
 };
 
@@ -71,7 +75,9 @@ describe('Worker issue investigation inbox', () => {
     await fixture.restart().onNotification({ ...notification(), id: 'envelope-2' });
     expect(fixture.spawnCallable).toHaveBeenCalledTimes(1);
     expect(fixture.investigate).toHaveBeenCalledTimes(1);
-    expect(await fixture.gadget.listInvestigations()).toMatchObject([{ issue_id: 'issue-1', status: 'queued' }]);
+    expect(await fixture.gadget.listInvestigations()).toMatchObject([{
+      run_key: `${scope.accountId}:run-1`, issue_id: 'issue-1', status: 'queued',
+    }]);
   });
 
   it('ignores other accounts, other Workers, resolved events, and malformed service evidence', async () => {
@@ -83,6 +89,9 @@ describe('Worker issue investigation inbox', () => {
     const resolved = notification(); resolved.data.state_event = 'ALERT_STATE_EVENT_END';
     await fixture.gadget.onNotification(resolved);
     await fixture.gadget.onNotification({ ...notification(), data: { issue: { services: {} } } });
+    await fixture.gadget.onNotification({ ...notification(), data: {
+      state_event: 'ALERT_STATE_EVENT_START', issue: { services: [null, 42] },
+    } });
     expect(fixture.spawnCallable).not.toHaveBeenCalled();
   });
 

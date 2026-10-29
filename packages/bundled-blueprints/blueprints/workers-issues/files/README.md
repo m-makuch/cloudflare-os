@@ -1,5 +1,16 @@
 # Worker issue inbox
 
+## Source and interface
+
+The TypeScript sources (`client.ts`, `server.ts`, and `lib/`) build into the self-contained
+`client.js` and `server.js` the gadget runs. Both sides use `lib/protocol.ts`; `protocol.d.ts`
+preserves the OS setup frontend's existing type import. Stored inbox data needs no migration.
+
+The inbox displays each logical notification separately, including repeated occurrences of the same
+issue. Refresh updates entries in place so unchanged reports keep their text selection. Notification
+receipt and optional AI enablement are displayed separately. The UI uses semantic system colors for
+light and dark surfaces without adding a separate brand palette.
+
 This inbox accepts authenticated Real-Time Issues notifications only for its configured account
 and Worker. Connect it from the dashboard's Cloudflare OS destination setup and enable its
 notification hook. The only required binding is `CLOUDFLARE_NOTIFICATIONS`; receiving notifications
