@@ -222,8 +222,10 @@ export const WorkersIssueSetupPage = ({ request }: { request: WorkersIssueSetupR
           {isInvestigation ? (
             <div className="grid gap-3">
               <p className="text-sm text-kumo-subtle">
-                The investigator gets read-only telemetry for this Worker. Repository access, tests,
-                code changes, and deployments require separate capabilities.
+                Setup installs a new investigator with the selected model and read-only telemetry
+                for this Worker, replacing any existing investigator binding. Workspace editors can
+                change its bindings later. Repository access, tests, code changes, and deployments
+                require separate capabilities.
               </p>
               {selectedModel && !changeModel ? (
                 <div className="flex flex-wrap items-center justify-between gap-2 text-sm text-kumo-default">
@@ -259,7 +261,8 @@ export const WorkersIssueSetupPage = ({ request }: { request: WorkersIssueSetupR
             </div>
           ) : (
             <p className="text-sm text-kumo-subtle">
-              AI investigations are optional. You can enable them after saving your automation.
+              AI investigations are optional. You can enable them after saving your automation. Each
+              Cloudflare connection supports up to 100 notification subscriptions per account.
             </p>
           )}
           <div className="flex flex-wrap justify-end gap-2 border-t border-kumo-line pt-4">

@@ -7,6 +7,8 @@ export interface WorkerScope {
 /** Durable progress of one logical issue notification. */
 export type InvestigationStatus =
   | "received"
+  | "pending"
+  | "failed"
   | "allocating"
   | "dispatching"
   | "queued"
@@ -22,6 +24,9 @@ export type Investigation = {
   created_at: number;
 };
 
+/** Lightweight polling result; full report text is fetched only when opened. */
+export type InvestigationSummary = Omit<Investigation, "report"> & { has_report: boolean };
+
 /** Scope is absent until the inbox has been initialized. */
 export interface InboxSetupStatus extends Partial<WorkerScope> {
   investigationsEnabled: boolean;
@@ -34,8 +39,14 @@ export interface WorkerIssueInbox {
     installed: boolean;
     suspended: boolean;
     webhookId?: string;
+    credentials?: "ready" | "reconnect_required" | "unavailable";
+    pendingDeliveries?: number;
+    retryingDeliveries?: number;
   }>;
   getSetupStatus(): Promise<InboxSetupStatus>;
   enableInvestigations(): Promise<void>;
-  listInvestigations(): Promise<Investigation[]>;
+  listInvestigations(): Promise<InvestigationSummary[]>;
+  getInvestigationReport(runKey: string): Promise<string | null>;
+  /** Retry only a definite failure before dispatch, never an ambiguous delivery. */
+  retryInvestigation(runKey: string): Promise<void>;
 }

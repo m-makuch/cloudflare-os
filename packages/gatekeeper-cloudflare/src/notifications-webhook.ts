@@ -7,21 +7,38 @@ const API_KEY_BYTES = 32;
 export const MAX_NOTIFICATION_BODY_BYTES = 512 * 1024;
 
 /** The configured, unvalidated notification ingress base: the override, else the gatekeeper base. */
-export function configuredNotificationBaseUrl(
-  env: { NOTIFICATIONS_WEBHOOK_BASE_URL?: string; BASE_URL?: string },
-): string {
-  return stripTrailingSlashes(env.NOTIFICATIONS_WEBHOOK_BASE_URL ||
-    env.BASE_URL || "http://localhost:8787/gatekeeper/cloudflare");
+export function configuredNotificationBaseUrl(env: {
+  NOTIFICATIONS_WEBHOOK_BASE_URL?: string;
+  BASE_URL?: string;
+}): string {
+  return stripTrailingSlashes(
+    env.NOTIFICATIONS_WEBHOOK_BASE_URL ||
+      env.BASE_URL ||
+      "http://localhost:8787/gatekeeper/cloudflare",
+  );
 }
 
 /** Cloudflare generic webhooks require a public HTTP(S) endpoint on port 80 or 443. */
 export function notificationWebhookBaseUrl(value: string): string {
   const base = stripTrailingSlashes(value);
   let url: URL;
-  try { url = new URL(base); } catch { throw new Error("Configure a valid public HTTPS notification address."); }
-  if (url.protocol !== "https:" || url.port || url.username || url.password ||
-      url.search || url.hash || ["localhost", "127.0.0.1", "[::1]"].includes(url.hostname)) {
-    throw new Error("Configure a public HTTPS notification address on port 443 without URL credentials, query, or fragment.");
+  try {
+    url = new URL(base);
+  } catch {
+    throw new Error("Configure a valid public HTTPS notification address.");
+  }
+  if (
+    url.protocol !== "https:" ||
+    url.port ||
+    url.username ||
+    url.password ||
+    url.search ||
+    url.hash ||
+    ["localhost", "127.0.0.1", "[::1]"].includes(url.hostname)
+  ) {
+    throw new Error(
+      "Configure a public HTTPS notification address on port 443 without URL credentials, query, or fragment.",
+    );
   }
   return base;
 }
@@ -56,12 +73,10 @@ export function parseNotificationWebhookPath(
   return { userObjectId: match[1]!.toLowerCase(), accountId: match[2]!.toLowerCase() };
 }
 
-/** Recognize Cloudflare's documented destination-test message, which is not an alert. */
+/** A destination test has only text; its wording is provider-owned and may change. */
 export function isWebhookTest(value: unknown): boolean {
   if (!value || typeof value !== "object" || Array.isArray(value)) return false;
-  return Object.keys(value).length === 1 && "text" in value &&
-    typeof value.text === "string" &&
-    value.text.startsWith("Hello World! This is a test message sent from https://cloudflare.com.");
+  return Object.keys(value).length === 1 && "text" in value && typeof value.text === "string";
 }
 
 /** Parse the generic ANS envelope. No fixed alert-type enumeration or event_id assumption. */
@@ -73,23 +88,27 @@ export async function parseNotificationWebhook(
   if (!value || typeof value !== "object" || Array.isArray(value))
     throw new Error("Invalid notification envelope.");
   const payload = value as Record<string, unknown>;
-  if (payload.account_id !== undefined && (
-    typeof payload.account_id !== "string" ||
-    assertCloudflareAccountId(payload.account_id) !== expectedAccountId
-  )) {
+  if (
+    payload.account_id !== undefined &&
+    (typeof payload.account_id !== "string" ||
+      assertCloudflareAccountId(payload.account_id) !== expectedAccountId)
+  ) {
     throw new Error("Notification account does not match the binding.");
   }
-  if (payload.alert_type !== undefined &&
-      (typeof payload.alert_type !== "string" || payload.alert_type.length === 0)) {
+  if (
+    payload.alert_type !== undefined &&
+    (typeof payload.alert_type !== "string" || payload.alert_type.length === 0)
+  ) {
     throw new Error("Invalid notification alert type.");
   }
-  if (typeof payload.ts !== "number" || payload.ts < 0) {
+  if (payload.ts !== undefined && (typeof payload.ts !== "number" || payload.ts < 0)) {
     throw new Error("Invalid notification timestamp.");
   }
-  const timestamp = new Date(payload.ts * 1000);
-  if (Number.isNaN(timestamp.valueOf())) throw new Error("Invalid notification timestamp.");
-  if (!("data" in payload) || !payload.data || typeof payload.data !== "object" ||
-      Array.isArray(payload.data)) throw new Error("Invalid notification evidence.");
+  const timestamp = typeof payload.ts === "number" ? new Date(payload.ts * 1000) : undefined;
+  if (timestamp && Number.isNaN(timestamp.valueOf()))
+    throw new Error("Invalid notification timestamp.");
+  if (!("data" in payload) && typeof payload.text !== "string")
+    throw new Error("Missing notification evidence.");
   // JSON.parse has validated JSON recursively; hashing the entire envelope distinguishes policy,
   // event state and evidence even when correlation IDs are shared. Identical retries collapse.
   const id = await hashWebhookApiKey(JSON.stringify(payload));
@@ -97,8 +116,8 @@ export async function parseNotificationWebhook(
     id,
     accountId: expectedAccountId,
     ...(payload.alert_type === undefined ? {} : { alertType: payload.alert_type }),
-    timestamp: timestamp.toISOString(),
-    data: payload.data,
+    ...(timestamp ? { timestamp: timestamp.toISOString() } : {}),
+    data: payload.data ?? null,
   };
   const fields = {
     policy_id: "policyId",

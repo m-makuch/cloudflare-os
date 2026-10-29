@@ -43,6 +43,10 @@ const render = async (
     accounts?: number[];
     wrongAccount?: number;
     configuratorError?: string;
+    existingInvestigator?: boolean;
+    investigationsEnabled?: boolean;
+    bindFailure?: boolean;
+    spawnerFailure?: boolean;
   } = {},
 ) => {
   let subscriber: AccountsSubscriberAdapter;
@@ -64,7 +68,7 @@ const render = async (
     getSetupStatus: vi.fn<WorkerIssueInbox["getSetupStatus"]>().mockResolvedValue({
       accountId: request.accountId,
       workerName: options.wrongScope ? "other-worker" : request.workerName,
-      investigationsEnabled: false,
+      investigationsEnabled: options.investigationsEnabled ?? false,
     }),
     enableInvestigations: vi
       .fn<WorkerIssueInbox["enableInvestigations"]>()
@@ -74,14 +78,31 @@ const render = async (
       .mockResolvedValue({ installed: true, suspended: false, webhookId: "destination-1" }),
     [Symbol.dispose]() {},
   };
+  let bindings = options.existingInvestigator ? [{ name: "INVESTIGATOR", target: 9 }] : [];
   const gadget = {
     connectToGadget: vi.fn<() => Promise<typeof inbox>>().mockResolvedValue(inbox),
-    listBindings: vi.fn<() => Promise<object[]>>().mockResolvedValue([]),
-    bind: vi.fn<(name: string, target: number) => Promise<void>>().mockResolvedValue(undefined),
+    listBindings: vi.fn<() => Promise<typeof bindings>>(async () => bindings),
+    unbind: vi.fn<(name: string) => Promise<void>>(async (name: string) => {
+      bindings = bindings.filter((binding) => binding.name !== name);
+    }),
+    bind: vi.fn<(name: string, target: number) => Promise<void>>(
+      async (name: string, target: number) => {
+        if (options.bindFailure && target === 6) throw new Error("Binding failed");
+        bindings.push({ name, target });
+      },
+    ),
     [Symbol.dispose]() {},
   };
-  const telemetry = { getId: async () => 5, [Symbol.dispose]() {} };
-  const investigator = { getId: async () => 6, [Symbol.dispose]() {} };
+  const telemetry = {
+    getId: async () => 5,
+    remove: vi.fn<() => Promise<void>>().mockResolvedValue(undefined),
+    [Symbol.dispose]() {},
+  };
+  const investigator = {
+    getId: async () => 6,
+    remove: vi.fn<() => Promise<void>>().mockResolvedValue(undefined),
+    [Symbol.dispose]() {},
+  };
   const workspace = {
     getMetadata: vi
       .fn<() => Promise<object>>()
@@ -100,6 +121,8 @@ const render = async (
       : vi.fn<() => Promise<void>>().mockResolvedValue(undefined),
     [Symbol.dispose]() {},
   };
+  if (options.spawnerFailure)
+    workspace.newAgentSpawnerGatekeeper.mockRejectedValue(new Error("Spawner failed"));
   const create = vi
     .fn<(...args: unknown[]) => Promise<typeof workspace>>()
     .mockResolvedValue(workspace);
@@ -183,6 +206,8 @@ const render = async (
     workspace,
     inbox,
     gadget,
+    telemetry,
+    investigator,
     create,
     open,
     ensure,
@@ -324,6 +349,41 @@ describe("Destination-first Worker issue onboarding", () => {
     expect(fixture.inbox.enableInvestigations).not.toHaveBeenCalled();
     expect(fixture.completion()).not.toHaveBeenCalled();
     expect(container!.querySelector("[role=alert]")?.textContent).toContain("does not match");
+  });
+
+  it("replaces an existing investigator even when investigations are already enabled", async () => {
+    const fixture = await render({
+      investigation: true,
+      existingInvestigator: true,
+      investigationsEnabled: true,
+    });
+    await act(async () => fixture.submit().click());
+    expect(fixture.workspace.newAgentSpawnerGatekeeper).toHaveBeenCalledWith(
+      expect.objectContaining({ modelId: "model-2", env: { WORKER_OBSERVABILITY: 5 } }),
+    );
+    expect(fixture.gadget.unbind).toHaveBeenCalledWith("INVESTIGATOR");
+    expect(fixture.gadget.bind).toHaveBeenCalledWith("INVESTIGATOR", 6);
+    expect(fixture.investigator.remove).not.toHaveBeenCalled();
+  });
+
+  it("removes new workpieces and restores the previous investigator when binding fails", async () => {
+    const fixture = await render({
+      investigation: true,
+      existingInvestigator: true,
+      bindFailure: true,
+    });
+    await act(async () => fixture.submit().click());
+    expect(fixture.gadget.bind).toHaveBeenCalledWith("INVESTIGATOR", 9);
+    expect(fixture.investigator.remove).toHaveBeenCalledTimes(1);
+    expect(fixture.telemetry.remove).toHaveBeenCalledTimes(1);
+    expect(fixture.inbox.enableInvestigations).not.toHaveBeenCalled();
+  });
+
+  it("removes telemetry if creating the investigator fails", async () => {
+    const fixture = await render({ investigation: true, spawnerFailure: true });
+    await act(async () => fixture.submit().click());
+    expect(fixture.telemetry.remove).toHaveBeenCalledTimes(1);
+    expect(fixture.gadget.bind).not.toHaveBeenCalled();
   });
 
   it("keeps notifications available when no AI model has been configured", async () => {

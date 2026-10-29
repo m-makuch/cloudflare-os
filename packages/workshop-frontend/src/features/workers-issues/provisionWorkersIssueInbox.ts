@@ -40,26 +40,53 @@ export const provisionWorkersIssueInbox = async (
     ) {
       throw new Error("This inbox does not match the requested Worker and destination.");
     }
-    if (!scope.investigationsEnabled) {
-      if (!modelId) throw new Error("Choose a language model before enabling investigations.");
-      const bindings = await gadget.listBindings();
-      if (!bindings.some((binding) => binding.name === "INVESTIGATOR")) {
-        using telemetry = await workspace.newGatekeeper(
-          accountId,
-          `https://dash.cloudflare.com/${request.accountId}/workers/services/view/${encodeURIComponent(request.workerName)}/production/observability`,
-        );
-        if (!telemetry) throw new Error("Worker telemetry could not be connected.");
-        using investigator = await workspace.newAgentSpawnerGatekeeper({
-          displayName: "Worker issue investigator",
-          modelId,
-          env: { WORKER_OBSERVABILITY: await telemetry.getId() },
-        });
-        await gadget.bind("INVESTIGATOR", await investigator.getId());
+    if (!modelId) throw new Error("Choose a language model before enabling investigations.");
+    const previous = (await gadget.listBindings()).find(
+      (binding) => binding.name === "INVESTIGATOR",
+    );
+    // Spawner env edges are mutable and omitted from its creation spec. A binding name cannot
+    // prove its authority, so explicitly install a fresh exact-Worker spawner and selected model.
+    using telemetry = await workspace.newGatekeeper(
+      accountId,
+      `https://dash.cloudflare.com/${request.accountId}/workers/services/view/${encodeURIComponent(request.workerName)}/production/observability`,
+    );
+    if (!telemetry) throw new Error("Worker telemetry could not be connected.");
+    let bound = false;
+    let uncertain = false;
+    try {
+      using investigator = await workspace.newAgentSpawnerGatekeeper({
+        displayName: "Worker issue investigator",
+        modelId,
+        env: { WORKER_OBSERVABILITY: await telemetry.getId() },
+      });
+      try {
+        const target = await investigator.getId();
+        try {
+          if (previous) await gadget.unbind("INVESTIGATOR");
+          await gadget.bind("INVESTIGATOR", target);
+          bound = true;
+        } catch (error) {
+          // A lost response may already have committed the binding. Never remove an active target.
+          uncertain = true;
+          const current = (await gadget.listBindings()).find(
+            (binding) => binding.name === "INVESTIGATOR",
+          );
+          uncertain = false;
+          bound = current?.target === target;
+          if (!bound) {
+            if (previous && !current) await gadget.bind("INVESTIGATOR", previous.target);
+            throw error;
+          }
+        }
+      } finally {
+        if (!bound && !uncertain) await investigator.remove();
       }
-      // Binding changes create a new gadget facet; never enable through the old, unbound one.
-      using configuredInbox = (await gadget.connectToGadget()) as RpcStub<WorkerIssueInbox>;
-      await configuredInbox.enableInvestigations();
+    } finally {
+      if (!bound && !uncertain) await telemetry.remove();
     }
+    // Binding changes create a new gadget facet; never enable through the old, unbound one.
+    using configuredInbox = (await gadget.connectToGadget()) as RpcStub<WorkerIssueInbox>;
+    await configuredInbox.enableInvestigations();
     return {
       workspaceId: metadata.id,
       destinationId: destination.webhookId,
@@ -75,6 +102,12 @@ export const provisionWorkersIssueInbox = async (
   if (!hook) throw new Error("The notification subscription was not registered.");
   if (!hook.enabled) await workspace.enableHook(hook.id);
   const status = await inbox.getNotificationStatus();
+  if (status.credentials && status.credentials !== "ready")
+    throw new Error(
+      status.credentials === "reconnect_required"
+        ? "Reconnect Cloudflare with Notifications access to resume delivery."
+        : "Cloudflare authorization could not be checked. Try again.",
+    );
   if (!status.installed || !status.webhookId || status.suspended)
     throw new Error("Notification destination is not ready.");
   return {

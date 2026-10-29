@@ -1,10 +1,15 @@
 import { el } from "@gadgets/bundled-blueprints/libraries/ui/client";
-import type { Investigation, InvestigationStatus, WorkerIssueInbox } from "./lib/protocol.ts";
+import type {
+  InvestigationSummary,
+  InvestigationStatus,
+  WorkerIssueInbox,
+} from "./lib/protocol.ts";
 
 // The Workshop iframe bootstrap supplies the RPC stub before this module runs.
 declare const gadget: WorkerIssueInbox;
 
-const style = el("style", { text: `
+const style = el("style", {
+  text: `
 :root { color-scheme: light dark; }
 * { box-sizing: border-box; }
 html, body { margin: 0; min-height: 100%; background: Canvas; color: CanvasText; }
@@ -48,7 +53,8 @@ p { margin: 0; }
   h1 { font-size: 20px; }
 }
 @media (pointer: coarse) { .refresh { min-height: 44px; } }
-` });
+`,
+});
 document.head.append(style);
 
 const scope = el("p", { class: "scope", text: "Loading Worker scope…" });
@@ -63,24 +69,28 @@ const emptyDescription = el("p");
 const empty = el("div", { class: "empty" }, [emptyTitle, emptyDescription]);
 const entries = el("section", { class: "entries", "aria-label": "Issue notifications" });
 
-document.body.replaceChildren(el("main", { class: "inbox" }, [
-  el("header", { class: "header" }, [
-    el("div", {}, [el("h1", { text: "Worker issue inbox" }), scope]),
-    refresh,
+document.body.replaceChildren(
+  el("main", { class: "inbox" }, [
+    el("header", { class: "header" }, [
+      el("div", {}, [el("h1", { text: "Worker issue inbox" }), scope]),
+      refresh,
+    ]),
+    el("div", { class: "mode" }, [mode, modeDescription]),
+    el("p", {
+      class: "description",
+      text: "Dashboard setup provisions read-only telemetry for this Worker. A workspace editor can change the investigator's bindings. Repository access, project tests, code changes, and deployments require separate capabilities.",
+    }),
+    el("div", { class: "summary" }, [summary, updated]),
+    error,
+    empty,
+    entries,
   ]),
-  el("div", { class: "mode" }, [mode, modeDescription]),
-  el("p", {
-    class: "description",
-    text: "Investigations use read-only telemetry for this Worker. Repository access, project tests, code changes, and deployments require separate capabilities.",
-  }),
-  el("div", { class: "summary" }, [summary, updated]),
-  error,
-  empty,
-  entries,
-]));
+);
 
 const STATUS_LABELS: Record<InvestigationStatus, string> = {
   received: "Notification received",
+  pending: "Waiting to start",
+  failed: "Could not start investigator",
   allocating: "Starting investigator",
   dispatching: "Sending to investigator",
   queued: "Investigation queued",
@@ -97,6 +107,9 @@ type EntryView = {
   time: HTMLTimeElement;
   badge: HTMLSpanElement;
   report: HTMLPreElement;
+  readReport: HTMLButtonElement;
+  retry: HTMLButtonElement;
+  reportLoaded: boolean;
 };
 const views = new Map<string, EntryView>();
 let loading = false;
@@ -108,8 +121,10 @@ function setText(element: HTMLElement, text: string): void {
   if (element.textContent !== text) element.textContent = text;
 }
 
-function reportText(run: Investigation): string {
-  if (run.report) return run.report;
+function reportText(run: InvestigationSummary): string {
+  if (run.has_report) return "";
+  if (run.status === "failed")
+    return "The investigator could not be started. Check the model and bindings, then retry.";
   if (run.status === "received") {
     return "Notification stored without running a model. Enabling AI investigations does not replay earlier notifications.";
   }
@@ -119,8 +134,8 @@ function reportText(run: Investigation): string {
   return "The investigator has not submitted a report yet.";
 }
 
-function renderEntries(runs: Investigation[]): void {
-  const visibleKeys = new Set(runs.map(run => run.run_key));
+function renderEntries(runs: InvestigationSummary[]): void {
+  const visibleKeys = new Set(runs.map((run) => run.run_key));
   for (const [key, view] of views) {
     if (!visibleKeys.has(key)) {
       view.element.remove();
@@ -135,11 +150,61 @@ function renderEntries(runs: Investigation[]): void {
       const time = el("time", { class: "metadata" });
       const badge = el("span", { class: "badge" });
       const report = el("pre", { class: "report" });
+      const readReport = el("button", { class: "refresh", type: "button", text: "Read report" });
+      const retry = el("button", { class: "refresh", type: "button", text: "Retry investigation" });
       const element = el("article", { class: "entry" }, [
         el("div", { class: "entry-header" }, [el("div", {}, [title, time]), badge]),
         report,
+        readReport,
+        retry,
       ]);
-      view = { element, title, time, badge, report };
+      const created = {
+        element,
+        title,
+        time,
+        badge,
+        report,
+        readReport,
+        retry,
+        reportLoaded: false,
+      };
+      readReport.addEventListener("click", async () => {
+        readReport.disabled = true;
+        try {
+          if (!created.reportLoaded) {
+            setText(
+              report,
+              (await gadget.getInvestigationReport(run.run_key)) ?? "Report is unavailable.",
+            );
+            created.reportLoaded = true;
+            report.hidden = false;
+          } else {
+            report.hidden = !report.hidden;
+          }
+          readReport.textContent = report.hidden ? "Read report" : "Hide report";
+        } catch {
+          setText(error, "Could not load the report. Try opening it again.");
+          error.hidden = false;
+        } finally {
+          readReport.disabled = false;
+        }
+      });
+      retry.addEventListener("click", async () => {
+        retry.disabled = true;
+        try {
+          await gadget.retryInvestigation(run.run_key);
+          await render();
+        } catch {
+          setText(
+            error,
+            "Could not retry this investigation. Check its current status and try again.",
+          );
+          error.hidden = false;
+        } finally {
+          retry.disabled = false;
+        }
+      });
+      view = created;
       views.set(run.run_key, view);
     }
     setText(view.title, run.issue_id);
@@ -147,8 +212,13 @@ function renderEntries(runs: Investigation[]): void {
     view.time.dateTime = new Date(run.created_at).toISOString();
     setText(view.badge, STATUS_LABELS[run.status] ?? "Unknown status");
     view.badge.dataset.status = run.status;
-    setText(view.report, reportText(run));
-    view.report.classList.toggle("placeholder", !run.report);
+    if (!view.reportLoaded) {
+      setText(view.report, reportText(run));
+      view.report.hidden = run.has_report;
+    }
+    view.report.classList.toggle("placeholder", !run.has_report);
+    view.readReport.hidden = !run.has_report;
+    view.retry.hidden = run.status !== "failed";
 
     // Insert new entries in order without detaching the existing report nodes.
     if (entries.children[index] !== view.element) {
@@ -158,26 +228,38 @@ function renderEntries(runs: Investigation[]): void {
 }
 
 async function render(): Promise<void> {
-  if (loading || disposed) return;
+  if (loading || disposed || document.hidden) return;
   loading = true;
   refresh.disabled = true;
   try {
     const [runs, setup] = await Promise.all([gadget.listInvestigations(), gadget.getSetupStatus()]);
     if (disposed) return;
-    setText(scope, setup.workerName
-      ? [setup.workerName, setup.accountId].filter(Boolean).join(" · ")
-      : "This inbox has not been connected to a Worker yet.");
+    setText(
+      scope,
+      setup.workerName
+        ? [setup.workerName, setup.accountId].filter(Boolean).join(" · ")
+        : "This inbox has not been connected to a Worker yet.",
+    );
     setText(mode, setup.investigationsEnabled ? "AI investigations on" : "Notifications only");
-    setText(modeDescription, setup.investigationsEnabled
-      ? "New issue notifications can start an investigation."
-      : "Notifications are stored without running a model.");
-    setText(summary, runs.length
-      ? `Showing ${runs.length} recent notification${runs.length === 1 ? "" : "s"} (up to 100).`
-      : "No notifications received yet.");
+    setText(
+      modeDescription,
+      setup.investigationsEnabled
+        ? "New issue notifications can start an investigation."
+        : "Notifications are stored without running a model.",
+    );
+    setText(
+      summary,
+      runs.length
+        ? `Showing ${runs.length} recent notification${runs.length === 1 ? "" : "s"} (up to 100).`
+        : "No notifications received yet.",
+    );
     renderEntries(runs);
     empty.hidden = runs.length > 0;
     setText(emptyTitle, "Waiting for an issue notification");
-    setText(emptyDescription, "Save your automation in the Cloudflare dashboard with this inbox as its notification destination. New issue notifications will appear here.");
+    setText(
+      emptyDescription,
+      "Save your automation in the Cloudflare dashboard with this inbox as its notification destination. New issue notifications will appear here.",
+    );
     error.hidden = true;
     const now = new Date();
     setText(updated, `Updated ${clockFormat.format(now)}`);
@@ -185,9 +267,12 @@ async function render(): Promise<void> {
     loaded = true;
   } catch {
     if (disposed) return;
-    setText(error, loaded
-      ? "Could not refresh the inbox. Showing the last loaded notifications. Refresh to try again."
-      : "Could not load the inbox. Refresh to try again.");
+    setText(
+      error,
+      loaded
+        ? "Could not refresh the inbox. Showing the last loaded notifications. Refresh to try again."
+        : "Could not load the inbox. Refresh to try again.",
+    );
     error.hidden = false;
     if (!loaded) {
       empty.hidden = true;
@@ -201,10 +286,23 @@ async function render(): Promise<void> {
   }
 }
 
-refresh.addEventListener("click", () => { void render(); });
-const timer = setInterval(() => { void render(); }, 5000);
-window.addEventListener("pagehide", () => {
-  disposed = true;
-  clearInterval(timer);
-}, { once: true });
+refresh.addEventListener("click", () => {
+  void render();
+});
+const timer = setInterval(() => {
+  void render();
+}, 5000);
+const resume = () => {
+  if (!document.hidden) void render();
+};
+document.addEventListener("visibilitychange", resume);
+window.addEventListener(
+  "pagehide",
+  () => {
+    disposed = true;
+    clearInterval(timer);
+    document.removeEventListener("visibilitychange", resume);
+  },
+  { once: true },
+);
 void render();
