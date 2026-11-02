@@ -1,7 +1,7 @@
 {
   "blueprintId": "automation.workers-issues",
   "title": "Worker issue inbox",
-  "description": "Receive Worker issue notifications. Optionally enable AI investigations with Worker-scoped read-only telemetry.",
+  "description": "Receive Worker issue notifications. Optionally enable AI investigations with Worker-scoped read-only telemetry, and AI fixes proposed as merge or pull requests.",
   "output": {
     "id": "investigations",
     "noun": "Investigation inbox",
@@ -13,10 +13,10 @@
     "name": "Cloudflare",
     "id": "agent@cloudflare.com"
   },
-  "revision": 2,
+  "revision": 3,
   "created": "2026-10-27T00:00:00.000Z",
-  "version": 2,
-  "lastUpdated": "2026-10-29T00:00:00.000Z",
+  "version": 3,
+  "lastUpdated": "2026-11-02T00:00:00.000Z",
   "bindings": {
     "CLOUDFLARE_NOTIFICATIONS": {
       "type": "gatekeeper",

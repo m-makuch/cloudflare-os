@@ -1,5 +1,6 @@
 import { el } from "@gadgets/bundled-blueprints/libraries/ui/client";
 import type {
+  FixSetup,
   InvestigationSummary,
   InvestigationStatus,
   WorkerIssueInbox,
@@ -32,7 +33,9 @@ p { margin: 0; }
 .badge::before { content: ""; width: 6px; height: 6px; border-radius: 50%; background: currentColor; }
 .badge[data-status="received"]::before { background: transparent; border: 1px solid currentColor; }
 .badge[data-status="delivery_unknown"] { border-style: dashed; }
-.badge[data-status="completed"] { font-weight: 700; }
+.badge[data-status="completed"], .badge[data-status="change_opened"] { font-weight: 700; }
+.badge[data-status="fix_unknown"] { border-style: dashed; }
+.change { display: inline-block; margin-top: 10px; color: LinkText; overflow-wrap: anywhere; }
 .description { max-width: 76ch; font-size: 13px; }
 .summary { margin: 24px 0 12px; flex-wrap: wrap; font-size: 12px; }
 .updated { font-variant-numeric: tabular-nums; }
@@ -61,6 +64,7 @@ const scope = el("p", { class: "scope", text: "Loading Worker scope…" });
 const refresh = el("button", { class: "refresh", type: "button", text: "Refresh inbox" });
 const mode = el("span", { class: "badge", text: "Loading setup…" });
 const modeDescription = el("span");
+const description = el("p", { class: "description" });
 const summary = el("p", { role: "status", text: "Loading inbox…" });
 const updated = el("time", { class: "updated" });
 const error = el("p", { class: "notice", role: "alert", hidden: true });
@@ -76,10 +80,7 @@ document.body.replaceChildren(
       refresh,
     ]),
     el("div", { class: "mode" }, [mode, modeDescription]),
-    el("p", {
-      class: "description",
-      text: "Dashboard setup provisions read-only telemetry for this Worker. A workspace editor can change the investigator's bindings. Repository access, project tests, code changes, and deployments require separate capabilities.",
-    }),
+    description,
     el("div", { class: "summary" }, [summary, updated]),
     error,
     empty,
@@ -96,7 +97,18 @@ const STATUS_LABELS: Record<InvestigationStatus, string> = {
   queued: "Investigation queued",
   delivery_unknown: "Delivery unconfirmed",
   completed: "Report ready",
+  fixing: "Fix in progress",
+  push_pending: "Waiting for your approval",
+  change_opened: "Change proposed",
+  fix_unknown: "Fix delivery unconfirmed",
 };
+
+/** What the git host calls a proposed change. */
+function changeNoun(fixes: FixSetup | undefined): string {
+  return fixes?.provider === "github" ? "pull request" : "merge request";
+}
+
+let fixSetup: FixSetup | undefined;
 
 const dateFormat = new Intl.DateTimeFormat(undefined, { dateStyle: "medium", timeStyle: "short" });
 const clockFormat = new Intl.DateTimeFormat(undefined, { timeStyle: "short" });
@@ -109,6 +121,7 @@ type EntryView = {
   report: HTMLPreElement;
   readReport: HTMLButtonElement;
   retry: HTMLButtonElement;
+  change: HTMLAnchorElement;
   reportLoaded: boolean;
 };
 const views = new Map<string, EntryView>();
@@ -131,6 +144,13 @@ function reportText(run: InvestigationSummary): string {
   if (run.status === "delivery_unknown") {
     return "Delivery could not be confirmed. Check the workspace conversations before sending again.";
   }
+  if (run.status === "fix_unknown") {
+    return `Delivery could not be confirmed. Retrying first checks the repository for a ${changeNoun(fixSetup)} from ${run.fix_branch ?? "its branch"}.`;
+  }
+  if (run.status === "push_pending") {
+    return `The fixer proposed a ${changeNoun(fixSetup)}. Approve its push and creation in the workspace; nothing reaches the repository until you do.`;
+  }
+  if (run.mode === "fix") return "The fixer has not submitted a report yet.";
   return "The investigator has not submitted a report yet.";
 }
 
@@ -152,8 +172,10 @@ function renderEntries(runs: InvestigationSummary[]): void {
       const report = el("pre", { class: "report" });
       const readReport = el("button", { class: "refresh", type: "button", text: "Read report" });
       const retry = el("button", { class: "refresh", type: "button", text: "Retry investigation" });
+      const change = el("a", { class: "change", target: "_blank", rel: "noopener noreferrer" });
       const element = el("article", { class: "entry" }, [
         el("div", { class: "entry-header" }, [el("div", {}, [title, time]), badge]),
+        change,
         report,
         readReport,
         retry,
@@ -166,6 +188,7 @@ function renderEntries(runs: InvestigationSummary[]): void {
         report,
         readReport,
         retry,
+        change,
         reportLoaded: false,
       };
       readReport.addEventListener("click", async () => {
@@ -218,7 +241,14 @@ function renderEntries(runs: InvestigationSummary[]): void {
     }
     view.report.classList.toggle("placeholder", !run.has_report);
     view.readReport.hidden = !run.has_report;
-    view.retry.hidden = run.status !== "failed";
+    view.retry.hidden = run.status !== "failed" && run.status !== "fix_unknown";
+    setText(view.retry, run.mode === "fix" ? "Retry fix" : "Retry investigation");
+    // Only an https link the server validated is shown; it opens on the git host.
+    const url = run.change_url;
+    view.change.hidden = !url;
+    if (url && view.change.href !== url) view.change.href = url;
+    const state = run.change_state && run.change_state !== "opened" ? ` (${run.change_state})` : "";
+    setText(view.change, url ? `View ${changeNoun(fixSetup)} ${run.change_id ? `#${run.change_id}` : ""}${state}` : "");
 
     // Insert new entries in order without detaching the existing report nodes.
     if (entries.children[index] !== view.element) {
@@ -232,20 +262,35 @@ async function render(): Promise<void> {
   loading = true;
   refresh.disabled = true;
   try {
+    // Pending requests are read from the git host at most once a minute per run, server-side.
+    await gadget.reconcileChanges().catch(() => undefined);
     const [runs, setup] = await Promise.all([gadget.listInvestigations(), gadget.getSetupStatus()]);
     if (disposed) return;
+    fixSetup = setup.fixes;
     setText(
       scope,
       setup.workerName
         ? [setup.workerName, setup.accountId].filter(Boolean).join(" · ")
         : "This inbox has not been connected to a Worker yet.",
     );
-    setText(mode, setup.investigationsEnabled ? "AI investigations on" : "Notifications only");
+    const fixes = setup.investigationsEnabled ? setup.fixes : undefined;
+    setText(
+      mode,
+      fixes ? "AI fixes on" : setup.investigationsEnabled ? "AI investigations on" : "Notifications only",
+    );
     setText(
       modeDescription,
-      setup.investigationsEnabled
-        ? "New issue notifications can start an investigation."
-        : "Notifications are stored without running a model.",
+      fixes
+        ? `New issue notifications can propose a fix as a ${changeNoun(fixes)} in ${fixes.repository}.`
+        : setup.investigationsEnabled
+          ? "New issue notifications can start an investigation."
+          : "Notifications are stored without running a model.",
+    );
+    setText(
+      description,
+      fixes
+        ? `The fixer can push only to branches starting with "${fixes.branchPrefix}" and open ${changeNoun(fixes)}s into the default branch. It cannot merge or deploy: you review and merge, and your CI deploys. A workspace editor can change its bindings.`
+        : "Dashboard setup provisions read-only telemetry for this Worker. A workspace editor can change the investigator's bindings. Repository access, project tests, code changes, and deployments require separate capabilities.",
     );
     setText(
       summary,

@@ -38,9 +38,32 @@ Failures before dispatch become `failed` and offer explicit retry. Ambiguous dis
 `delivery_unknown` for inspection rather than being resent automatically. Conflicting issue IDs for
 the same run increment a durable diagnostic counter without triggering provider retries.
 
+## Optional AI fixes
+
+With investigations enabled, setup can also connect a repository and enable fixes. The
+`REPOSITORY` binding must be a contributor binding (GitLab `GITLAB_PROJECT_CONTRIBUTOR` or GitHub
+`GITHUB_REPO_CONTRIBUTOR`): the gatekeeper lets it push only to branches under its prefix (by default
+`cloudflare-os/`), never force, never to the default or a protected branch, and open requests only
+into the default branch; it refuses public repositories unless the user allowed them, checked again
+when each write applies. `enableFixes()` refuses a binding that reports no branch prefix. Setup gives
+the `INVESTIGATOR` spawner the same `REPOSITORY` binding as the inbox.
+
+A run dispatched while fixes are enabled is a fix run for life, and an investigation stays an
+investigation. Its branch, `<prefix>fix/<issue>-<hash of the run>`, is chosen before dispatch and
+reused on retry, so the git host's one-open-request-per-branch rule bounds duplicates. The fixer
+reports the request it opened (`push_pending` while its push and creation wait for approval,
+`change_opened` once it exists); the page asks the inbox to re-read pending requests, at most once a
+minute per run. An ambiguous fix dispatch is `fix_unknown`, and retrying it first lists the requests
+from its branch: one found there is shown instead of attempted again.
+
+The fixer's instructions require scrubbing personal and secret data from code, tests, commit
+messages, and descriptions before committing. Nothing is merged or deployed by the inbox or the
+fixer: a person merges, and the project's CI deploys. Whether each push and request waits for a
+person is the workspace's approval setting for the repository binding, chosen at setup.
+
 ## Deployment
 
-Release the OS setup frontend and blueprint together. Dashboard setup uses `/setup/workers-issues`;
+Release the OS setup frontend and blueprint together. Updating the blueprint never enables fixes. Dashboard setup uses `/setup/workers-issues`;
 home-page setup links redirect there, and unrelated routes never interpret the setup query. Only
 development builds accept localhost dashboard origins. Updating a blueprint never opts an inbox
 into AI: investigations require explicit enablement.

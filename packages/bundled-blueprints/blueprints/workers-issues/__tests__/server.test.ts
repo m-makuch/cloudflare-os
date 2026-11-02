@@ -42,12 +42,42 @@ afterEach(() => {
   for (const db of databases.splice(0)) db.close();
 });
 
-const setup = () => {
+type Change = { id: string; url: string | null; state: string; merged?: boolean };
+
+/** A contributor repository binding: metadata, and the requests listed per branch. */
+const repository = (provider: "gitlab" | "github", metadata: Record<string, unknown> = {}) => {
+  const changes = new Map<string, Change[]>();
+  const list = vi.fn(async (options: { sourceBranch?: string; head?: string }) => {
+    const rows = changes.get(options.sourceBranch ?? options.head ?? "") ?? [];
+    return { next: async () => rows, [Symbol.dispose]: vi.fn() };
+  });
+  return {
+    changes,
+    list,
+    binding: {
+      getMetadata: vi.fn().mockResolvedValue({
+        ...(provider === "github"
+          ? { fullName: "acme/checkout", url: "https://github.com/acme/checkout" }
+          : { path: "acme/checkout", url: "https://gitlab.example.com/acme/checkout" }),
+        defaultBranch: "main",
+        visibility: "private",
+        branchPrefix: "cloudflare-os/",
+        allowPublic: false,
+        ...metadata,
+      }),
+      listMergeRequests: provider === "gitlab" ? list : vi.fn(),
+      listPullRequests: provider === "github" ? list : vi.fn(),
+    },
+  };
+};
+
+const setup = (options: { repository?: ReturnType<typeof repository> } = {}) => {
   const database = new DatabaseSync(":memory:");
   databases.push(database);
   const storage = new Map<string, unknown>();
   const investigate = vi.fn().mockResolvedValue(undefined);
-  const spawnCallable = vi.fn().mockResolvedValue({ investigate, [Symbol.dispose]() {} });
+  const fix = vi.fn().mockResolvedValue(undefined);
+  const spawnCallable = vi.fn().mockResolvedValue({ investigate, fix, [Symbol.dispose]() {} });
   const subscribe = vi.fn().mockResolvedValue(undefined);
   let gadget: InstanceType<typeof Gadget>;
   const context = {
@@ -56,6 +86,7 @@ const setup = () => {
       put: async (key: string, value: unknown) => {
         storage.set(key, value);
       },
+      delete: async (key: string) => storage.delete(key),
       setAlarm: vi.fn().mockResolvedValue(undefined),
       sql: {
         exec: (sql: string, ...values: SQLInputValue[]) => {
@@ -72,13 +103,32 @@ const setup = () => {
   const env = {
     INVESTIGATOR: { spawnCallable },
     CLOUDFLARE_NOTIFICATIONS: { subscribe, getStatus: vi.fn() },
+    ...(options.repository ? { REPOSITORY: options.repository.binding } : {}),
   };
   const restart = () => {
     gadget = new Gadget(context as unknown as DurableObjectState, env);
     return gadget;
   };
-  return { gadget: restart(), restart, spawnCallable, investigate, subscribe, storage, context };
+  return { gadget: restart(), restart, spawnCallable, investigate, fix, subscribe, storage, context, database };
 };
+
+type Task = {
+  getContext(): Promise<{ fix?: { branch: string; provider: string; repository: string } }>;
+  reportChange(change: { id: string; url: string | null }): Promise<void>;
+  complete(report: string): Promise<void>;
+};
+
+/** An inbox with investigations and fixes enabled, and one pending notification. */
+const fixing = async (provider: "gitlab" | "github" = "gitlab") => {
+  const repo = repository(provider);
+  const fixture = setup({ repository: repo });
+  await fixture.gadget.initialize(scope);
+  await fixture.gadget.enableInvestigations();
+  await fixture.gadget.enableFixes();
+  await fixture.gadget.onNotification(notification());
+  return { ...fixture, repo };
+};
+const RUN = `${scope.accountId}:run-1`;
 
 describe("Worker issue investigation inbox", () => {
   it("registers one external-policy hook, including concurrent initialization and restart", async () => {
@@ -264,5 +314,183 @@ describe("Worker issue investigation inbox", () => {
     await oldDispatch;
     expect(fixture.investigate).toHaveBeenCalledTimes(1);
     expect(await replacement.listInvestigations()).toMatchObject([{ status: "queued" }]);
+  });
+});
+
+describe("Worker issue fixes", () => {
+  it("requires investigations and a contributor repository binding, and records the repository", async () => {
+    const plain = setup();
+    await plain.gadget.initialize(scope);
+    await plain.gadget.enableInvestigations();
+    await expect(plain.gadget.enableFixes()).rejects.toThrow("Connect a repository");
+
+    const full = setup({ repository: repository("gitlab", { branchPrefix: undefined }) });
+    await full.gadget.initialize(scope);
+    await expect(full.gadget.enableFixes()).rejects.toThrow("Enable investigations");
+    await full.gadget.enableInvestigations();
+    // A binding with the whole repository's surface is refused.
+    await expect(full.gadget.enableFixes()).rejects.toThrow("contributor binding");
+
+    const github = setup({ repository: repository("github") });
+    await github.gadget.initialize(scope);
+    await github.gadget.enableInvestigations();
+    expect(await github.gadget.enableFixes()).toEqual({
+      provider: "github", repository: "acme/checkout", branchPrefix: "cloudflare-os/",
+    });
+    expect(await github.gadget.getSetupStatus()).toMatchObject({
+      fixes: { provider: "github", repository: "acme/checkout" },
+    });
+    await github.gadget.disableFixes();
+    expect(await github.gadget.getSetupStatus()).not.toHaveProperty("fixes");
+  });
+
+  it("dispatches a fixer with a stable prefixed branch and the fix instructions", async () => {
+    const fixture = await fixing();
+    await fixture.gadget.alarm();
+    expect(fixture.investigate).not.toHaveBeenCalled();
+    expect(fixture.fix).toHaveBeenCalledTimes(1);
+    const [title, options] = fixture.spawnCallable.mock.calls[0]!;
+    expect(title).toBe("Fix checkout-test: issue-1");
+    expect(options.mainType).toBe("Fixer");
+    // The instructions carry the scrubbing rule and forbid merging and deploying.
+    expect(options.types).toMatch(/Scrub before committing/);
+    expect(options.types).toMatch(/email addresses/);
+    expect(options.types).toMatch(/Never merge it, deploy/);
+
+    const task = fixture.fix.mock.calls[0]![0] as Task;
+    const context = await task.getContext();
+    expect(context.fix).toEqual({
+      provider: "gitlab", repository: "acme/checkout", branch: expect.stringMatching(/^cloudflare-os\/fix\/issue-1-[0-9a-f]{10}$/),
+    });
+    expect(await fixture.gadget.listInvestigations()).toMatchObject([
+      { status: "fixing", mode: "fix", fix_branch: context.fix!.branch },
+    ]);
+  });
+
+  it("records a pending request, then its URL once the repository shows it", async () => {
+    const fixture = await fixing();
+    await fixture.gadget.alarm();
+    const task = fixture.fix.mock.calls[0]![0] as Task;
+    const { fix } = await task.getContext();
+    await expect(task.reportChange({ id: "42; drop", url: null })).rejects.toThrow();
+    await expect(task.reportChange({ id: "42", url: "javascript:alert(1)" })).rejects.toThrow();
+    await task.reportChange({ id: "~1", url: null });
+    await task.complete("Fixed the missing coupon guard; added a regression test.");
+    expect(await fixture.gadget.listInvestigations()).toMatchObject([
+      { status: "push_pending", change_id: "~1", change_url: null, has_report: true },
+    ]);
+
+    // Approved and created: the repository now lists it.
+    const url = "https://gitlab.example.com/acme/checkout/-/merge_requests/7";
+    fixture.repo.changes.set(fix!.branch, [{ id: "7", url, state: "opened" }]);
+    await fixture.gadget.reconcileChanges();
+    expect(fixture.repo.list).toHaveBeenCalledWith({ sourceBranch: fix!.branch, state: "all", resultsPerPage: 10 });
+    expect(await fixture.gadget.listInvestigations()).toMatchObject([
+      { status: "change_opened", change_id: "7", change_url: url, change_state: "opened" },
+    ]);
+    // Read at most once a minute per run.
+    await fixture.gadget.reconcileChanges();
+    expect(fixture.repo.list).toHaveBeenCalledTimes(1);
+  });
+
+  it("reads GitHub pull requests by head and records a merge", async () => {
+    const fixture = await fixing("github");
+    await fixture.gadget.alarm();
+    const task = fixture.fix.mock.calls[0]![0] as Task;
+    const { fix } = await task.getContext();
+    await task.reportChange({ id: "~1", url: null });
+    const url = "https://github.com/acme/checkout/pull/9";
+    fixture.repo.changes.set(fix!.branch, [{ id: "9", url, state: "closed", merged: true }]);
+    await fixture.gadget.reconcileChanges();
+    expect(fixture.repo.list).toHaveBeenCalledWith({ head: fix!.branch, state: "all", resultsPerPage: 10 });
+    expect(await fixture.gadget.listInvestigations()).toMatchObject([
+      { status: "change_opened", change_id: "9", change_url: url, change_state: "merged" },
+    ]);
+  });
+
+  it("checks the repository before retrying an unconfirmed fix, and reuses its branch", async () => {
+    const fixture = await fixing();
+    fixture.fix.mockRejectedValueOnce(new Error("Connection lost after dispatch"));
+    await fixture.gadget.alarm();
+    const [run] = await fixture.gadget.listInvestigations();
+    expect(run).toMatchObject({ status: "fix_unknown" });
+
+    // The fixer got as far as opening its request: shown, not attempted again.
+    const url = "https://gitlab.example.com/acme/checkout/-/merge_requests/8";
+    fixture.repo.changes.set(run!.fix_branch!, [{ id: "8", url, state: "opened" }]);
+    await fixture.gadget.retryInvestigation(RUN);
+    expect(await fixture.gadget.listInvestigations()).toMatchObject([{ status: "change_opened", change_id: "8" }]);
+    await fixture.gadget.alarm();
+    expect(fixture.fix).toHaveBeenCalledTimes(1);
+  });
+
+  it("retries an unconfirmed fix with nothing in the repository on the same branch", async () => {
+    const fixture = await fixing();
+    fixture.fix.mockRejectedValueOnce(new Error("Connection lost after dispatch"));
+    await fixture.gadget.alarm();
+    const [before] = await fixture.gadget.listInvestigations();
+    await fixture.gadget.retryInvestigation(RUN);
+    await fixture.gadget.alarm();
+    expect(fixture.fix).toHaveBeenCalledTimes(2);
+    const task = fixture.fix.mock.calls[1]![0] as Task;
+    expect((await task.getContext()).fix!.branch).toBe(before!.fix_branch);
+  });
+
+  it("marks a fix lost to a restart mid-dispatch as unconfirmed, not as a lost investigation", async () => {
+    const fixture = await fixing();
+    const delivery = Promise.withResolvers<void>();
+    fixture.fix.mockReturnValueOnce(delivery.promise);
+    void fixture.gadget.alarm();
+    await vi.waitFor(() => expect(fixture.fix).toHaveBeenCalledTimes(1));
+    expect(await fixture.restart().listInvestigations()).toMatchObject([{ status: "fix_unknown" }]);
+  });
+
+  it("keeps runs dispatched as investigations investigating after fixes are enabled", async () => {
+    const repo = repository("gitlab");
+    const fixture = setup({ repository: repo });
+    fixture.spawnCallable.mockRejectedValueOnce(new Error("Model unavailable"));
+    await fixture.gadget.initialize(scope);
+    await fixture.gadget.enableInvestigations();
+    await fixture.gadget.onNotification(notification());
+    await fixture.gadget.alarm();
+    await fixture.gadget.enableFixes();
+    await fixture.gadget.retryInvestigation(RUN);
+    await fixture.gadget.alarm();
+    expect(fixture.investigate).toHaveBeenCalledTimes(1);
+    expect(fixture.fix).not.toHaveBeenCalled();
+  });
+
+  it("refuses a change report from an investigation-only run", async () => {
+    const fixture = setup();
+    await fixture.gadget.initialize(scope);
+    await fixture.gadget.enableInvestigations();
+    await fixture.gadget.onNotification(notification());
+    await fixture.gadget.alarm();
+    const task = fixture.investigate.mock.calls[0]![0] as Task;
+    await expect(task.reportChange({ id: "1", url: null })).rejects.toThrow("cannot open");
+  });
+
+  it("adds the fix columns to an inbox created before fixes, keeping its rows", async () => {
+    const database = new DatabaseSync(":memory:");
+    databases.push(database);
+    database.exec(`CREATE TABLE investigations (
+      run_key TEXT PRIMARY KEY, issue_id TEXT NOT NULL, notification TEXT NOT NULL,
+      status TEXT NOT NULL, report TEXT, created_at INTEGER NOT NULL)`);
+    database.prepare("INSERT INTO investigations VALUES ('k', 'issue-0', '{}', 'completed', 'r', 1)").run();
+    const context = {
+      storage: {
+        get: async () => undefined,
+        sql: {
+          exec: (sql: string, ...values: SQLInputValue[]) => {
+            const rows = database.prepare(sql).all(...values);
+            return { toArray: () => rows };
+          },
+        },
+      },
+    };
+    const gadget = new Gadget(context as unknown as DurableObjectState, {} as never);
+    expect(await gadget.listInvestigations()).toMatchObject([
+      { run_key: "k", status: "completed", mode: null, fix_branch: null, change_url: null },
+    ]);
   });
 });

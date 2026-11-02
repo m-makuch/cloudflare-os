@@ -7,6 +7,11 @@ const entry = (overrides: Partial<InvestigationSummary> = {}): InvestigationSumm
   status: "received",
   has_report: false,
   created_at: 1_790_000_000_000,
+  mode: null,
+  fix_branch: null,
+  change_id: null,
+  change_url: null,
+  change_state: null,
   ...overrides,
 });
 
@@ -14,6 +19,7 @@ const listInvestigations = vi.fn<WorkerIssueInbox["listInvestigations"]>();
 const getSetupStatus = vi.fn<WorkerIssueInbox["getSetupStatus"]>();
 const getInvestigationReport = vi.fn<WorkerIssueInbox["getInvestigationReport"]>();
 const retryInvestigation = vi.fn<WorkerIssueInbox["retryInvestigation"]>();
+const reconcileChanges = vi.fn<WorkerIssueInbox["reconcileChanges"]>();
 
 beforeEach(() => {
   vi.resetModules();
@@ -23,6 +29,7 @@ beforeEach(() => {
   listInvestigations.mockReset().mockResolvedValue([entry()]);
   getInvestigationReport.mockReset().mockResolvedValue("Read this report without interruption.");
   retryInvestigation.mockReset().mockResolvedValue(undefined);
+  reconcileChanges.mockReset().mockResolvedValue(undefined);
   getSetupStatus.mockReset().mockResolvedValue({
     accountId: "a".repeat(32),
     workerName: "checkout-test",
@@ -33,6 +40,7 @@ beforeEach(() => {
     getSetupStatus,
     getInvestigationReport,
     retryInvestigation,
+    reconcileChanges,
   });
 });
 
@@ -183,5 +191,42 @@ describe("Worker issue inbox", () => {
     retry.click();
     await vi.advanceTimersByTimeAsync(0);
     expect(retryInvestigation).toHaveBeenCalledWith("account:run-1");
+  });
+
+  it("presents fix mode, a pending request, and a link to an opened one on the git host", async () => {
+    getSetupStatus.mockResolvedValue({
+      accountId: "a".repeat(32),
+      workerName: "checkout-test",
+      investigationsEnabled: true,
+      fixes: { provider: "gitlab", repository: "acme/checkout", branchPrefix: "cloudflare-os/" },
+    });
+    const url = "https://gitlab.example.com/acme/checkout/-/merge_requests/7";
+    listInvestigations.mockResolvedValue([
+      entry({ run_key: "a:2", status: "change_opened", mode: "fix", change_id: "7", change_url: url, change_state: "opened" }),
+      entry({ run_key: "a:1", status: "push_pending", mode: "fix", change_id: "~1" }),
+      entry({ run_key: "a:0", status: "fix_unknown", mode: "fix", fix_branch: "cloudflare-os/fix/issue-1-abc" }),
+    ]);
+    await load();
+    expect(reconcileChanges).toHaveBeenCalled();
+    expect(document.body.textContent).toContain("AI fixes on");
+    expect(document.body.textContent).toContain('branches starting with "cloudflare-os/"');
+    expect(document.body.textContent).toContain("cannot merge or deploy");
+    const [opened, pending, unknown] = document.querySelectorAll<HTMLElement>("article");
+    const link = opened!.querySelector<HTMLAnchorElement>("a.change")!;
+    expect(link.href).toBe(url);
+    expect(link.rel).toContain("noopener");
+    expect(link.textContent).toContain("merge request #7");
+    expect(pending!.textContent).toContain("Waiting for your approval");
+    expect(pending!.querySelector<HTMLAnchorElement>("a.change")!.hidden).toBe(true);
+    expect(unknown!.textContent).toContain("checks the repository");
+    const retry = [...unknown!.querySelectorAll("button")].find(button => button.textContent === "Retry fix")!;
+    expect(retry.hidden).toBe(false);
+  });
+
+  it("keeps showing the inbox when the repository cannot be read", async () => {
+    reconcileChanges.mockRejectedValue(new Error("unavailable"));
+    await load();
+    expect(document.querySelectorAll("article")).toHaveLength(1);
+    expect(document.querySelector<HTMLElement>("[role=alert]")!.hidden).toBe(true);
   });
 });
