@@ -46,6 +46,26 @@ describe("dashboard issue setup context", () => {
     expect(parseWorkersIssueSetup(search(value))).toBeNull();
   });
 
+  it("preserves a fix request only alongside an investigation, and rejects malformed ones", () => {
+    const investigation = { workspaceId: "b".repeat(64), destinationId: "destination-1" };
+    const remediation = {
+      approval: "ask",
+      allowPublic: false,
+      repositoryUrl: "https://github.com/acme/checkout",
+    };
+    const value = { ...request, investigation, remediation };
+    expect(parseWorkersIssueSetup(search(value))).toEqual(value);
+    expect(parseWorkersIssueSetup(search({ ...request, remediation }))).toBeNull();
+    for (const bad of [
+      { ...remediation, approval: "always" },
+      { ...remediation, allowPublic: "yes" },
+      { ...remediation, repositoryUrl: "javascript:alert(1)" },
+      { ...remediation, repositoryUrl: "http://github.com/acme/checkout" },
+    ]) {
+      expect(parseWorkersIssueSetup(search({ ...request, investigation, remediation: bad }))).toBeNull();
+    }
+  });
+
   it("rejects duplicate and oversized setup parameters", () => {
     expect(parseWorkersIssueSetup(`${search(request)}&${search(request)}`)).toBeNull();
     expect(parseWorkersIssueSetup(search({ ...request, extra: "x".repeat(2048) }))).toBeNull();

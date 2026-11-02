@@ -1,9 +1,11 @@
 import { useEffect, useRef, useState } from "react";
-import { Button, Checkbox, LinkButton, Select } from "@cloudflare/kumo";
-import type { AiChatAuthorInfo } from "@gadgets/workshop-shared/api";
+import { Banner, Button, Checkbox, Dialog, Input, LinkButton, Radio, Select, Switch } from "@cloudflare/kumo";
+import type { AiChatAuthorInfo, GatekeeperVendorInfo } from "@gadgets/workshop-shared/api";
 import type { RpcStub } from "capnweb";
 import type { CloudflareAccountConfiguratorRpc } from "../../../../gatekeeper-cloudflare/src/configurator/cloudflare-configurator-types";
 import { useAuthenticatedApi } from "../../AuthContext";
+import { authorizeRepositoryAccount } from "./authorizeRepositoryAccount";
+import { FIX_BRANCH_PREFIX, resolveContributorRepository } from "./contributorRepository";
 import { provisionWorkersIssueInbox } from "./provisionWorkersIssueInbox";
 import {
   NOTIFICATIONS_PATTERN,
@@ -31,6 +33,14 @@ export const WorkersIssueSetupPage = ({ request }: { request: WorkersIssueSetupR
   const [modelId, setModelId] = useState("");
   const [changeModel, setChangeModel] = useState(false);
   const [investigateCurrent, setInvestigateCurrent] = useState(false);
+  const remediation = request.remediation;
+  const [fixesWanted, setFixesWanted] = useState(Boolean(remediation));
+  const [repositoryUrl, setRepositoryUrl] = useState(remediation?.repositoryUrl ?? "");
+  const [approval, setApproval] = useState<"ask" | "automatic">(remediation?.approval ?? "ask");
+  const [allowPublic, setAllowPublic] = useState(remediation?.allowPublic ?? false);
+  const [confirmingPublic, setConfirmingPublic] = useState(false);
+  const [publicAcknowledged, setPublicAcknowledged] = useState(false);
+  const [vendors, setVendors] = useState<GatekeeperVendorInfo[]>();
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
   const [message, setMessage] = useState("");
@@ -59,6 +69,30 @@ export const WorkersIssueSetupPage = ({ request }: { request: WorkersIssueSetupR
     models.find((model) => model.id === modelId) ??
     preferredModel ??
     (models.length === 1 ? models[0] : undefined);
+  const fixing = Boolean(remediation) && fixesWanted;
+  const repository =
+    fixing && vendors ? resolveContributorRepository(vendors, repositoryUrl, allowPublic) : undefined;
+  const repositoryReady = !fixing || (repository !== undefined && !("error" in repository));
+  const closePublicDialog = () => {
+    setConfirmingPublic(false);
+    setPublicAcknowledged(false);
+  };
+
+  useEffect(() => {
+    if (!remediation) return;
+    let cancelled = false;
+    authenticatedApi
+      .listGatekeeperVendors()
+      .then((next) => {
+        if (!cancelled) setVendors(next);
+      })
+      .catch(() => {
+        if (!cancelled) setError("Could not load repository connectors. Reload to try again.");
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [authenticatedApi, remediation]);
 
   useEffect(() => {
     if (!isInvestigation) return;
@@ -86,7 +120,8 @@ export const WorkersIssueSetupPage = ({ request }: { request: WorkersIssueSetupR
       connection.checking ||
       connection.error ||
       (connection.choices.length > 1 && !selectedAccount) ||
-      (isInvestigation && !selectedModel)
+      (isInvestigation && !selectedModel) ||
+      !repositoryReady
     )
       return;
     const controller = new AbortController();
@@ -109,10 +144,30 @@ export const WorkersIssueSetupPage = ({ request }: { request: WorkersIssueSetupR
       if (!accessible.some((value) => value.value === request.accountId))
         throw new Error("This connection cannot access the requested Cloudflare account.");
       controller.signal.throwIfAborted();
+      let fix;
+      if (repository && !("error" in repository)) {
+        setMessage(
+          `Checking ${repository.vendorName} access. If authorization opens, finish it to continue automatically.`,
+        );
+        fix = {
+          accountId: await authorizeRepositoryAccount(
+            authenticatedApi,
+            repository.vendorId,
+            repository.urlPattern,
+            controller.signal,
+          ),
+          resourceUrl: repository.resourceUrl,
+          approval,
+          allowPublic,
+        };
+        controller.signal.throwIfAborted();
+      }
       setMessage(
-        isInvestigation
-          ? "Connecting the Worker-scoped investigator…"
-          : "Connecting the notification destination…",
+        fix
+          ? "Connecting the Worker-scoped fixer…"
+          : isInvestigation
+            ? "Connecting the Worker-scoped investigator…"
+            : "Connecting the notification destination…",
       );
       const result = await provisionWorkersIssueInbox(
         authenticatedApi,
@@ -130,6 +185,7 @@ export const WorkersIssueSetupPage = ({ request }: { request: WorkersIssueSetupR
             }
           }
         },
+        fix,
       );
       if (controller.signal.aborted) return;
       setReady({
@@ -137,9 +193,11 @@ export const WorkersIssueSetupPage = ({ request }: { request: WorkersIssueSetupR
         investigateCurrent: isInvestigation && Boolean(request.issueId) && investigateCurrent,
       });
       setMessage(
-        isInvestigation
-          ? "AI investigations are enabled. Returning to your saved automation."
-          : "Cloudflare OS is connected. Return to the dashboard to save your automation.",
+        fix
+          ? "AI fixes are enabled. Returning to your saved automation."
+          : isInvestigation
+            ? "AI investigations are enabled. Returning to your saved automation."
+            : "Cloudflare OS is connected. Return to the dashboard to save your automation.",
       );
     } catch (caught) {
       if (!controller.signal.aborted)
@@ -161,7 +219,7 @@ export const WorkersIssueSetupPage = ({ request }: { request: WorkersIssueSetupR
       <div className="grid gap-2">
         <p className="text-sm font-medium text-kumo-subtle">Cloudflare OS</p>
         <h1 className="text-2xl font-semibold text-kumo-default">
-          {isInvestigation ? "Enable AI investigations" : "Connect Cloudflare OS"}
+          {fixing ? "Enable AI fixes" : isInvestigation ? "Enable AI investigations" : "Connect Cloudflare OS"}
         </h1>
         <p className="text-sm text-kumo-subtle">
           {isInvestigation ? "Analyze logs and traces for" : "Receive issue notifications for"}{" "}
@@ -222,10 +280,9 @@ export const WorkersIssueSetupPage = ({ request }: { request: WorkersIssueSetupR
           {isInvestigation ? (
             <div className="grid gap-3">
               <p className="text-sm text-kumo-subtle">
-                Setup installs a new investigator with the selected model and read-only telemetry
-                for this Worker, replacing any existing investigator binding. Workspace editors can
-                change its bindings later. Repository access, tests, code changes, and deployments
-                require separate capabilities.
+                {fixing
+                  ? "Setup installs a new fixer with the selected model, read-only telemetry for this Worker, and access to propose changes to one repository, replacing any existing investigator binding. Workspace editors can change its bindings later."
+                  : "Setup installs a new investigator with the selected model and read-only telemetry for this Worker, replacing any existing investigator binding. Workspace editors can change its bindings later. Repository access, tests, code changes, and deployments require separate capabilities."}
               </p>
               {selectedModel && !changeModel ? (
                 <div className="flex flex-wrap items-center justify-between gap-2 text-sm text-kumo-default">
@@ -249,6 +306,67 @@ export const WorkersIssueSetupPage = ({ request }: { request: WorkersIssueSetupR
                   Configure a language model in OS Settings, then reload this setup. Your
                   notification destination is already connected.
                 </p>
+              )}
+              {remediation && (
+                <section className="grid gap-3 rounded-lg border border-kumo-line p-4">
+                  <Switch
+                    label="Propose fixes as pull or merge requests"
+                    checked={fixesWanted}
+                    disabled={busy}
+                    onClick={() => setFixesWanted((value) => !value)}
+                  />
+                  {fixesWanted && (
+                    <>
+                      <p className="text-sm text-kumo-subtle">
+                        The fixer commits a fix and a regression test to a new branch starting with{" "}
+                        <code>{FIX_BRANCH_PREFIX}</code> and opens a pull or merge request into the
+                        default branch. It cannot merge, push to other branches, or deploy: you
+                        review and merge, and your CI deploys. Fixes are written from production
+                        telemetry and notification text, which can contain personal data or
+                        attacker-controlled content; the fixer is instructed to leave such data out,
+                        but review every change before merging.
+                      </p>
+                      <Input
+                        label="Repository"
+                        placeholder="https://github.com/owner/repo"
+                        value={repositoryUrl}
+                        disabled={busy}
+                        onChange={(event) => setRepositoryUrl(event.target.value)}
+                        description={
+                          repository && !("error" in repository)
+                            ? `${repository.vendorName} · ${repository.path}`
+                            : "The repository this Worker is built from."
+                        }
+                        error={
+                          repositoryUrl && repository && "error" in repository
+                            ? repository.error
+                            : undefined
+                        }
+                      />
+                      <Radio.Group
+                        legend="Before each push and pull or merge request"
+                        value={approval}
+                        disabled={busy}
+                        onValueChange={(value) => setApproval(value === "automatic" ? "automatic" : "ask")}
+                      >
+                        <Radio.Item label="Ask me in the workspace (recommended)" value="ask" />
+                        <Radio.Item label="Push and open it automatically" value="automatic" />
+                      </Radio.Group>
+                      <Switch
+                        label="Allow public repositories"
+                        checked={allowPublic}
+                        disabled={busy}
+                        onClick={() => (allowPublic ? setAllowPublic(false) : setConfirmingPublic(true))}
+                      />
+                      {allowPublic && approval === "automatic" && (
+                        <Banner
+                          variant="alert"
+                          description="With a public repository and automatic approval, each proposed change, and anything it contains, becomes public without your review."
+                        />
+                      )}
+                    </>
+                  )}
+                </section>
               )}
               {request.issueId && (
                 <Checkbox
@@ -283,11 +401,12 @@ export const WorkersIssueSetupPage = ({ request }: { request: WorkersIssueSetupR
                 connection.checking ||
                 Boolean(connection.error) ||
                 (connection.choices.length > 1 && !selectedAccount) ||
-                (isInvestigation && !selectedModel)
+                (isInvestigation && !selectedModel) ||
+                !repositoryReady
               }
               onClick={() => void setup()}
             >
-              {isInvestigation ? "Enable investigations" : "Connect destination"}
+              {fixing ? "Enable fixes" : isInvestigation ? "Enable investigations" : "Connect destination"}
             </Button>
           </div>
         </>
@@ -307,6 +426,35 @@ export const WorkersIssueSetupPage = ({ request }: { request: WorkersIssueSetupR
           Open issue inbox
         </LinkButton>
       )}
+      <Dialog.Root open={confirmingPublic} onOpenChange={(open) => !open && closePublicDialog()}>
+        <Dialog className="grid gap-4 p-6">
+          <Dialog.Title className="text-lg font-semibold">Allow public repositories?</Dialog.Title>
+          <Dialog.Description className="text-sm text-kumo-subtle">
+            Anyone can read what is pushed to a public repository: the fix, its test, the commit
+            message, and the description. They are written from production telemetry, which can
+            contain personal or secret data. The fixer is instructed to leave such data out, but it
+            can make mistakes.
+          </Dialog.Description>
+          <Checkbox
+            label="I understand that proposed changes to a public repository are visible to anyone"
+            checked={publicAcknowledged}
+            onCheckedChange={setPublicAcknowledged}
+          />
+          <div className="flex justify-end gap-2">
+            <Button onClick={closePublicDialog}>Cancel</Button>
+            <Button
+              variant="primary"
+              disabled={!publicAcknowledged}
+              onClick={() => {
+                setAllowPublic(true);
+                closePublicDialog();
+              }}
+            >
+              Allow
+            </Button>
+          </div>
+        </Dialog>
+      </Dialog.Root>
     </main>
   );
 };

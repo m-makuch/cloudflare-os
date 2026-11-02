@@ -47,6 +47,9 @@ const render = async (
     investigationsEnabled?: boolean;
     bindFailure?: boolean;
     spawnerFailure?: boolean;
+    remediation?: { approval: "ask" | "automatic"; allowPublic: boolean; repositoryUrl?: string };
+    publicRepository?: boolean;
+    restricted?: boolean;
   } = {},
 ) => {
   let subscriber: AccountsSubscriberAdapter;
@@ -73,6 +76,11 @@ const render = async (
     enableInvestigations: vi
       .fn<WorkerIssueInbox["enableInvestigations"]>()
       .mockResolvedValue(undefined),
+    enableFixes: vi.fn<WorkerIssueInbox["enableFixes"]>().mockResolvedValue({
+      provider: "github",
+      repository: "acme/checkout",
+      branchPrefix: "cloudflare-os/",
+    }),
     getNotificationStatus: vi
       .fn<WorkerIssueInbox["getNotificationStatus"]>()
       .mockResolvedValue({ installed: true, suspended: false, webhookId: "destination-1" }),
@@ -103,13 +111,49 @@ const render = async (
     remove: vi.fn<() => Promise<void>>().mockResolvedValue(undefined),
     [Symbol.dispose]() {},
   };
+  const repository = {
+    getId: async () => 8,
+    remove: vi.fn<() => Promise<void>>().mockResolvedValue(undefined),
+    openSession: async () => ({
+      getMetadata: async () => ({ visibility: options.publicRepository ? "public" : "private" }),
+      [Symbol.dispose]() {},
+    }),
+    [Symbol.dispose]() {},
+  };
   const workspace = {
     getMetadata: vi
       .fn<() => Promise<object>>()
-      .mockResolvedValue({ id: workspaceId, defaultGadgetId: 0 }),
+      .mockResolvedValue({
+        id: workspaceId,
+        defaultGadgetId: 0,
+        containsRestrictedData: options.restricted ?? false,
+      }),
     setTitle: vi.fn<(title: string) => void>(),
     getGadget: vi.fn<() => Promise<typeof gadget>>().mockResolvedValue(gadget),
-    newGatekeeper: vi.fn<() => Promise<typeof telemetry>>().mockResolvedValue(telemetry),
+    newGatekeeper: vi.fn<(accountId: number, url: string) => Promise<object>>(
+      async (_accountId: number, url: string) =>
+        url.startsWith("https://github.com/") ? repository : telemetry,
+    ),
+    listPreApprovableActions: vi.fn<() => Promise<object[]>>().mockResolvedValue([
+      {
+        gatekeeperId: 8,
+        actionKind: { tag: "github.push", label: "Push commits" },
+        alreadyEnabled: false,
+      },
+      {
+        gatekeeperId: 8,
+        actionKind: { tag: "github.createPullRequest", label: "Create pull requests" },
+        alreadyEnabled: false,
+      },
+      {
+        gatekeeperId: 5,
+        actionKind: { tag: "cloudflare.other", label: "Other" },
+        alreadyEnabled: false,
+      },
+    ]),
+    setAutoApprovedActionKind: vi
+      .fn<(id: number, kind: object) => Promise<void>>()
+      .mockResolvedValue(undefined),
     newAgentSpawnerGatekeeper: vi
       .fn<() => Promise<typeof investigator>>()
       .mockResolvedValue(investigator),
@@ -165,9 +209,32 @@ const render = async (
     subscribeConnectedAccounts: async (value: AccountsSubscriberAdapter) => {
       subscriber = value;
       for (const id of options.accounts ?? [1]) addAccount(id);
+      // A connected GitHub account, which the Cloudflare connection logic must ignore.
+      value.add(
+        7,
+        { displayName: "octocat" },
+        { displayName: "GitHub", url: "https://github.com" },
+        [],
+        true,
+        "github",
+      );
       subscriber.ready();
       return { [Symbol.dispose]() {} };
     },
+    listGatekeeperVendors: vi.fn<() => Promise<object[]>>().mockResolvedValue([
+      {
+        id: "github",
+        description: { displayName: "GitHub", url: "https://github.com" },
+        supportedResources: [
+          {
+            urlPattern: "https://github.com/:owner/:repo\\?branchPrefix=*",
+            title: "",
+            description: "",
+          },
+          { urlPattern: "https://github.com/:owner/:repo", title: "", description: "" },
+        ],
+      },
+    ]),
     listModels,
     getPreferredModel,
     startResourceConfigurator: configurator,
@@ -182,14 +249,22 @@ const render = async (
   document.body.appendChild(container);
   root = createRoot(container);
   const setupRequest = options.investigation
-    ? { ...request, investigation: { workspaceId, destinationId: "destination-1" } }
+    ? {
+        ...request,
+        investigation: { workspaceId, destinationId: "destination-1" },
+        ...(options.remediation ? { remediation: options.remediation } : {}),
+      }
     : request;
   await act(async () => root!.render(<WorkersIssueSetupPage request={setupRequest} />));
   const submit = () =>
     [...container!.querySelectorAll("button")].find(
       (button) =>
         button.textContent ===
-        (options.investigation ? "Enable investigations" : "Connect destination"),
+        (options.remediation
+          ? "Enable fixes"
+          : options.investigation
+            ? "Enable investigations"
+            : "Connect destination"),
     )!;
   const completion = () => {
     const postMessage = vi.fn<Window["postMessage"]>();
@@ -208,6 +283,7 @@ const render = async (
     gadget,
     telemetry,
     investigator,
+    repository,
     create,
     open,
     ensure,
@@ -391,5 +467,133 @@ describe("Destination-first Worker issue onboarding", () => {
     expect(fixture.submit().disabled).toBe(true);
     expect(container!.textContent).toContain("Your notification destination is already connected");
     expect(fixture.workspace.newAgentSpawnerGatekeeper).not.toHaveBeenCalled();
+  });
+});
+
+const switchLabelled = (text: string) =>
+  [...document.querySelectorAll<HTMLElement>("[role=switch]")].find((element) =>
+    element.closest("label, div")?.textContent?.includes(text),
+  )!;
+
+describe("Worker issue fixes", () => {
+  const remediation = {
+    approval: "ask" as const,
+    allowPublic: false,
+    repositoryUrl: "https://github.com/acme/checkout",
+  };
+  const CONTRIBUTOR = "https://github.com/:owner/:repo\\?branchPrefix=*";
+
+  it("connects a contributor repository for the fixer and inbox, enabling fixes with approval required", async () => {
+    const fixture = await render({ investigation: true, investigationsEnabled: true, remediation });
+    expect(container!.textContent).toContain("Enable AI fixes");
+    expect(container!.textContent).toContain("GitHub · acme/checkout");
+    await act(async () => fixture.submit().click());
+
+    expect(fixture.ensure).toHaveBeenCalledWith(7, [CONTRIBUTOR]);
+    expect(fixture.workspace.newGatekeeper).toHaveBeenCalledWith(
+      7,
+      "https://github.com/acme/checkout?branchPrefix=cloudflare-os%2F",
+    );
+    expect(fixture.workspace.newAgentSpawnerGatekeeper).toHaveBeenCalledWith({
+      displayName: "Worker issue fixer",
+      modelId: "model-2",
+      env: { WORKER_OBSERVABILITY: 5, REPOSITORY: 8 },
+    });
+    expect(fixture.gadget.bind).toHaveBeenCalledWith("INVESTIGATOR", 6);
+    expect(fixture.gadget.bind).toHaveBeenCalledWith("REPOSITORY", 8);
+    expect(fixture.inbox.enableInvestigations).toHaveBeenCalled();
+    expect(fixture.inbox.enableFixes).toHaveBeenCalled();
+    expect(fixture.workspace.setAutoApprovedActionKind).not.toHaveBeenCalled();
+    expect(fixture.completion()).toHaveBeenCalledWith(
+      expect.objectContaining({ fixesEnabled: true, investigationsEnabled: true }),
+      { targetOrigin: request.dashboardOrigin },
+    );
+  });
+
+  it("auto-approves only the repository binding's push and request kinds in automatic mode", async () => {
+    const fixture = await render({
+      investigation: true,
+      investigationsEnabled: true,
+      remediation: { ...remediation, approval: "automatic" },
+    });
+    await act(async () => fixture.submit().click());
+    expect(fixture.workspace.setAutoApprovedActionKind.mock.calls).toEqual([
+      [8, { tag: "github.push", label: "Push commits" }],
+      [8, { tag: "github.createPullRequest", label: "Create pull requests" }],
+    ]);
+  });
+
+  it("refuses a public repository unless allowed, removing everything it created", async () => {
+    const fixture = await render({
+      investigation: true,
+      investigationsEnabled: true,
+      remediation,
+      publicRepository: true,
+    });
+    await act(async () => fixture.submit().click());
+    expect(container!.querySelector("[role=alert]")?.textContent).toContain(
+      "This repository is public",
+    );
+    expect(fixture.repository.remove).toHaveBeenCalled();
+    expect(fixture.telemetry.remove).toHaveBeenCalled();
+    expect(fixture.workspace.newAgentSpawnerGatekeeper).not.toHaveBeenCalled();
+    expect(fixture.gadget.bind).not.toHaveBeenCalled();
+    expect(fixture.inbox.enableFixes).not.toHaveBeenCalled();
+  });
+
+  it("allows public repositories only after an explicit acknowledgment", async () => {
+    const fixture = await render({
+      investigation: true,
+      investigationsEnabled: true,
+      remediation,
+      publicRepository: true,
+    });
+    await act(async () => switchLabelled("Allow public repositories").click());
+    const allow = () =>
+      [...document.querySelectorAll("button")].find((button) => button.textContent === "Allow")!;
+    expect(allow().disabled).toBe(true);
+    const acknowledge = [...document.querySelectorAll<HTMLElement>("[role=checkbox]")].find(
+      (element) => element.closest("label, div")?.textContent?.includes("visible to anyone"),
+    )!;
+    // Inside the dialog the checkbox builds a PointerEvent, which jsdom lacks; stand one in.
+    const view: { PointerEvent?: typeof MouseEvent } = window;
+    view.PointerEvent = MouseEvent;
+    try {
+      await act(async () => acknowledge.click());
+    } finally {
+      delete view.PointerEvent;
+    }
+    expect(allow().disabled).toBe(false);
+    await act(async () => allow().click());
+    await act(async () => fixture.submit().click());
+    expect(fixture.workspace.newGatekeeper).toHaveBeenCalledWith(
+      7,
+      "https://github.com/acme/checkout?branchPrefix=cloudflare-os%2F&allowPublic=true",
+    );
+    expect(fixture.inbox.enableFixes).toHaveBeenCalled();
+  });
+
+  it("refuses fixes in a workspace that has read restricted data, which could never push", async () => {
+    const fixture = await render({
+      investigation: true,
+      investigationsEnabled: true,
+      remediation,
+      restricted: true,
+    });
+    await act(async () => fixture.submit().click());
+    expect(container!.querySelector("[role=alert]")?.textContent).toContain("restricted data");
+    expect(fixture.workspace.newGatekeeper).not.toHaveBeenCalled();
+  });
+
+  it("enables investigations alone when the user turns fixes off", async () => {
+    const fixture = await render({ investigation: true, investigationsEnabled: true, remediation });
+    await act(async () => switchLabelled("Propose fixes").click());
+    const enable = [...container!.querySelectorAll("button")].find(
+      (button) => button.textContent === "Enable investigations",
+    )!;
+    await act(async () => enable.click());
+    expect(fixture.workspace.newGatekeeper).toHaveBeenCalledTimes(1);
+    expect(fixture.inbox.enableFixes).not.toHaveBeenCalled();
+    expect(fixture.inbox.enableInvestigations).toHaveBeenCalled();
   });
 });

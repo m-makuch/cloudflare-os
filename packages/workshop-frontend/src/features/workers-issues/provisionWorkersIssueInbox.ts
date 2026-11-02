@@ -1,7 +1,51 @@
 import type { RpcStub } from "capnweb";
-import type { AuthenticatedApi } from "@gadgets/workshop-shared/api";
+import type { AuthenticatedApi, GadgetClient, GatekeeperClient } from "@gadgets/workshop-shared/api";
 import type { WorkerIssueInbox } from "../../../../bundled-blueprints/blueprints/workers-issues/files/protocol";
 import type { WorkersIssueSetupRequest } from "./workersIssueSetup";
+
+/** What fixes need: the repository's contributor binding and the approval the user chose. */
+export type WorkersIssueFixSetup = {
+  /** The connected git account to create the binding with. */
+  accountId: number;
+  /** The contributor binding URL (see `resolveContributorRepository`). */
+  resourceUrl: string;
+  approval: "ask" | "automatic";
+  allowPublic: boolean;
+};
+
+/** A binding change whose outcome could not be read back: neither target may be removed. */
+class UncertainBindingError extends Error {
+  constructor(readonly cause: unknown) {
+    super("Binding outcome unknown.");
+  }
+}
+
+/**
+ * Points the gadget's binding `name` at `target`, restoring the previous target if the change
+ * fails. A lost response may already have committed it, so a failure is read back first.
+ * @throws The failure, or `UncertainBindingError` when the binding cannot even be read.
+ */
+const replaceBinding = async (
+  gadget: RpcStub<GadgetClient>,
+  name: string,
+  target: Awaited<ReturnType<GatekeeperClient<never>["getId"]>>,
+): Promise<void> => {
+  const previous = (await gadget.listBindings()).find((binding) => binding.name === name);
+  try {
+    if (previous) await gadget.unbind(name);
+    await gadget.bind(name, target);
+  } catch (error) {
+    let current;
+    try {
+      current = (await gadget.listBindings()).find((binding) => binding.name === name);
+    } catch {
+      throw new UncertainBindingError(error);
+    }
+    if (current?.target === target) return;
+    if (previous && !current) await gadget.bind(name, previous.target);
+    throw error;
+  }
+};
 
 export const provisionWorkersIssueInbox = async (
   api: RpcStub<AuthenticatedApi>,
@@ -10,6 +54,7 @@ export const provisionWorkersIssueInbox = async (
   workspaceId: string,
   modelId: string | undefined,
   onWorkspace: (id: string) => void,
+  fix?: WorkersIssueFixSetup,
 ) => {
   using workspace = workspaceId
     ? await api.openWorkspace(workspaceId)
@@ -41,56 +86,78 @@ export const provisionWorkersIssueInbox = async (
       throw new Error("This inbox does not match the requested Worker and destination.");
     }
     if (!modelId) throw new Error("Choose a language model before enabling investigations.");
-    const previous = (await gadget.listBindings()).find(
-      (binding) => binding.name === "INVESTIGATOR",
-    );
+    if (fix && metadata.containsRestrictedData) {
+      // A workspace that has read restricted data refuses every push, so a fix could never land.
+      throw new Error(
+        "This inbox's workspace has read restricted data, so it cannot push fixes. Create a new inbox for this Worker to enable fixes.",
+      );
+    }
     // Spawner env edges are mutable and omitted from its creation spec. A binding name cannot
-    // prove its authority, so explicitly install a fresh exact-Worker spawner and selected model.
-    using telemetry = await workspace.newGatekeeper(
-      accountId,
-      `https://dash.cloudflare.com/${request.accountId}/workers/services/view/${encodeURIComponent(request.workerName)}/production/observability`,
-    );
-    if (!telemetry) throw new Error("Worker telemetry could not be connected.");
-    let bound = false;
+    // prove its authority, so explicitly install fresh exact-scope gatekeepers and a new spawner.
+    // Until the spawner is bound, nothing references them, and a failure removes them.
+    const created: Array<{ remove(): Promise<void> }> = [];
+    let committed = false;
     let uncertain = false;
+    let repositoryId: Awaited<ReturnType<GatekeeperClient<never>["getId"]>> | undefined;
     try {
-      using investigator = await workspace.newAgentSpawnerGatekeeper({
-        displayName: "Worker issue investigator",
-        modelId,
-        env: { WORKER_OBSERVABILITY: await telemetry.getId() },
-      });
-      try {
-        const target = await investigator.getId();
-        try {
-          if (previous) await gadget.unbind("INVESTIGATOR");
-          await gadget.bind("INVESTIGATOR", target);
-          bound = true;
-        } catch (error) {
-          // A lost response may already have committed the binding. Never remove an active target.
-          uncertain = true;
-          const current = (await gadget.listBindings()).find(
-            (binding) => binding.name === "INVESTIGATOR",
+      using telemetry = await workspace.newGatekeeper(
+        accountId,
+        `https://dash.cloudflare.com/${request.accountId}/workers/services/view/${encodeURIComponent(request.workerName)}/production/observability`,
+      );
+      if (!telemetry) throw new Error("Worker telemetry could not be connected.");
+      created.push(telemetry);
+      using repository = fix ? await workspace.newGatekeeper(fix.accountId, fix.resourceUrl) : null;
+      if (fix) {
+        if (!repository) throw new Error("The repository could not be connected.");
+        created.push(repository);
+        repositoryId = await repository.getId();
+        // Checked here to fail early with a clear message; the gatekeeper checks again, fresh,
+        // before every push and request.
+        using session = (await repository.openSession()) as RpcStub<{
+          getMetadata(): Promise<{ visibility?: string }>;
+        }>;
+        if ((await session.getMetadata()).visibility === "public" && !fix.allowPublic)
+          throw new Error(
+            "This repository is public. Allow public repositories to propose fixes to it.",
           );
-          uncertain = false;
-          bound = current?.target === target;
-          if (!bound) {
-            if (previous && !current) await gadget.bind("INVESTIGATOR", previous.target);
-            throw error;
-          }
-        }
-      } finally {
-        if (!bound && !uncertain) await investigator.remove();
       }
+      using investigator = await workspace.newAgentSpawnerGatekeeper({
+        displayName: fix ? "Worker issue fixer" : "Worker issue investigator",
+        modelId,
+        env: {
+          WORKER_OBSERVABILITY: await telemetry.getId(),
+          ...(repositoryId === undefined ? {} : { REPOSITORY: repositoryId }),
+        },
+      });
+      created.push(investigator);
+      await replaceBinding(gadget, "INVESTIGATOR", await investigator.getId());
+      committed = true;
+      if (repositoryId !== undefined) await replaceBinding(gadget, "REPOSITORY", repositoryId);
+    } catch (error) {
+      uncertain = error instanceof UncertainBindingError;
+      throw uncertain ? (error as UncertainBindingError).cause : error;
     } finally {
-      if (!bound && !uncertain) await telemetry.remove();
+      if (!committed && !uncertain) for (const target of created.reverse()) await target.remove();
     }
     // Binding changes create a new gadget facet; never enable through the old, unbound one.
     using configuredInbox = (await gadget.connectToGadget()) as RpcStub<WorkerIssueInbox>;
     await configuredInbox.enableInvestigations();
+    if (fix && repositoryId !== undefined) {
+      await configuredInbox.enableFixes();
+      if (fix.approval === "automatic") {
+        // Only the kinds the repository binding offers: pushing (never force) and opening a
+        // merge or pull request. Merging is never auto-approvable.
+        for (const offered of await workspace.listPreApprovableActions()) {
+          if (offered.gatekeeperId === repositoryId && !offered.alreadyEnabled)
+            await workspace.setAutoApprovedActionKind(repositoryId, offered.actionKind);
+        }
+      }
+    }
     return {
       workspaceId: metadata.id,
       destinationId: destination.webhookId,
       investigationsEnabled: true,
+      fixesEnabled: Boolean(fix),
     };
   }
 
