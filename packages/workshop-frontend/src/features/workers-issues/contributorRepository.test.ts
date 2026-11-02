@@ -28,7 +28,7 @@ describe("resolveContributorRepository", () => {
       "https://github.com/acme/checkout.git",
       "https://github.com/acme/checkout/tree/main/src",
     ]) {
-      expect(resolveContributorRepository(vendors, url, false), url).toEqual({
+      expect(resolveContributorRepository(vendors, url, false)).toEqual({
         vendorId: "github",
         vendorName: "GitHub",
         urlPattern: "https://github.com/:owner/:repo\\?branchPrefix=*",

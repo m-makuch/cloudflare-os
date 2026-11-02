@@ -212,7 +212,7 @@ const render = async (
       // A connected GitHub account, which the Cloudflare connection logic must ignore.
       value.add(
         7,
-        { displayName: "octocat" },
+        { displayName: "octocat", avatar: { url: "https://example.test/avatar" } },
         { displayName: "GitHub", url: "https://github.com" },
         [],
         true,

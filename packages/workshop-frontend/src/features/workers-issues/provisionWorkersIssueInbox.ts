@@ -137,7 +137,7 @@ export const provisionWorkersIssueInbox = async (
       uncertain = error instanceof UncertainBindingError;
       throw uncertain ? (error as UncertainBindingError).cause : error;
     } finally {
-      if (!committed && !uncertain) for (const target of created.reverse()) await target.remove();
+      if (!committed && !uncertain) for (const target of created.toReversed()) await target.remove();
     }
     // Binding changes create a new gadget facet; never enable through the old, unbound one.
     using configuredInbox = (await gadget.connectToGadget()) as RpcStub<WorkerIssueInbox>;
