@@ -118,6 +118,8 @@ describe("auto-approval", () => {
     expect(tags("mergeRequest")).toEqual(mergeRequest);
     expect(tags("project")).toEqual(
       ["gitlab.createIssue", "gitlab.createMergeRequest", ...mergeRequest, "gitlab.push", "gitlab.forcePush"]);
+    // A contributor binding can push (never force) and open merge requests, nothing else.
+    expect(tags("contributor")).toEqual(["gitlab.push", "gitlab.createMergeRequest"]);
   });
 });
 
