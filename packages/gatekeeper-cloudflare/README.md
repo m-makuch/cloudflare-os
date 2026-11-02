@@ -315,9 +315,13 @@ correlation and event-state keys for logical-run idempotency. Delivery order is 
 
 A connection supports 100 hooks. Each callback is preceded by a Cloudflare-specific Workshop
 observation describing the bound account, reported alert type, policy ID, and event state.
-Notification observations are marked as restricted data: authenticated delivery can still contain
-attacker-controlled text and telemetry. Write-capable remediation requires separate security review;
-this integration does not bypass the platform's restricted-data handling.
+Like Workers Observability reads, these observations are not marked as restricted data: that would
+permanently stop the workspace from taking actions, so an alert could never lead to a pushed fix.
+Authenticated delivery can still carry attacker-controlled text and telemetry, so what may leave the
+workspace is bounded elsewhere: a fixer gets only a contributor repository binding (pushes under one
+branch prefix and merge requests into the default branch, never public repositories unless the user
+allows them), each push and merge request waits for approval unless the user chose otherwise, and
+its instructions require scrubbing personal and secret data before committing.
 Notifications bindings are private to their owner. Disabling a hook
 stops future handoffs and removes the managed policy when no other managed-policy hook uses its configuration. The shared
 webhook remains for other policies. Before removing a hook or attempting policy creation/deletion,

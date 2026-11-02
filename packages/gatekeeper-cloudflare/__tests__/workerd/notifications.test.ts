@@ -182,7 +182,9 @@ it("tests the destination, receives matching alerts once, and ignores other aler
   ]);
   const [observation] = await env.NOTIFICATION_TEST_HOOKS.readObservations();
   expect(observation!.description).toContain(`account ${accountId}`);
-  expect(observation!.containsRestrictedData).toBe(true);
+  // Not restricted: a restricted workspace refuses pushes, and the Worker-issue fixer must push
+  // its fix branch. What reaches a repository is guarded instead -- see the contributor binding.
+  expect(observation!.containsRestrictedData).toBeUndefined();
 
   await sendAlert(stub);
   expect(await receivedAlerts()).toEqual(alerts);

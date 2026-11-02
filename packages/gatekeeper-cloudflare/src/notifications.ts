@@ -110,7 +110,6 @@ function notificationObservation(notification: CloudflareNotification): Observat
   const alertType = auditIdentifier(notification.alertType);
   return {
     title: `Cloudflare notification: ${alertType}`,
-    containsRestrictedData: true,
     description:
       `Receive an authenticated Cloudflare notification for account ${notification.accountId}. ` +
       `Alert type: ${alertType}; policy ID: ${auditIdentifier(notification.policyId)}; ` +
