@@ -1,6 +1,8 @@
 // @vitest-environment jsdom
 import { afterEach, describe, expect, it, vi } from "vitest";
 import {
+  extraDashboardOrigins,
+  isDashboardOrigin,
   parseWorkersIssueSetup,
   respondToWorkersIssueSetup,
   workersIssueSetupSearch,
@@ -119,5 +121,26 @@ describe("dashboard issue setup context", () => {
     cleanup();
     poll(request.dashboardOrigin);
     expect(postMessage).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe("extra dashboard origins for a test deployment", () => {
+  it("accepts only exact HTTPS origins, and trusts nothing extra by default", () => {
+    expect(extraDashboardOrigins(undefined)).toEqual([]);
+    expect(
+      extraDashboardOrigins(
+        " https://localhost:7445 ,http://localhost:7445,https://localhost:7445/path,*,javascript:x,https://dash.example.test",
+      ),
+    ).toEqual(["https://localhost:7445", "https://dash.example.test"]);
+  });
+
+  it("trusts a listed origin exactly, never a lookalike", () => {
+    const extra = extraDashboardOrigins("https://dash.example.test:7445");
+    expect(isDashboardOrigin("https://dash.example.test:7445", extra)).toBe(true);
+    expect(isDashboardOrigin("https://dash.example.test:7446", extra)).toBe(false);
+    expect(isDashboardOrigin("https://dash.example.test:7445/", extra)).toBe(false);
+    expect(isDashboardOrigin("http://dash.example.test:7445", extra)).toBe(false);
+    expect(isDashboardOrigin("https://dash.example.test:7445", [])).toBe(false);
+    expect(isDashboardOrigin("https://dash.cloudflare.com", [])).toBe(true);
   });
 });

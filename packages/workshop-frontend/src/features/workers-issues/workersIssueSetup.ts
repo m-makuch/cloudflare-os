@@ -37,13 +37,36 @@ const parseRemediation = (value: unknown): WorkersIssueRemediationRequest | null
   return { approval, allowPublic, repositoryUrl };
 };
 
-const isDashboardOrigin = (value: string): boolean => {
+/**
+ * Exact HTTPS origins a test deployment additionally trusts as the dashboard, e.g. a developer's
+ * local dashboard driving a deployed instance. Build-time and unset by default, so a release
+ * trusts only the Cloudflare dashboards.
+ */
+export const extraDashboardOrigins = (value: string | undefined): string[] =>
+  (value ?? "")
+    .split(",")
+    .map(origin => origin.trim())
+    .filter(origin => {
+      try {
+        const url = new URL(origin);
+        return url.protocol === "https:" && url.origin === origin;
+      } catch {
+        return false;
+      }
+    });
+
+const EXTRA_DASHBOARD_ORIGINS = extraDashboardOrigins(
+  import.meta.env.VITE_WORKERS_ISSUE_EXTRA_DASHBOARD_ORIGINS,
+);
+
+export const isDashboardOrigin = (value: string, extra = EXTRA_DASHBOARD_ORIGINS): boolean => {
   try {
     const url = new URL(value);
     return (
       url.origin === value &&
       ((url.protocol === "https:" &&
         ["dash.cloudflare.com", "dash.staging.cloudflare.com"].includes(url.hostname)) ||
+        extra.includes(value) ||
         (import.meta.env.DEV &&
           ["localhost", "127.0.0.1", "[::1]"].includes(url.hostname) &&
           ["http:", "https:"].includes(url.protocol)))
