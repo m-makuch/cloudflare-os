@@ -82,6 +82,7 @@ p { margin: 0; }
 .badge[data-tone="warning"] { background: var(--warning-tint); color: var(--warning); }
 .badge[data-tone="danger"] { background: var(--danger-tint); color: var(--danger); }
 .change { display: inline-block; margin-top: 10px; color: var(--link); font-weight: 500; overflow-wrap: anywhere; }
+.release { max-width: 80ch; margin: 10px 0 0; font-size: 13px; color: var(--text); }
 .description { max-width: 80ch; font-size: 13px; }
 .summary { margin: 24px 0 12px; flex-wrap: wrap; font-size: 13px; color: var(--subtle); }
 .updated { font-variant-numeric: tabular-nums; }
@@ -154,6 +155,11 @@ const STATUS_LABELS: Record<InvestigationStatus, string> = {
   push_pending: "Waiting for your approval",
   change_opened: "Change proposed",
   fix_unknown: "Fix delivery unconfirmed",
+  change_merged: "Merged, waiting for release",
+  released: "Released, verifying",
+  recurring: "Still occurring after release",
+  resolved: "Resolved",
+  regressed: "Regressed",
 };
 
 type Tone = "neutral" | "info" | "success" | "warning" | "danger";
@@ -172,7 +178,15 @@ const STATUS_TONES: Record<InvestigationStatus, Tone> = {
   push_pending: "warning",
   change_opened: "success",
   fix_unknown: "warning",
+  change_merged: "info",
+  released: "info",
+  recurring: "danger",
+  resolved: "success",
+  regressed: "danger",
 };
+
+/** How long a release serves traffic without the issue before it is resolved (server.ts). */
+const VERIFY_WINDOW_MINUTES = 60;
 
 /** What the git host calls a proposed change. */
 function changeNoun(fixes: FixSetup | undefined): string {
@@ -243,6 +257,7 @@ type EntryView = {
   investigate: HTMLButtonElement;
   investigateLink: HTMLAnchorElement;
   change: HTMLAnchorElement;
+  release: HTMLParagraphElement;
   reportLoaded: boolean;
 };
 const views = new Map<string, EntryView>();
@@ -277,6 +292,37 @@ function reportText(run: InvestigationSummary): string {
   return "The investigator has not submitted a report yet.";
 }
 
+/** Where a merged fix is on its way to production, shown in place of a report until one exists. */
+function releaseText(run: InvestigationSummary): string | undefined {
+  const since = run.released_at ? ` since ${clockFormat.format(run.released_at)}` : "";
+  switch (run.status) {
+    case "change_merged":
+      if (!setupStatus?.releasesReady) {
+        return "Merged. Set up AI fixes again to follow it to its release and resolve the issue once it is fixed.";
+      }
+      if (run.release_note === "unmapped") {
+        return "Merged. The live deployment does not say which commit it runs, so the release cannot be matched. Deploy with Workers Builds, or tag each version with its commit (wrangler versions upload --tag <commit>).";
+      }
+      if (run.release_note === "rolled_back") {
+        return "Merged, but the live deployment no longer contains the fix. Waiting for a release that does.";
+      }
+      return "Merged. Waiting for a deployment that contains it to go live.";
+    case "released":
+      if (run.release_note === "no_traffic") {
+        return `Live${since}, but it has not served enough traffic to tell whether the issue is fixed. Verification continues as requests arrive.`;
+      }
+      return `Live${since}. The issue is resolved after ${VERIFY_WINDOW_MINUTES} minutes of traffic without it.`;
+    case "recurring":
+      return `The issue occurred again after the release went live${since}, so this fix did not resolve it. The issue stays open in Workers Observability.`;
+    case "resolved":
+      return `Released${since} and verified: no new occurrences. The issue is resolved in Workers Observability.`;
+    case "regressed":
+      return "This issue was resolved, then occurred again. Workers Observability has reopened it; see the newer notification.";
+    default:
+      return undefined;
+  }
+}
+
 function renderEntries(runs: InvestigationSummary[]): void {
   const visibleKeys = new Set(runs.map((run) => run.run_key));
   for (const [key, view] of views) {
@@ -303,9 +349,11 @@ function renderEntries(runs: InvestigationSummary[]): void {
         text: "Set up and investigate",
       });
       const change = el("a", { class: "change", target: "_blank", rel: "noopener noreferrer" });
+      const release = el("p", { class: "release" });
       const element = el("article", { class: "entry" }, [
         el("div", { class: "entry-header" }, [el("div", {}, [title, time]), badge]),
         change,
+        release,
         report,
         el("div", { class: "actions" }, [readReport, retry, investigate, investigateLink]),
       ]);
@@ -320,6 +368,7 @@ function renderEntries(runs: InvestigationSummary[]): void {
         investigate,
         investigateLink,
         change,
+        release,
         reportLoaded: false,
       };
       readReport.addEventListener("click", async () => {
@@ -397,6 +446,10 @@ function renderEntries(runs: InvestigationSummary[]): void {
     if (url && view.change.href !== url) view.change.href = url;
     const state = run.change_state && run.change_state !== "opened" ? ` (${run.change_state})` : "";
     setText(view.change, url ? `View ${changeNoun(fixSetup)} ${run.change_id ? `#${run.change_id}` : ""}${state}` : "");
+
+    const release = releaseText(run) ?? "";
+    setText(view.release, release);
+    view.release.hidden = !release;
 
     // Insert new entries in order without detaching the existing report nodes.
     if (entries.children[index] !== view.element) {

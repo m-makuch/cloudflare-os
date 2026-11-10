@@ -74,6 +74,28 @@ messages, and descriptions before committing. Nothing is merged or deployed by t
 fixer: a person merges, and the project's CI deploys. Whether each push and request waits for a
 person is the workspace's approval setting for the repository binding, chosen at setup.
 
+## Following a fix to production
+
+With a `WORKER_RELEASES` binding (the Cloudflare "Worker releases" resource for the same Worker),
+the inbox follows a merged request until the fix is live. Merging records the request's merge commit
+(`change_merged`). The run is `released` once every version serving traffic in the latest
+production deployment contains that commit, checked with the repository binding's
+`containsCommit`. A version's commit is its Workers Builds commit, or otherwise a `workers/tag`
+holding a hex commit SHA (`wrangler versions upload --tag $(git rev-parse HEAD)`) for other CI.
+Without either, the run stays merged with the note `unmapped`; a rollback to versions without the
+commit is noted `rolled_back`.
+
+A released run is verified after 60 minutes, and at least 20 invocations, of released traffic with no
+new occurrence of the issue. It then becomes `resolved`, and the inbox marks the Workers
+Observability issue resolved if it is still active. That write is the binding's
+`resolve-worker-issue` action, which setup auto-approves. An occurrence after the release (beyond a
+five-minute grace) makes the run `recurring` instead, and a notification for a resolved issue makes
+its run `regressed`. Without traffic the run waits with the note `no_traffic`.
+
+The inbox re-checks when it is read, at most every two minutes per run. Setup can also bind the
+Scheduled Tasks gatekeeper as `SCHEDULER` and call `enableBackgroundChecks()`, which registers a
+15-minute hook that also starts runs left `pending`; the hook runs only once enabled.
+
 ## Deployment
 
 Release the OS setup frontend and blueprint together. Updating the blueprint never enables fixes. Dashboard and inbox setup use `/setup/workers-issues`;

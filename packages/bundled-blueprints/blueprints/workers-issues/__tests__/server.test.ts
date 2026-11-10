@@ -1,6 +1,6 @@
 // @vitest-environment node
 import { DatabaseSync, type SQLInputValue } from "node:sqlite";
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { Gadget } from "../files/server.ts";
 
 const { restore } = vi.hoisted(() => ({ restore: Symbol("restore") }));
@@ -42,11 +42,13 @@ afterEach(() => {
   for (const db of databases.splice(0)) db.close();
 });
 
-type Change = { id: string; url: string | null; state: string; merged?: boolean };
+type Change = { id: string; url: string | null; state: string; merged?: boolean; mergeCommit?: string | null };
 
 /** A contributor repository binding: metadata, and the requests listed per branch. */
 const repository = (provider: "gitlab" | "github", metadata: Record<string, unknown> = {}) => {
   const changes = new Map<string, Change[]>();
+  /** Commits by the refs whose history contains them: `${commit} in ${ref}`. */
+  const contained = new Set<string>();
   const list = vi.fn(async (options: { sourceBranch?: string; head?: string }) => {
     const rows = changes.get(options.sourceBranch ?? options.head ?? "") ?? [];
     return { next: async () => rows, [Symbol.dispose]: vi.fn() };
@@ -54,7 +56,9 @@ const repository = (provider: "gitlab" | "github", metadata: Record<string, unkn
   return {
     changes,
     list,
+    contained,
     binding: {
+      containsCommit: vi.fn(async (commit: string, ref: string) => commit === ref || contained.has(`${commit} in ${ref}`)),
       getMetadata: vi.fn().mockResolvedValue({
         ...(provider === "github"
           ? { fullName: "acme/checkout", url: "https://github.com/acme/checkout" }
@@ -71,8 +75,39 @@ const repository = (provider: "gitlab" | "github", metadata: Record<string, unkn
   };
 };
 
+type Deployment = {
+  id: string;
+  createdOn: string;
+  versions: { versionId: string; percentage: number; tag?: string; commit?: string }[];
+};
+
+/** A Worker releases binding: its deployments (newest first), the issue, and its traffic. */
+const releases = () => {
+  const state = {
+    deployments: [] as Deployment[],
+    issue: { status: "active" as "active" | "resolved" | "ignored", lastObserved: 0 },
+    invocations: 0,
+  };
+  return {
+    state,
+    binding: {
+      listDeployments: vi.fn(async (options?: { limit?: number }) => state.deployments.slice(0, options?.limit ?? 10)),
+      countInvocations: vi.fn(async () => state.invocations),
+      getIssue: vi.fn(async () => ({ ...state.issue })),
+      resolveIssue: vi.fn(async () => {
+        state.issue.status = "resolved";
+      }),
+    },
+  };
+};
+
 const setup = (
-  options: { repository?: ReturnType<typeof repository>; investigator?: boolean } = {},
+  options: {
+    repository?: ReturnType<typeof repository>;
+    investigator?: boolean;
+    releases?: ReturnType<typeof releases>;
+    scheduler?: { every: ReturnType<typeof vi.fn<(...args: unknown[]) => Promise<string>>> };
+  } = {},
 ) => {
   const database = new DatabaseSync(":memory:");
   databases.push(database);
@@ -113,6 +148,8 @@ const setup = (
     ...(options.investigator === false ? {} : { INVESTIGATOR: { spawnCallable } }),
     CLOUDFLARE_NOTIFICATIONS: { subscribe, getStatus: vi.fn() },
     ...(options.repository ? { REPOSITORY: options.repository.binding } : {}),
+    ...(options.releases ? { WORKER_RELEASES: options.releases.binding } : {}),
+    ...(options.scheduler ? { SCHEDULER: options.scheduler } : {}),
   };
   const restart = () => {
     gadget = new Gadget(context as unknown as DurableObjectState, env);
@@ -134,9 +171,10 @@ type Task = {
 const fixing = async (
   provider: "gitlab" | "github" = "gitlab",
   fixer?: (fix: ReturnType<typeof setup>["fix"]) => void,
+  extra: { releases?: ReturnType<typeof releases> } = {},
 ) => {
   const repo = repository(provider);
-  const fixture = setup({ repository: repo });
+  const fixture = setup({ repository: repo, ...extra });
   fixer?.(fixture.fix);
   await fixture.gadget.initialize(scope);
   await fixture.gadget.enableInvestigations();
@@ -572,3 +610,205 @@ describe("Worker issue fixes", () => {
     ]);
   });
 });
+
+const latestRun = async (fixture: { gadget: InstanceType<typeof Gadget> }) =>
+  (await fixture.gadget.listInvestigations())[0]!;
+
+describe("following a fix to production", () => {
+  const MERGE = "c".repeat(40);
+  const DEPLOYED = "d".repeat(40);
+  const T0 = Date.parse("2026-11-10T12:00:00Z");
+  const MINUTE = 60_000;
+  const at = (minutes: number) => vi.setSystemTime(T0 + minutes * MINUTE);
+  const deployment = (minutes: number, version: Partial<Deployment["versions"][number]>) => ({
+    id: `deployment-${minutes}`,
+    createdOn: new Date(T0 + minutes * MINUTE).toISOString(),
+    versions: [{ versionId: `version-${minutes}`, percentage: 100, ...version }],
+  });
+
+  beforeEach(() => {
+    vi.useFakeTimers({ toFake: ["Date"] });
+    at(0);
+  });
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  /** A fix run whose pull request has just been merged as MERGE, with a releases binding. */
+  const merged = async () => {
+    const workerReleases = releases();
+    const fixture = await fixing("github", undefined, { releases: workerReleases });
+    await fixture.settle();
+    const task = fixture.fix.mock.calls[0]![0] as Task;
+    const { fix } = await task.getContext();
+    await task.reportChange({ id: "~1", url: null });
+    fixture.repo.changes.set(fix!.branch, [
+      { id: "9", url: "https://github.com/acme/checkout/pull/9", state: "closed", merged: true, mergeCommit: MERGE },
+    ]);
+    return { ...fixture, workerReleases };
+  };
+
+  it("records the merge, then the release whose commit contains it, and resolves after a window of traffic", async () => {
+    const fixture = await merged();
+    fixture.workerReleases.state.deployments = [deployment(-30, { commit: "e".repeat(40) })];
+    fixture.workerReleases.state.issue.lastObserved = T0 - 40 * MINUTE;
+    await fixture.gadget.reconcileChanges();
+    expect(await latestRun(fixture)).toMatchObject({ status: "change_merged", merge_commit: MERGE, release_note: null });
+
+    // Deployed from a commit that contains the merge.
+    at(5);
+    fixture.repo.contained.add(`${MERGE} in ${DEPLOYED}`);
+    fixture.workerReleases.state.deployments.unshift(deployment(4, { commit: DEPLOYED }));
+    await fixture.gadget.reconcileChanges();
+    expect(await latestRun(fixture)).toMatchObject({
+      status: "released", release_deployment: "deployment-4", release_version: "version-4", released_at: T0 + 4 * MINUTE,
+    });
+
+    // Within the window nothing is decided, however much traffic there is.
+    fixture.workerReleases.state.invocations = 500;
+    at(30);
+    await fixture.gadget.reconcileChanges();
+    expect((await latestRun(fixture)).status).toBe("released");
+    expect(fixture.workerReleases.binding.resolveIssue).not.toHaveBeenCalled();
+
+    at(70);
+    await fixture.gadget.reconcileChanges();
+    expect(fixture.workerReleases.binding.countInvocations).toHaveBeenLastCalledWith("version-4", T0 + 4 * MINUTE);
+    expect(fixture.workerReleases.binding.resolveIssue).toHaveBeenCalledWith("issue-1");
+    expect(await latestRun(fixture)).toMatchObject({ status: "resolved", resolved_at: T0 + 70 * MINUTE });
+  });
+
+  it("matches a version tagged with its commit, and says why it waits when nothing names one", async () => {
+    const fixture = await merged();
+    fixture.workerReleases.state.deployments = [deployment(2, {})];
+    await fixture.gadget.reconcileChanges();
+    expect(await latestRun(fixture)).toMatchObject({ status: "change_merged", release_note: "unmapped" });
+
+    at(5);
+    fixture.repo.contained.add(`${MERGE} in ${DEPLOYED.slice(0, 12)}`);
+    fixture.workerReleases.state.deployments.unshift(deployment(4, { tag: DEPLOYED.slice(0, 12).toUpperCase() }));
+    await fixture.gadget.reconcileChanges();
+    expect(await latestRun(fixture)).toMatchObject({ status: "released", release_note: null });
+  });
+
+  it("waits while any version serving traffic lacks the fix, as in a gradual rollout", async () => {
+    const fixture = await merged();
+    fixture.repo.contained.add(`${MERGE} in ${DEPLOYED}`);
+    fixture.workerReleases.state.deployments = [{
+      ...deployment(4, {}),
+      versions: [
+        { versionId: "new", percentage: 10, commit: DEPLOYED },
+        { versionId: "old", percentage: 90, commit: "e".repeat(40) },
+      ],
+    }];
+    await fixture.gadget.reconcileChanges();
+    expect((await latestRun(fixture)).status).toBe("change_merged");
+  });
+
+  it("marks a fix whose issue occurs after the release as recurring, and leaves the issue open", async () => {
+    const fixture = await merged();
+    fixture.repo.contained.add(`${MERGE} in ${DEPLOYED}`);
+    fixture.workerReleases.state.deployments = [deployment(0, { commit: DEPLOYED })];
+    await fixture.gadget.reconcileChanges();
+    expect((await latestRun(fixture)).status).toBe("released");
+
+    // Shortly after the deployment, an occurrence is the old version finishing; later, it is not.
+    fixture.workerReleases.state.issue.lastObserved = T0 + 2 * MINUTE;
+    at(3);
+    await fixture.gadget.reconcileChanges();
+    expect((await latestRun(fixture)).status).toBe("released");
+    fixture.workerReleases.state.issue.lastObserved = T0 + 20 * MINUTE;
+    at(21);
+    await fixture.gadget.reconcileChanges();
+    expect((await latestRun(fixture)).status).toBe("recurring");
+    expect(fixture.workerReleases.binding.resolveIssue).not.toHaveBeenCalled();
+  });
+
+  it("keeps verifying a release too quiet to tell, and resolves once it has served traffic", async () => {
+    const fixture = await merged();
+    fixture.repo.contained.add(`${MERGE} in ${DEPLOYED}`);
+    fixture.workerReleases.state.deployments = [deployment(0, { commit: DEPLOYED })];
+    await fixture.gadget.reconcileChanges();
+    fixture.workerReleases.state.invocations = 3;
+    at(61);
+    await fixture.gadget.reconcileChanges();
+    expect(await latestRun(fixture)).toMatchObject({ status: "released", release_note: "no_traffic" });
+    fixture.workerReleases.state.invocations = 40;
+    at(64);
+    await fixture.gadget.reconcileChanges();
+    expect(await latestRun(fixture)).toMatchObject({ status: "resolved", release_note: null });
+  });
+
+  it("goes back to waiting when a rollback takes the fix out of production", async () => {
+    const fixture = await merged();
+    fixture.repo.contained.add(`${MERGE} in ${DEPLOYED}`);
+    fixture.workerReleases.state.deployments = [deployment(0, { commit: DEPLOYED })];
+    await fixture.gadget.reconcileChanges();
+    at(10);
+    fixture.workerReleases.state.deployments.unshift(deployment(9, { commit: "e".repeat(40) }));
+    await fixture.gadget.reconcileChanges();
+    expect(await latestRun(fixture)).toMatchObject({ status: "change_merged", release_note: "rolled_back" });
+  });
+
+  it("leaves an issue a person ignored alone, and marks a resolved issue that fires again as regressed", async () => {
+    const fixture = await merged();
+    fixture.repo.contained.add(`${MERGE} in ${DEPLOYED}`);
+    fixture.workerReleases.state.deployments = [deployment(0, { commit: DEPLOYED })];
+    fixture.workerReleases.state.issue.status = "ignored";
+    fixture.workerReleases.state.invocations = 100;
+    await fixture.gadget.reconcileChanges();
+    at(61);
+    await fixture.gadget.reconcileChanges();
+    expect((await latestRun(fixture)).status).toBe("resolved");
+    expect(fixture.workerReleases.binding.resolveIssue).not.toHaveBeenCalled();
+
+    const again = notification();
+    again.data.state_correlation_id = "run-2";
+    await fixture.gadget.onNotification(again);
+    const runs = await fixture.gadget.listInvestigations();
+    expect(runs.find((entry) => entry.run_key === RUN)?.status).toBe("regressed");
+  });
+
+  it("follows nothing without a releases binding: a merge just waits, and setup says so", async () => {
+    const fixture = await fixing("github");
+    await fixture.settle();
+    const task = fixture.fix.mock.calls[0]![0] as Task;
+    const { fix } = await task.getContext();
+    fixture.repo.changes.set(fix!.branch, [
+      { id: "9", url: "https://github.com/acme/checkout/pull/9", state: "closed", merged: true, mergeCommit: MERGE },
+    ]);
+    await task.reportChange({ id: "~1", url: null });
+    await fixture.gadget.reconcileChanges();
+    expect((await latestRun(fixture)).status).toBe("change_merged");
+    expect(await fixture.gadget.getSetupStatus()).toMatchObject({ releasesReady: false, backgroundChecks: false });
+  });
+});
+
+describe("background checks", () => {
+  it("registers one schedule, runs the checks when it fires, and ignores any other schedule", async () => {
+    const every = vi.fn<(...args: unknown[]) => Promise<string>>().mockResolvedValue("schedule-1");
+    const fixture = setup({ scheduler: { every }, repository: repository("gitlab") });
+    await expect(fixture.gadget.enableBackgroundChecks()).rejects.toThrow(/Scheduled Tasks/);
+    await fixture.gadget.initialize(scope);
+    await fixture.gadget.enableBackgroundChecks();
+    await fixture.gadget.enableBackgroundChecks();
+    expect(every).toHaveBeenCalledTimes(1);
+    expect(every.mock.calls[0]![0]).toBe(15 * 60_000);
+    expect(every.mock.calls[0]![2]).toMatchObject({ title: "Check checkout-test issues" });
+    expect(await fixture.gadget.getSetupStatus()).toMatchObject({ backgroundChecks: true });
+
+    // A notification stored while investigations were on but never started (a restart) is
+    // dispatched by the next firing, which waits for it.
+    await fixture.gadget.enableInvestigations();
+    fixture.database.prepare(
+      `INSERT INTO investigations (run_key, issue_id, notification, status, report, created_at)
+       VALUES ('k', 'issue-9', '{}', 'pending', NULL, 0)`,
+    ).run();
+    const callback = every.mock.calls[0]![1] as { onSchedule(firing: unknown): Promise<void> };
+    await callback.onSchedule({ scheduleId: "other", runId: "r0" });
+    expect(fixture.spawnCallable).not.toHaveBeenCalled();
+    await callback.onSchedule({ scheduleId: "schedule-1", runId: "r1" });
+    expect(fixture.spawnCallable).toHaveBeenCalledTimes(1);
+  });
+});
+

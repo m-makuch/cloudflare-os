@@ -5,6 +5,7 @@ import type {
   FixSetup,
   Investigation,
   InvestigationSummary,
+  ReleaseNote,
   WorkerIssueInbox,
   WorkerScope,
 } from "./lib/protocol.ts";
@@ -27,8 +28,12 @@ interface FixTask extends InvestigationTask {
   reportChange(change: { id: string; url: string | null }): Promise<void>;
 }
 
+interface ScheduleCallback extends RpcTarget {
+  onSchedule(firing: { scheduleId: string; runId: string }): Promise<void>;
+}
+
 /** A merge or pull request row, the fields both contributor bindings return. */
-type ChangeRow = { id: string; url: string | null; state: string; merged?: boolean };
+type ChangeRow = { id: string; url: string | null; state: string; merged?: boolean; mergeCommit?: string | null };
 
 interface ChangeCursor {
   next(): Promise<ChangeRow[] | null>;
@@ -46,6 +51,20 @@ interface RepositoryBinding {
     resultsPerPage: number;
   }): Promise<ChangeCursor>;
   listPullRequests(options: { head: string; state: "all"; resultsPerPage: number }): Promise<ChangeCursor>;
+  /** Whether `ref`'s history contains `commit`. */
+  containsCommit(commit: string, ref: string): Promise<boolean>;
+}
+
+/** The fields of a Cloudflare Worker releases binding the inbox reads, and its one write. */
+interface ReleasesBinding {
+  listDeployments(options?: { limit?: number }): Promise<{
+    id: string;
+    createdOn: string;
+    versions: { versionId: string; percentage: number; tag?: string; commit?: string }[];
+  }[]>;
+  countInvocations(versionId: string, since: number): Promise<number>;
+  getIssue(issueId: string): Promise<{ status: "active" | "resolved" | "ignored"; lastObserved: number }>;
+  resolveIssue(issueId: string): Promise<void>;
 }
 
 /** Only capabilities explicitly bound to this gadget, never the host Worker's environment. */
@@ -72,9 +91,21 @@ interface GadgetEnv {
     >;
   };
   REPOSITORY?: RepositoryBinding;
+  WORKER_RELEASES?: ReleasesBinding;
+  SCHEDULER?: {
+    every(
+      everyMs: number,
+      callback: RpcStub<ScheduleCallback>,
+      options: { title: string; description: string },
+    ): Promise<string>;
+  };
 }
 
-type StoredInvestigation = Investigation & { notification: string; change_checked_at: number | null };
+type StoredInvestigation = Investigation & {
+  notification: string;
+  change_checked_at: number | null;
+  release_checked_at: number | null;
+};
 
 const TASK_TYPES = `
 interface InvestigationTask extends RpcTarget {
@@ -155,6 +186,27 @@ interface Fixer {
 }`;
 
 const CHANGE_RECHECK_MS = 60_000;
+/** Releases are read at most this often per merged fix. */
+const RELEASE_RECHECK_MS = 120_000;
+/** How long a release must serve traffic without the issue before it counts as fixed. */
+const VERIFY_WINDOW_MS = 60 * 60_000;
+/** The least traffic that verifies a release: fewer invocations prove nothing either way. */
+const MIN_VERIFY_INVOCATIONS = 20;
+/**
+ * Occurrences this soon after a deployment are not held against it: the previous version can
+ * still be finishing requests, and telemetry arrives late.
+ */
+const RELEASE_GRACE_MS = 5 * 60_000;
+const SCHEDULE_EVERY_MS = 15 * 60_000;
+
+/**
+ * The commit a deployed version runs, if it says: Workers Builds records it, and other CI can
+ * tag the version with it (`wrangler versions upload --tag <sha>`).
+ */
+function versionCommit(version: { tag?: string; commit?: string }): string | undefined {
+  if (version.commit) return version.commit;
+  return version.tag && /^[0-9a-f]{7,40}$/i.test(version.tag) ? version.tag.toLowerCase() : undefined;
+}
 /** A fixer that never reported may still have opened a request; look once this long after dispatch. */
 const UNREPORTED_FIX_MS = 120_000;
 
@@ -165,6 +217,13 @@ const COLUMNS: Record<string, string> = {
   change_url: "TEXT",
   change_state: "TEXT",
   change_checked_at: "INTEGER",
+  merge_commit: "TEXT",
+  release_deployment: "TEXT",
+  release_version: "TEXT",
+  released_at: "INTEGER",
+  resolved_at: "INTEGER",
+  release_note: "TEXT",
+  release_checked_at: "INTEGER",
 };
 
 function changeState(row: ChangeRow): ChangeState {
@@ -211,6 +270,15 @@ export class Gadget extends DurableObject<GadgetEnv, unknown> implements WorkerI
   [restore](params: unknown) {
     if (!isRecord(params)) throw new Error("Unknown persistent callback.");
     const inbox = this;
+    if (params.kind === "schedule") {
+      return new RpcStub(
+        new (class extends RpcTarget implements ScheduleCallback {
+          onSchedule(firing: { scheduleId: string; runId: string }): Promise<void> {
+            return inbox.onSchedule(firing);
+          }
+        })(),
+      );
+    }
     if (params.kind === "notification") {
       return new RpcStub(
         new (class extends RpcTarget implements NotificationCallback {
@@ -347,7 +415,29 @@ export class Gadget extends DurableObject<GadgetEnv, unknown> implements WorkerI
       investigationsEnabled: Boolean(await this.ctx.storage.get("investigationsEnabled")),
       investigatorReady: Boolean(scope && this.env.INVESTIGATOR),
       ...(fixes ? { fixes } : {}),
+      releasesReady: Boolean(this.env.WORKER_RELEASES),
+      backgroundChecks: Boolean(this.env.SCHEDULER && (await this.ctx.storage.get("scheduleId"))),
     };
+  }
+
+  async enableBackgroundChecks(): Promise<void> {
+    const scope = await this.ctx.storage.get<WorkerScope>("scope");
+    if (!scope || !this.env.SCHEDULER) throw new Error("Connect Scheduled Tasks before enabling background checks.");
+    // Each registration is a new schedule, so the id is kept and registered once.
+    if (await this.ctx.storage.get("scheduleId")) return;
+    using callback: RpcStub<ScheduleCallback> = await this.ctx.restore({ kind: "schedule" });
+    const id = await this.env.SCHEDULER.every(SCHEDULE_EVERY_MS, callback, {
+      title: `Check ${scope.workerName} issues`,
+      description:
+        "Starts waiting investigations and follows proposed fixes to their merge, release and verification.",
+    });
+    await this.ctx.storage.put("scheduleId", id);
+  }
+
+  async onSchedule(firing: { scheduleId: string; runId: string }): Promise<void> {
+    if (!isRecord(firing) || firing.scheduleId !== (await this.ctx.storage.get("scheduleId"))) return;
+    // Awaited, unlike a page's poll, so the firing lasts as long as its work.
+    await Promise.allSettled([this.drainPending(), this.reconcileChanges()]);
   }
 
   async enableInvestigations() {
@@ -432,6 +522,11 @@ export class Gadget extends DurableObject<GadgetEnv, unknown> implements WorkerI
       enabled ? "pending" : "received",
       Date.now(),
     );
+    // Upstream reactivates a resolved issue when it recurs; the run that resolved it says so.
+    this.ctx.storage.sql.exec(
+      "UPDATE investigations SET status = 'regressed' WHERE issue_id = ? AND status = 'resolved'",
+      identity.issueId,
+    );
     if (enabled) this.startPending();
   }
 
@@ -442,12 +537,17 @@ export class Gadget extends DurableObject<GadgetEnv, unknown> implements WorkerI
    * starts. dispatch() claims each run synchronously, so overlapping drains start it once.
    */
   startPending(): void {
+    const drained = this.drainPending();
+    if (drained) this.ctx.waitUntil(drained);
+  }
+
+  drainPending(): Promise<unknown> | undefined {
     const pending = this.ctx.storage.sql
       .exec<StoredInvestigation>(
         "SELECT * FROM investigations WHERE status = 'pending' ORDER BY created_at LIMIT 10",
       )
       .toArray();
-    if (pending.length) this.ctx.waitUntil(Promise.all(pending.map((run) => this.dispatch(run))));
+    return pending.length ? Promise.all(pending.map((run) => this.dispatch(run))) : undefined;
   }
 
   /**
@@ -562,16 +662,116 @@ export class Gadget extends DurableObject<GadgetEnv, unknown> implements WorkerI
     const row = rows.find((candidate) => changeState(candidate) === "opened") ?? rows[0];
     if (!row) return false;
     const pending = row.id.startsWith("~") || !validChangeUrl(row.url);
+    const mergeCommit =
+      changeState(row) === "merged" && typeof row.mergeCommit === "string" && /^[0-9a-f]{40}$/.test(row.mergeCommit)
+        ? row.mergeCommit
+        : null;
     this.ctx.storage.sql.exec(
-      `UPDATE investigations SET change_id = ?, change_url = ?, change_state = ?, status = ?
+      `UPDATE investigations SET change_id = ?, change_url = ?, change_state = ?, merge_commit = ?, status = ?
        WHERE run_key = ?`,
       row.id,
       pending ? null : row.url,
       changeState(row),
-      pending ? "push_pending" : "change_opened",
+      mergeCommit,
+      pending ? "push_pending" : mergeCommit ? "change_merged" : "change_opened",
       run.run_key,
     );
     return true;
+  }
+
+  /**
+   * Whether every version serving the live deployment contains the fix. Undefined when the
+   * deployment names no commit for one of them, so the answer can't be known.
+   */
+  async liveContains(run: StoredInvestigation): Promise<
+    { deployment: { id: string; createdOn: string; versions: string[] }; contains: boolean | undefined } | undefined
+  > {
+    const [live] = await this.env.WORKER_RELEASES!.listDeployments({ limit: 1 });
+    if (!live) return undefined;
+    const serving = live.versions.filter((version) => version.percentage > 0);
+    let contains: boolean | undefined = serving.length > 0;
+    for (const version of serving) {
+      const commit = versionCommit(version);
+      if (!commit) contains = undefined;
+      else if (contains !== false && !(await this.env.REPOSITORY!.containsCommit(run.merge_commit!, commit))) {
+        contains = false;
+      }
+    }
+    return {
+      deployment: { id: live.id, createdOn: live.createdOn, versions: serving.map((version) => version.versionId) },
+      contains,
+    };
+  }
+
+  /** A merged fix: has a deployment containing it gone live? */
+  async checkRelease(run: StoredInvestigation): Promise<void> {
+    const live = await this.liveContains(run);
+    if (!live) return;
+    if (!live.contains) {
+      this.setReleaseNote(run, live.contains === undefined ? "unmapped" : null);
+      return;
+    }
+    const releasedAt = Date.parse(live.deployment.createdOn);
+    this.ctx.storage.sql.exec(
+      `UPDATE investigations SET status = 'released', release_deployment = ?, release_version = ?,
+       released_at = ?, release_note = NULL WHERE run_key = ? AND status = 'change_merged'`,
+      live.deployment.id,
+      live.deployment.versions.join(","),
+      Number.isFinite(releasedAt) ? releasedAt : Date.now(),
+      run.run_key,
+    );
+  }
+
+  /**
+   * A released fix: the issue occurring after the release means it did not fix it; a full window
+   * of traffic without it means it did, and the issue is resolved upstream as well.
+   */
+  async verifyRelease(run: StoredInvestigation): Promise<void> {
+    const releases = this.env.WORKER_RELEASES!;
+    const releasedAt = run.released_at ?? Date.now();
+    const issue = await releases.getIssue(run.issue_id);
+    if (issue.lastObserved > releasedAt + RELEASE_GRACE_MS) {
+      this.setStatus(run, "recurring");
+      return;
+    }
+    // A rollback, or a later deployment without the fix, takes it out of production again.
+    const live = await this.liveContains(run);
+    if (live && live.deployment.id !== run.release_deployment && live.contains === false) {
+      this.ctx.storage.sql.exec(
+        "UPDATE investigations SET status = 'change_merged', release_note = 'rolled_back' WHERE run_key = ?",
+        run.run_key,
+      );
+      return;
+    }
+    if (Date.now() - releasedAt < VERIFY_WINDOW_MS) return;
+    const versions = (run.release_version ?? "").split(",").filter(Boolean);
+    let invocations = 0;
+    for (const version of versions) invocations += await releases.countInvocations(version, releasedAt);
+    if (invocations < MIN_VERIFY_INVOCATIONS) {
+      this.setReleaseNote(run, "no_traffic");
+      return;
+    }
+    // A person's "ignored" stands; only an active issue is resolved upstream.
+    if (issue.status === "active") await releases.resolveIssue(run.issue_id);
+    this.ctx.storage.sql.exec(
+      `UPDATE investigations SET status = 'resolved', resolved_at = ?, release_note = NULL
+       WHERE run_key = ? AND status = 'released'`,
+      Date.now(),
+      run.run_key,
+    );
+  }
+
+  setStatus(run: StoredInvestigation, status: "recurring"): void {
+    this.ctx.storage.sql.exec(
+      "UPDATE investigations SET status = ?, release_note = NULL WHERE run_key = ? AND status = ?",
+      status,
+      run.run_key,
+      run.status,
+    );
+  }
+
+  setReleaseNote(run: StoredInvestigation, note: ReleaseNote | null): void {
+    this.ctx.storage.sql.exec("UPDATE investigations SET release_note = ? WHERE run_key = ?", note, run.run_key);
   }
 
   async reconcileChanges(): Promise<void> {
@@ -579,7 +779,7 @@ export class Gadget extends DurableObject<GadgetEnv, unknown> implements WorkerI
     const due = this.ctx.storage.sql
       .exec<StoredInvestigation>(
         `SELECT * FROM investigations WHERE mode = 'fix'
-         AND (status = 'push_pending' OR (status = 'change_opened' AND change_state = 'opened')
+         AND (status = 'push_pending' OR (status = 'change_opened' AND change_state IN ('opened', 'merged'))
               OR (status = 'fixing' AND created_at < ?))
          AND (change_checked_at IS NULL OR change_checked_at < ?)
          ORDER BY created_at DESC LIMIT 5`,
@@ -589,6 +789,31 @@ export class Gadget extends DurableObject<GadgetEnv, unknown> implements WorkerI
       .toArray();
     // One unreadable run must not stop the others being refreshed.
     await Promise.allSettled(due.map((run) => this.checkChange(run)));
+    await this.reconcileReleases();
+  }
+
+  async reconcileReleases(): Promise<void> {
+    if (!this.env.WORKER_RELEASES || !this.env.REPOSITORY) return;
+    const now = Date.now();
+    const due = this.ctx.storage.sql
+      .exec<StoredInvestigation>(
+        `SELECT * FROM investigations WHERE mode = 'fix' AND merge_commit IS NOT NULL
+         AND status IN ('change_merged', 'released')
+         AND (release_checked_at IS NULL OR release_checked_at < ?)
+         ORDER BY created_at DESC LIMIT 5`,
+        now - RELEASE_RECHECK_MS,
+      )
+      .toArray();
+    for (const run of due) {
+      this.ctx.storage.sql.exec(
+        "UPDATE investigations SET release_checked_at = ? WHERE run_key = ?",
+        now,
+        run.run_key,
+      );
+    }
+    await Promise.allSettled(
+      due.map((run) => (run.status === "released" ? this.verifyRelease(run) : this.checkRelease(run))),
+    );
   }
 
   async listInvestigations() {
@@ -597,7 +822,8 @@ export class Gadget extends DurableObject<GadgetEnv, unknown> implements WorkerI
     return this.ctx.storage.sql
       .exec<Omit<InvestigationSummary, "has_report"> & { has_report: number }>(
         `SELECT run_key, issue_id, status, report IS NOT NULL AS has_report, created_at, mode,
-         fix_branch, change_id, change_url, change_state
+         fix_branch, change_id, change_url, change_state, merge_commit, release_deployment,
+         release_version, released_at, resolved_at, release_note
          FROM investigations ORDER BY created_at DESC LIMIT 100`,
       )
       .toArray()

@@ -9,6 +9,12 @@ export interface WorkerScope {
  * fixer has the task, then `push_pending` once it reports a merge or pull request that is still
  * waiting for approval, and `change_opened` once the request exists on the git host. An ambiguous
  * fix dispatch is `fix_unknown`: the repository is checked for its branch before any retry.
+ *
+ * After the request is merged (`change_merged`) the inbox watches the Worker's deployments: once
+ * every version serving traffic contains the merge, the fix is `released`, and it is verified on
+ * that traffic. It becomes `resolved` -- in Workers Observability too -- after a verification
+ * window with traffic and no new occurrence, or `recurring` if the issue occurs after the release.
+ * A resolved issue that fires again is `regressed`.
  */
 export type InvestigationStatus =
   | "received"
@@ -22,7 +28,19 @@ export type InvestigationStatus =
   | "fixing"
   | "push_pending"
   | "change_opened"
-  | "fix_unknown";
+  | "fix_unknown"
+  | "change_merged"
+  | "released"
+  | "recurring"
+  | "resolved"
+  | "regressed";
+
+/**
+ * Why a merged or released fix is still waiting: the live deployment names no commit to compare
+ * (`unmapped`), the release has not had enough traffic to verify (`no_traffic`), or the live
+ * deployment no longer contains it (`rolled_back`).
+ */
+export type ReleaseNote = "unmapped" | "no_traffic" | "rolled_back";
 
 /** Whether a run only investigates, or may also push a fix and open a merge or pull request. */
 export type RunMode = "investigate" | "fix";
@@ -45,6 +63,15 @@ export type Investigation = {
   /** Its web page, once it exists on the git host. */
   change_url: string | null;
   change_state: ChangeState | null;
+  /** The commit the merge put on the default branch. */
+  merge_commit: string | null;
+  /** The live deployment first found to contain the merge, and its versions (comma-separated). */
+  release_deployment: string | null;
+  release_version: string | null;
+  /** When that deployment was created, in ms since the epoch: verification counts from here. */
+  released_at: number | null;
+  resolved_at: number | null;
+  release_note: ReleaseNote | null;
 };
 
 /** The git host behind the inbox's repository binding. */
@@ -73,6 +100,10 @@ export interface InboxSetupStatus extends Partial<WorkerScope> {
   investigatorReady: boolean;
   /** Present once fixes are enabled. */
   fixes?: FixSetup;
+  /** Whether a Worker releases binding is bound, so a merged fix is followed to its release. */
+  releasesReady: boolean;
+  /** Whether a schedule checks the inbox while no one has it open. */
+  backgroundChecks: boolean;
 }
 
 /** The inbox RPC contract shared by its browser, server, and OS setup frontend. */
@@ -113,7 +144,13 @@ export interface WorkerIssueInbox {
   retryInvestigation(runKey: string): Promise<void>;
   /**
    * Read the git host for fix runs whose merge or pull request is pending or unreported, at most
-   * once a minute per run. Polled by the inbox page.
+   * once a minute per run, and the Worker's releases for merged fixes. Polled by the inbox page
+   * and, once background checks are on, by a schedule.
    */
   reconcileChanges(): Promise<void>;
+  /**
+   * Register a schedule, through the `SCHEDULER` binding, that runs the inbox's checks while no
+   * one has it open. Idempotent. Its hook starts disabled: OS setup enables it.
+   */
+  enableBackgroundChecks(): Promise<void>;
 }

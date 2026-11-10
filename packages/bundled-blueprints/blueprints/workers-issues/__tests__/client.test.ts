@@ -12,6 +12,12 @@ const entry = (overrides: Partial<InvestigationSummary> = {}): InvestigationSumm
   change_id: null,
   change_url: null,
   change_state: null,
+  merge_commit: null,
+  release_deployment: null,
+  release_version: null,
+  released_at: null,
+  resolved_at: null,
+  release_note: null,
   ...overrides,
 });
 
@@ -46,6 +52,8 @@ beforeEach(() => {
     workerName: "checkout-test",
     investigationsEnabled: false,
     investigatorReady: false,
+  releasesReady: false,
+  backgroundChecks: false,
   });
   // The frame's base URL is the Workshop page hosting it.
   history.replaceState(null, "", `/workspace/${workspaceId}`);
@@ -89,6 +97,8 @@ const setupRequest = (anchor: HTMLAnchorElement) => {
   expect(anchor.target).toBe("_blank");
   return JSON.parse(url.searchParams.get("workers_issue_setup")!);
 };
+
+const release = (article: HTMLElement) => article.querySelector<HTMLElement>(".release")!;
 
 describe("Worker issue inbox", () => {
   it("presents notification-only mode and untrusted report text without executing markup", async () => {
@@ -191,6 +201,8 @@ describe("Worker issue inbox", () => {
       workerName: "checkout-test",
       investigationsEnabled: true,
       investigatorReady: true,
+    releasesReady: false,
+    backgroundChecks: false,
     });
     await load();
 
@@ -232,6 +244,8 @@ describe("Worker issue inbox", () => {
       workerName: "checkout-test",
       investigationsEnabled: true,
       investigatorReady: true,
+      releasesReady: false,
+      backgroundChecks: false,
       fixes: { provider: "gitlab", repository: "acme/checkout", branchPrefix: "cloudflare-os/" },
     });
     const url = "https://gitlab.example.com/acme/checkout/-/merge_requests/7";
@@ -255,6 +269,39 @@ describe("Worker issue inbox", () => {
     expect(unknown!.textContent).toContain("checks the repository");
     const retry = [...unknown!.querySelectorAll("button")].find(button => button.textContent === "Retry fix")!;
     expect(retry.hidden).toBe(false);
+  });
+
+  it("explains where a merged fix is on its way to production", async () => {
+    getSetupStatus.mockResolvedValue({
+      accountId: "a".repeat(32),
+      workerName: "checkout-test",
+      investigationsEnabled: true,
+      investigatorReady: true,
+      releasesReady: true,
+      backgroundChecks: true,
+      fixes: { provider: "github", repository: "acme/checkout", branchPrefix: "cloudflare-os/" },
+    });
+    const url = "https://github.com/acme/checkout/pull/9";
+    const fix = { mode: "fix" as const, change_id: "9", change_url: url, change_state: "merged" as const, has_report: true };
+    listInvestigations.mockResolvedValue([
+      entry({ run_key: "a:4", status: "resolved", ...fix, released_at: 1_790_000_000_000 }),
+      entry({ run_key: "a:3", status: "recurring", ...fix }),
+      entry({ run_key: "a:2", status: "released", ...fix }),
+      entry({ run_key: "a:1", status: "change_merged", ...fix, release_note: "unmapped" }),
+      entry({ run_key: "a:0", status: "regressed", ...fix }),
+    ]);
+    await load();
+    const [resolved, recurring, released, merged, regressed] = document.querySelectorAll<HTMLElement>("article");
+    expect(resolved!.textContent).toContain("Resolved");
+    expect(release(resolved!).textContent).toContain("resolved in Workers Observability");
+    expect(recurring!.querySelector(".badge")!.getAttribute("data-tone")).toBe("danger");
+    expect(release(recurring!).textContent).toContain("did not resolve it");
+    expect(release(released!).textContent).toContain("60 minutes of traffic");
+    expect(release(merged!).textContent).toContain("--tag");
+    expect(release(regressed!).textContent).toContain("reopened");
+    // The report is still offered alongside.
+    expect(resolved!.querySelector<HTMLElement>(".report")!.hidden).toBe(true);
+    expect([...resolved!.querySelectorAll("button")].some((button) => button.textContent === "Read report")).toBe(true);
   });
 
   it("keeps showing the inbox when the repository cannot be read", async () => {
@@ -296,6 +343,8 @@ describe("Worker issue inbox", () => {
       workerName: "checkout-test",
       investigationsEnabled: false,
       investigatorReady: true,
+    releasesReady: false,
+    backgroundChecks: false,
     });
     await load();
     expect(document.body.textContent).toContain("AI investigations on request");
@@ -314,6 +363,8 @@ describe("Worker issue inbox", () => {
       workerName: "checkout-test",
       investigationsEnabled: true,
       investigatorReady: true,
+    releasesReady: false,
+    backgroundChecks: false,
     });
     await vi.advanceTimersByTimeAsync(5000);
     expect(document.body.textContent).toContain("AI investigations on");
