@@ -50,6 +50,9 @@ const render = async (
     remediation?: { approval: "ask" | "automatic"; allowPublic: boolean; repositoryUrl?: string };
     publicRepository?: boolean;
     restricted?: boolean;
+    /** Opened from the inbox: no dashboard origin, optionally for one stored notification. */
+    fromInbox?: { runKey?: string };
+    fixesEnabled?: boolean;
   } = {},
 ) => {
   let subscriber: AccountsSubscriberAdapter;
@@ -72,10 +75,21 @@ const render = async (
       accountId: request.accountId,
       workerName: options.wrongScope ? "other-worker" : request.workerName,
       investigationsEnabled: options.investigationsEnabled ?? false,
+      investigatorReady: Boolean(options.existingInvestigator),
+      ...(options.fixesEnabled
+        ? { fixes: { provider: "github", repository: "acme/checkout", branchPrefix: "cloudflare-os/" } }
+        : {}),
     }),
     enableInvestigations: vi
       .fn<WorkerIssueInbox["enableInvestigations"]>()
       .mockResolvedValue(undefined),
+    disableInvestigations: vi
+      .fn<WorkerIssueInbox["disableInvestigations"]>()
+      .mockResolvedValue(undefined),
+    investigateNotification: vi
+      .fn<WorkerIssueInbox["investigateNotification"]>()
+      .mockResolvedValue(undefined),
+    disableFixes: vi.fn<WorkerIssueInbox["disableFixes"]>().mockResolvedValue(undefined),
     enableFixes: vi.fn<WorkerIssueInbox["enableFixes"]>().mockResolvedValue({
       provider: "github",
       repository: "acme/checkout",
@@ -248,11 +262,13 @@ const render = async (
   container = document.createElement("div");
   document.body.appendChild(container);
   root = createRoot(container);
+  const { dashboardOrigin, ...inboxRequest } = request;
   const setupRequest = options.investigation
     ? {
-        ...request,
+        ...(options.fromInbox ? inboxRequest : { ...inboxRequest, dashboardOrigin }),
         investigation: { workspaceId, destinationId: "destination-1" },
         ...(options.remediation ? { remediation: options.remediation } : {}),
+        ...(options.fromInbox?.runKey ? { runKey: options.fromInbox.runKey } : {}),
       }
     : request;
   await act(async () => root!.render(<WorkersIssueSetupPage request={setupRequest} />));
@@ -595,5 +611,52 @@ describe("Worker issue fixes", () => {
     expect(fixture.workspace.newGatekeeper).toHaveBeenCalledTimes(1);
     expect(fixture.inbox.enableFixes).not.toHaveBeenCalled();
     expect(fixture.inbox.enableInvestigations).toHaveBeenCalled();
+  });
+});
+
+describe("Worker issue setup opened from the inbox", () => {
+  const runKey = `${request.accountId}:run-1`;
+
+  it("binds an investigator for one notification without investigating every later one", async () => {
+    const fixture = await render({ investigation: true, fromInbox: { runKey } });
+    expect(switchLabelled("Investigate new notifications automatically").getAttribute("aria-checked")).toBe(
+      "false",
+    );
+    // Fixes are offered, but off until the user asks.
+    expect(switchLabelled("Propose fixes").getAttribute("aria-checked")).toBe("false");
+    await act(async () => fixture.submit().click());
+    expect(fixture.gadget.bind).toHaveBeenCalledWith("INVESTIGATOR", 6);
+    expect(fixture.inbox.enableInvestigations).not.toHaveBeenCalled();
+    expect(fixture.inbox.disableInvestigations).toHaveBeenCalledTimes(1);
+    expect(fixture.inbox.investigateNotification).toHaveBeenCalledWith(runKey);
+    expect(container!.textContent).toContain("The inbox is investigating the notification.");
+    // No dashboard to report to.
+    expect(fixture.completion()).not.toHaveBeenCalled();
+  });
+
+  it("still reports success when the notification was investigated meanwhile", async () => {
+    const fixture = await render({ investigation: true, fromInbox: { runKey } });
+    fixture.inbox.investigateNotification.mockRejectedValue(new Error("Already investigated"));
+    await act(async () => fixture.submit().click());
+    expect(container!.querySelector("[role=alert]")).toBeNull();
+    expect(container!.textContent).toContain("already being investigated");
+  });
+
+  it("investigates every new notification when opened to enable investigations", async () => {
+    const fixture = await render({ investigation: true, fromInbox: {} });
+    expect(switchLabelled("Investigate new notifications automatically").getAttribute("aria-checked")).toBe(
+      "true",
+    );
+    await act(async () => fixture.submit().click());
+    expect(fixture.inbox.enableInvestigations).toHaveBeenCalledTimes(1);
+    expect(fixture.inbox.investigateNotification).not.toHaveBeenCalled();
+    expect(container!.textContent).toContain("return to the inbox");
+  });
+
+  it("turns off stored fixes when the replacement investigator has no repository", async () => {
+    const fixture = await render({ investigation: true, fromInbox: {}, fixesEnabled: true });
+    await act(async () => fixture.submit().click());
+    expect(fixture.inbox.disableFixes).toHaveBeenCalledTimes(1);
+    expect(fixture.inbox.enableFixes).not.toHaveBeenCalled();
   });
 });

@@ -55,6 +55,8 @@ export const provisionWorkersIssueInbox = async (
   modelId: string | undefined,
   onWorkspace: (id: string) => void,
   fix?: WorkersIssueFixSetup,
+  /** Whether every new notification starts a run, or only those the user picks in the inbox. */
+  automatic = true,
 ) => {
   using workspace = workspaceId
     ? await api.openWorkspace(workspaceId)
@@ -141,7 +143,9 @@ export const provisionWorkersIssueInbox = async (
     }
     // Binding changes create a new gadget facet; never enable through the old, unbound one.
     using configuredInbox = (await gadget.connectToGadget()) as RpcStub<WorkerIssueInbox>;
-    await configuredInbox.enableInvestigations();
+    // Called only when needed: an inbox created before on-request runs has no way to turn them off.
+    if (automatic) await configuredInbox.enableInvestigations();
+    else await configuredInbox.disableInvestigations();
     if (fix && repositoryId !== undefined) {
       await configuredInbox.enableFixes();
       if (fix.approval === "automatic") {
@@ -152,12 +156,23 @@ export const provisionWorkersIssueInbox = async (
             await workspace.setAutoApprovedActionKind(repositoryId, offered.actionKind);
         }
       }
+    } else if (scope.fixes) {
+      // The new investigator has no repository, so runs must not be dispatched as fixes.
+      await configuredInbox.disableFixes();
     }
+    // The notification may have been investigated meanwhile, from the inbox: setup still stands.
+    const investigated = request.runKey
+      ? await configuredInbox.investigateNotification(request.runKey).then(
+          () => true,
+          () => false,
+        )
+      : undefined;
     return {
       workspaceId: metadata.id,
       destinationId: destination.webhookId,
-      investigationsEnabled: true,
+      investigationsEnabled: automatic,
       fixesEnabled: Boolean(fix),
+      ...(investigated === undefined ? {} : { investigated }),
     };
   }
 

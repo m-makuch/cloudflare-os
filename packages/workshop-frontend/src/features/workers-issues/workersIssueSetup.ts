@@ -16,10 +16,19 @@ export type WorkersIssueSetupRequest = {
   accountId: string;
   workerName: string;
   issueId?: string;
-  dashboardOrigin: string;
+  /**
+   * The dashboard that opened setup and awaits its result. Absent when the inbox opened it: the
+   * result is then shown here, and nothing is handed back.
+   */
+  dashboardOrigin?: string;
   investigation?: { workspaceId: string; destinationId: string };
   /** Only with `investigation`: fixes build on investigations. */
   remediation?: WorkersIssueRemediationRequest;
+  /**
+   * Only from the inbox, with `investigation`: the stored notification to investigate once the
+   * investigator is bound. Its run key, `<accountId>:<correlation id>`.
+   */
+  runKey?: string;
 };
 
 const parseRemediation = (value: unknown): WorkersIssueRemediationRequest | null => {
@@ -95,8 +104,16 @@ export const parseWorkersIssueSetupValue = (value: unknown): WorkersIssueSetupRe
     if (typeof text !== "string" || text.length > MAX_SETUP_REQUEST_LENGTH) return null;
     const request: unknown = typeof value === "string" ? JSON.parse(value) : value;
     if (typeof request !== "object" || request === null || Array.isArray(request)) return null;
-    const { state, accountId, workerName, issueId, dashboardOrigin, investigation, remediation } =
-      request as Record<string, unknown>;
+    const {
+      state,
+      accountId,
+      workerName,
+      issueId,
+      dashboardOrigin,
+      investigation,
+      remediation,
+      runKey,
+    } = request as Record<string, unknown>;
     if (
       typeof state !== "string" ||
       !/^[a-f\d-]{36}$/i.test(state) ||
@@ -106,8 +123,19 @@ export const parseWorkersIssueSetupValue = (value: unknown): WorkersIssueSetupRe
       !/^[a-z\d_-]{1,63}$/i.test(workerName) ||
       (issueId !== undefined &&
         (typeof issueId !== "string" || !/^[a-z\d-]{1,128}$/i.test(issueId))) ||
-      typeof dashboardOrigin !== "string" ||
-      !isDashboardOrigin(dashboardOrigin)
+      (dashboardOrigin !== undefined &&
+        (typeof dashboardOrigin !== "string" || !isDashboardOrigin(dashboardOrigin)))
+    )
+      return null;
+    // A request without a dashboard comes from the inbox, which only ever asks for investigations.
+    if (dashboardOrigin === undefined && !investigation) return null;
+    if (
+      runKey !== undefined &&
+      (dashboardOrigin !== undefined ||
+        !investigation ||
+        typeof runKey !== "string" ||
+        !runKey.startsWith(`${accountId}:`) ||
+        !/^[a-f\d]{32}:[a-z\d-]{1,128}$/i.test(runKey))
     )
       return null;
     if (
@@ -129,11 +157,12 @@ export const parseWorkersIssueSetupValue = (value: unknown): WorkersIssueSetupRe
       accountId,
       workerName,
       issueId,
-      dashboardOrigin,
+      ...(dashboardOrigin === undefined ? {} : { dashboardOrigin }),
       ...(investigation
         ? { investigation: investigation as WorkersIssueSetupRequest["investigation"] }
         : {}),
       ...(parsedRemediation ? { remediation: parsedRemediation } : {}),
+      ...(runKey === undefined ? {} : { runKey }),
     };
   } catch {
     return null;
@@ -168,9 +197,11 @@ export const respondToWorkersIssueSetup = (
     fixesEnabled?: boolean;
   },
 ): (() => void) => {
+  const { dashboardOrigin } = request;
+  if (!dashboardOrigin) return () => undefined;
   const receive = (event: MessageEvent<unknown>) => {
     if (
-      event.origin !== request.dashboardOrigin ||
+      event.origin !== dashboardOrigin ||
       !event.source ||
       typeof event.data !== "object" ||
       event.data === null ||
@@ -187,7 +218,7 @@ export const respondToWorkersIssueSetup = (
         accountId: request.accountId,
         ...result,
       },
-      { targetOrigin: request.dashboardOrigin },
+      { targetOrigin: dashboardOrigin },
     );
   };
   window.addEventListener("message", receive);

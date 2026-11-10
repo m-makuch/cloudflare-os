@@ -20,6 +20,8 @@ const INVESTIGATION_PATTERNS = [WORKER_PATTERN];
 export const WorkersIssueSetupPage = ({ request }: { request: WorkersIssueSetupRequest }) => {
   const { authenticatedApi } = useAuthenticatedApi();
   const isInvestigation = Boolean(request.investigation);
+  // Opened from the inbox rather than handed off by the dashboard: nothing is reported back.
+  const fromInbox = !request.dashboardOrigin;
   const connection = useWorkersIssueConnections(
     authenticatedApi,
     request.accountId,
@@ -33,8 +35,11 @@ export const WorkersIssueSetupPage = ({ request }: { request: WorkersIssueSetupR
   const [modelId, setModelId] = useState("");
   const [changeModel, setChangeModel] = useState(false);
   const [investigateCurrent, setInvestigateCurrent] = useState(false);
-  const remediation = request.remediation;
-  const [fixesWanted, setFixesWanted] = useState(Boolean(remediation));
+  const remediation =
+    request.remediation ?? (fromInbox ? { approval: "ask" as const, allowPublic: false } : undefined);
+  const [fixesWanted, setFixesWanted] = useState(Boolean(request.remediation));
+  // A user who came to investigate one notification has not asked for every later one.
+  const [automatic, setAutomatic] = useState(!request.runKey);
   const [repositoryUrl, setRepositoryUrl] = useState(remediation?.repositoryUrl ?? "");
   const [approval, setApproval] = useState<"ask" | "automatic">(remediation?.approval ?? "ask");
   const [allowPublic, setAllowPublic] = useState(remediation?.allowPublic ?? false);
@@ -49,6 +54,7 @@ export const WorkersIssueSetupPage = ({ request }: { request: WorkersIssueSetupR
     workspaceId: string;
     investigationsEnabled: boolean;
     investigateCurrent: boolean;
+    investigated?: boolean;
   }>();
   const [workspaceId, setWorkspaceId] = useState(() => {
     if (request.investigation) return request.investigation.workspaceId;
@@ -78,8 +84,9 @@ export const WorkersIssueSetupPage = ({ request }: { request: WorkersIssueSetupR
     setPublicAcknowledged(false);
   };
 
+  const offersFixes = Boolean(remediation);
   useEffect(() => {
-    if (!remediation) return;
+    if (!offersFixes) return;
     let cancelled = false;
     authenticatedApi
       .listGatekeeperVendors()
@@ -92,7 +99,7 @@ export const WorkersIssueSetupPage = ({ request }: { request: WorkersIssueSetupR
     return () => {
       cancelled = true;
     };
-  }, [authenticatedApi, remediation]);
+  }, [authenticatedApi, offersFixes]);
 
   useEffect(() => {
     if (!isInvestigation) return;
@@ -186,17 +193,28 @@ export const WorkersIssueSetupPage = ({ request }: { request: WorkersIssueSetupR
           }
         },
         fix,
+        !fromInbox || automatic,
       );
       if (controller.signal.aborted) return;
       setReady({
         ...result,
         investigateCurrent: isInvestigation && Boolean(request.issueId) && investigateCurrent,
       });
+      const enabled = fix ? "AI fixes are enabled." : "AI investigations are enabled.";
+      const investigated = "investigated" in result ? result.investigated : undefined;
+      const notification =
+        investigated === undefined
+          ? []
+          : [
+              investigated
+                ? `The inbox is ${fix ? "working on a fix for" : "investigating"} the notification.`
+                : "The notification was already being investigated.",
+            ];
       setMessage(
-        fix
-          ? "AI fixes are enabled. Returning to your saved automation."
+        fromInbox
+          ? [enabled, ...notification, "You can close this tab and return to the inbox."].join(" ")
           : isInvestigation
-            ? "AI investigations are enabled. Returning to your saved automation."
+            ? `${enabled} Returning to your saved automation.`
             : "Cloudflare OS is connected. Return to the dashboard to save your automation.",
       );
     } catch (caught) {
@@ -367,6 +385,21 @@ export const WorkersIssueSetupPage = ({ request }: { request: WorkersIssueSetupR
                     </>
                   )}
                 </section>
+              )}
+              {fromInbox && (
+                <Switch
+                  label="Investigate new notifications automatically"
+                  checked={automatic}
+                  disabled={busy}
+                  onClick={() => setAutomatic((value) => !value)}
+                />
+              )}
+              {fromInbox && (
+                <p className="text-sm text-kumo-subtle">
+                  {automatic
+                    ? "Every new issue notification runs the model, which incurs usage costs."
+                    : "New notifications are only stored. Investigate any of them from the inbox."}
+                </p>
               )}
               {request.issueId && (
                 <Checkbox

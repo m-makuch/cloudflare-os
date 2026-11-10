@@ -68,6 +68,29 @@ describe("dashboard issue setup context", () => {
     }
   });
 
+  it("accepts an inbox request only for investigations, with one run key of its own account", () => {
+    const { dashboardOrigin: _dashboard, issueId: _issue, ...inbox } = request;
+    const investigation = { workspaceId: "b".repeat(64), destinationId: "destination-1" };
+    const runKey = `${request.accountId}:run-1`;
+    const value = { ...inbox, investigation, runKey };
+    expect(parseWorkersIssueSetup(search(value))).toEqual(value);
+    expect(parseWorkersIssueSetup(search({ ...inbox, investigation }))).toEqual({
+      ...inbox,
+      investigation,
+    });
+    // Connecting a destination always starts from the dashboard.
+    expect(parseWorkersIssueSetup(search(inbox))).toBeNull();
+    for (const bad of [
+      { ...value, runKey: `${"c".repeat(32)}:run-1` },
+      { ...value, runKey: `${request.accountId}:../run` },
+      { ...value, runKey: 1 },
+      { ...value, dashboardOrigin: request.dashboardOrigin },
+      { ...inbox, runKey },
+    ]) {
+      expect(parseWorkersIssueSetup(search(bad))).toBeNull();
+    }
+  });
+
   it("rejects duplicate and oversized setup parameters", () => {
     expect(parseWorkersIssueSetup(`${search(request)}&${search(request)}`)).toBeNull();
     expect(parseWorkersIssueSetup(search({ ...request, extra: "x".repeat(2048) }))).toBeNull();
