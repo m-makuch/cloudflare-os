@@ -3490,6 +3490,17 @@ export interface Overseer extends RpcTarget {
   getGatekeeperById(id: WorkpieceId): Promise<GatekeeperClient<any>>;
 
   /**
+   * Get this workspace's gatekeeper for the owner's auto-provisioned ("ambient") account of
+   * vendor `vendorId`, such as Scheduled Tasks (`scheduler`), e.g. to bind it into a gadget's
+   * `env` with GadgetClient.bind(). It reaches agents without a binding, but a gadget's persistent
+   * code needs one.
+   *
+   * @nullWhen the owner has no account of that vendor: one the deployment only offers needs
+   *   AuthenticatedApi.provisionAmbientAccount() first, and one the deployment disabled has none
+   */
+  getAmbientGatekeeper(vendorId: string): Promise<GatekeeperClient<any> | null>;
+
+  /**
    * Try to create a new gatekeeper for this resource URL, such as a repository or MCP server.
    * The gatekeeper is a connection to that one resource of a connected account, such as a GitHub
    * repository or an MCP server's endpoint.

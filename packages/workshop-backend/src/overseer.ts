@@ -12155,8 +12155,8 @@ class OverseerClientInterface extends RpcTarget implements Overseer {
               private clientUserId: string,
               private isOwner: boolean,
               private notifyClosed: NativeRpcStub<() => void>,
-              // Ambient capsule reconciliation started during open(); listSlashCommands() waits for
-              // this so ambient providers are attached when possible.
+              // Ambient capsule reconciliation started during open(); listSlashCommands() and
+              // getAmbientGatekeeper() wait for this so ambient providers are attached when possible.
                private slashCommandsReady: Promise<void>) {
     super();
     this.#leaveSession = this.isOwner
@@ -12526,6 +12526,19 @@ class OverseerClientInterface extends RpcTarget implements Overseer {
     let author = await this.#getClientProfile();
     return await this.impl.withChatLock(chatId,
         () => this.impl.updateChatFromMainline(chatId, author));
+  }
+
+  async getAmbientGatekeeper(vendorId: string): Promise<GatekeeperClient<any> | null> {
+    let find = () => [...this.impl.storage.gatekeepers.list()].find(gk =>
+        gk.creationSpec?.type === "ambient" && gk.creationSpec.vendorId === vendorId)?.id;
+    // Opening started the reconcile; an account provisioned since then needs another one.
+    await this.slashCommandsReady;
+    let id = find();
+    if (id === undefined) {
+      await this.impl.ensureAmbientCapsules();
+      id = find();
+    }
+    return id === undefined ? null : await this.getGatekeeperById(id);
   }
 
   async getGatekeeperById(id: number): Promise<GatekeeperClient<any>> {
@@ -13945,6 +13958,9 @@ class UseOverseerInterface extends RpcTarget implements Overseer {
   }
   async listPreApprovableActions(): Promise<PreApprovableAction[]> { this.#deny(); }
   async getGatekeeperById(_id: number): Promise<GatekeeperClient<any>> { this.#deny(); }
+  async getAmbientGatekeeper(_vendorId: string): Promise<GatekeeperClient<any> | null> {
+    this.#deny();
+  }
   async newGatekeeper(_accountId: number, _resourceUrl: string)
       : Promise<GatekeeperClient<any> | null> { this.#deny(); }
   async newAiModelGatekeeper(_modelId: string): Promise<GatekeeperClient<any>> { this.#deny(); }
