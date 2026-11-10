@@ -9,8 +9,8 @@ The TypeScript sources (`client.ts`, `server.ts`, and `lib/`) build into the sel
 The inbox displays each logical notification separately, including repeated occurrences of the same
 issue. Refresh updates entries in place so unchanged reports keep their text selection. Notification
 receipt and optional AI enablement are displayed separately. Polls fetch summaries, full reports load
-when opened, and polling pauses while the tab is hidden. The UI uses semantic system colors for
-light and dark surfaces without adding a separate brand palette.
+when opened, and polling pauses while the tab is hidden. The UI restates Cloudflare's Kumo tokens
+(the sandboxed frame cannot load Kumo) and follows the viewer's light or dark scheme.
 
 This inbox accepts authenticated Real-Time Issues notifications only for its configured account
 and Worker. Connect it from the dashboard's Cloudflare OS destination setup and enable its
@@ -42,8 +42,10 @@ needs consent and a model. Investigating the issue the user came from in the das
 unchecked-by-default option, dispatched by the dashboard only after the automation is saved and AI
 setup is verified.
 
-Each logical notification run is accepted durably as `pending`; allocation and dispatch run from an
-alarm, outside the notification callback. Replayed webhook envelopes do not start another investigation.
+Each logical notification run is accepted durably as `pending`; allocation and dispatch run after
+the notification callback returns, through `ctx.waitUntil()`. A gadget is a Durable Object facet,
+and facets cannot set alarms, so a run a restart leaves `pending` starts the next time the inbox is
+read or another run starts. Replayed webhook envelopes do not start another investigation.
 Failures before dispatch become `failed` and offer explicit retry. Ambiguous dispatches remain
 `delivery_unknown` for inspection rather than being resent automatically. Conflicting issue IDs for
 the same run increment a durable diagnostic counter without triggering provider retries.

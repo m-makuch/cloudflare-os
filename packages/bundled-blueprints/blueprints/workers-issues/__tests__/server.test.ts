@@ -82,14 +82,21 @@ const setup = (
   const spawnCallable = vi.fn().mockResolvedValue({ investigate, fix, [Symbol.dispose]() {} });
   const subscribe = vi.fn().mockResolvedValue(undefined);
   let gadget: InstanceType<typeof Gadget>;
+  const background: Promise<unknown>[] = [];
+  /** Waits for the work the gadget handed to ctx.waitUntil(), including work that work started. */
+  const settle = async () => {
+    while (background.length) await Promise.all(background.splice(0));
+  };
   const context = {
+    waitUntil: (promise: Promise<unknown>) => background.push(promise),
     storage: {
       get: async (key: string) => storage.get(key),
       put: async (key: string, value: unknown) => {
         storage.set(key, value);
       },
       delete: async (key: string) => storage.delete(key),
-      setAlarm: vi.fn().mockResolvedValue(undefined),
+      // As in production, where a gadget is a Durable Object facet.
+      setAlarm: vi.fn().mockRejectedValue(new Error("Facets currently cannot set alarms.")),
       sql: {
         exec: (sql: string, ...values: SQLInputValue[]) => {
           const rows = database.prepare(sql).all(...values);
@@ -111,7 +118,7 @@ const setup = (
     gadget = new Gadget(context as unknown as DurableObjectState, env);
     return gadget;
   };
-  return { gadget: restart(), restart, spawnCallable, investigate, fix, subscribe, storage, context, database };
+  return { gadget: restart(), restart, settle, spawnCallable, investigate, fix, subscribe, storage, context, database };
 };
 
 type Task = {
@@ -120,10 +127,17 @@ type Task = {
   complete(report: string): Promise<void>;
 };
 
-/** An inbox with investigations and fixes enabled, and one pending notification. */
-const fixing = async (provider: "gitlab" | "github" = "gitlab") => {
+/**
+ * An inbox with investigations and fixes enabled that has received one notification, whose run
+ * starts at once; `fixer` configures the fixer's response first.
+ */
+const fixing = async (
+  provider: "gitlab" | "github" = "gitlab",
+  fixer?: (fix: ReturnType<typeof setup>["fix"]) => void,
+) => {
   const repo = repository(provider);
   const fixture = setup({ repository: repo });
+  fixer?.(fixture.fix);
   await fixture.gadget.initialize(scope);
   await fixture.gadget.enableInvestigations();
   await fixture.gadget.enableFixes();
@@ -152,9 +166,9 @@ describe("Worker issue investigation inbox", () => {
     await fixture.gadget.initialize(scope);
     await fixture.gadget.enableInvestigations();
     await fixture.gadget.onNotification(notification());
+    await fixture.settle();
     await fixture.restart().onNotification({ ...notification(), id: "envelope-2" });
-    expect(fixture.spawnCallable).not.toHaveBeenCalled();
-    await fixture.gadget.alarm();
+    await fixture.settle();
     expect(fixture.spawnCallable).toHaveBeenCalledTimes(1);
     expect(fixture.investigate).toHaveBeenCalledTimes(1);
     expect(await fixture.gadget.listInvestigations()).toMatchObject([
@@ -193,7 +207,7 @@ describe("Worker issue investigation inbox", () => {
     await fixture.gadget.initialize(scope);
     await fixture.gadget.enableInvestigations();
     await fixture.gadget.onNotification(notification());
-    await fixture.gadget.alarm();
+    await fixture.settle();
     await fixture.restart().onNotification({ ...notification(), id: "retry-envelope" });
     expect(fixture.investigate).toHaveBeenCalledTimes(1);
     expect(await fixture.gadget.listInvestigations()).toMatchObject([
@@ -212,7 +226,7 @@ describe("Worker issue investigation inbox", () => {
     await fixture.gadget.initialize(scope);
     await fixture.gadget.enableInvestigations();
     await fixture.gadget.onNotification(notification());
-    await fixture.gadget.alarm();
+    await fixture.settle();
     expect(await fixture.gadget.listInvestigations()).toMatchObject([
       { status: "completed", has_report: true },
     ]);
@@ -238,7 +252,7 @@ describe("Worker issue investigation inbox", () => {
     const next = notification();
     next.data.state_correlation_id = "run-2";
     await fixture.gadget.onNotification(next);
-    await fixture.gadget.alarm();
+    await fixture.settle();
     expect(fixture.spawnCallable).toHaveBeenCalledTimes(1);
     expect(await fixture.gadget.getSetupStatus()).toMatchObject({ investigationsEnabled: true });
   });
@@ -260,11 +274,13 @@ describe("Worker issue investigation inbox", () => {
       investigationsEnabled: false,
       investigatorReady: true,
     });
-    await Promise.all([
+    // A second concurrent click finds the run already claimed and is refused.
+    const clicks = await Promise.allSettled([
       fixture.gadget.investigateNotification(RUN),
       fixture.gadget.investigateNotification(RUN),
     ]);
-    await fixture.gadget.alarm();
+    expect(clicks.filter((click) => click.status === "fulfilled").length).toBeGreaterThanOrEqual(1);
+    await fixture.settle();
     expect(fixture.investigate).toHaveBeenCalledTimes(1);
     const runs = await fixture.gadget.listInvestigations();
     expect(runs.find((run) => run.run_key === RUN)).toMatchObject({ status: "queued", mode: "investigate" });
@@ -281,7 +297,7 @@ describe("Worker issue investigation inbox", () => {
     await fixture.gadget.enableInvestigations();
     await fixture.gadget.disableInvestigations();
     await fixture.gadget.onNotification(notification());
-    await fixture.gadget.alarm();
+    await fixture.settle();
     expect(fixture.spawnCallable).not.toHaveBeenCalled();
     expect(await fixture.gadget.listInvestigations()).toMatchObject([{ status: "received" }]);
     expect(await fixture.gadget.getSetupStatus()).toMatchObject({ investigationsEnabled: false });
@@ -297,16 +313,14 @@ describe("Worker issue investigation inbox", () => {
     await fixture.gadget.initialize(scope);
     await fixture.gadget.enableInvestigations();
     await fixture.gadget.onNotification(notification());
-    expect(fixture.spawnCallable).not.toHaveBeenCalled();
-    const dispatch = fixture.gadget.alarm();
+    expect(await fixture.gadget.listInvestigations()).toMatchObject([{ status: "allocating" }]);
     await vi.waitFor(() => expect(fixture.spawnCallable).toHaveBeenCalledTimes(1));
     const next = notification();
     next.data.state_correlation_id = "run-2";
     await fixture.gadget.onNotification(next);
     expect(await fixture.gadget.listInvestigations()).toHaveLength(2);
     allocation.resolve({ investigate: fixture.investigate, [Symbol.dispose]() {} });
-    await dispatch;
-    await fixture.gadget.alarm();
+    await fixture.settle();
     expect(fixture.investigate).toHaveBeenCalledTimes(2);
   });
 
@@ -319,10 +333,10 @@ describe("Worker issue investigation inbox", () => {
       fixture.gadget.onNotification(notification()),
       fixture.gadget.onNotification(notification()),
     ]);
-    await fixture.gadget.alarm();
+    await fixture.settle();
     expect(await fixture.gadget.listInvestigations()).toMatchObject([{ status: "failed" }]);
     await fixture.gadget.retryInvestigation(`${scope.accountId}:run-1`);
-    await fixture.gadget.alarm();
+    await fixture.settle();
     expect(fixture.investigate).toHaveBeenCalledTimes(1);
     await expect(fixture.gadget.retryInvestigation(`${scope.accountId}:run-1`)).rejects.toThrow(
       "Only a failed",
@@ -350,14 +364,13 @@ describe("Worker issue investigation inbox", () => {
     await fixture.gadget.initialize(scope);
     await fixture.gadget.enableInvestigations();
     await fixture.gadget.onNotification(notification());
-    const oldDispatch = fixture.gadget.alarm();
     await vi.waitFor(() => expect(fixture.spawnCallable).toHaveBeenCalledTimes(1));
     const replacement = fixture.restart();
     expect(await replacement.listInvestigations()).toMatchObject([{ status: "failed" }]);
     await replacement.retryInvestigation(`${scope.accountId}:run-1`);
-    await replacement.alarm();
+    await vi.waitFor(() => expect(fixture.investigate).toHaveBeenCalledTimes(1));
     allocation.resolve({ investigate: fixture.investigate, [Symbol.dispose]() {} });
-    await oldDispatch;
+    await fixture.settle();
     expect(fixture.investigate).toHaveBeenCalledTimes(1);
     expect(await replacement.listInvestigations()).toMatchObject([{ status: "queued" }]);
   });
@@ -393,7 +406,7 @@ describe("Worker issue fixes", () => {
 
   it("dispatches a fixer with a stable prefixed branch and the fix instructions", async () => {
     const fixture = await fixing();
-    await fixture.gadget.alarm();
+    await fixture.settle();
     expect(fixture.investigate).not.toHaveBeenCalled();
     expect(fixture.fix).toHaveBeenCalledTimes(1);
     const [title, options] = fixture.spawnCallable.mock.calls[0]!;
@@ -416,7 +429,7 @@ describe("Worker issue fixes", () => {
 
   it("records a pending request, then its URL once the repository shows it", async () => {
     const fixture = await fixing();
-    await fixture.gadget.alarm();
+    await fixture.settle();
     const task = fixture.fix.mock.calls[0]![0] as Task;
     const { fix } = await task.getContext();
     await expect(task.reportChange({ id: "42; drop", url: null })).rejects.toThrow();
@@ -442,7 +455,7 @@ describe("Worker issue fixes", () => {
 
   it("reads GitHub pull requests by head and records a merge", async () => {
     const fixture = await fixing("github");
-    await fixture.gadget.alarm();
+    await fixture.settle();
     const task = fixture.fix.mock.calls[0]![0] as Task;
     const { fix } = await task.getContext();
     await task.reportChange({ id: "~1", url: null });
@@ -456,9 +469,10 @@ describe("Worker issue fixes", () => {
   });
 
   it("checks the repository before retrying an unconfirmed fix, and reuses its branch", async () => {
-    const fixture = await fixing();
-    fixture.fix.mockRejectedValueOnce(new Error("Connection lost after dispatch"));
-    await fixture.gadget.alarm();
+    const fixture = await fixing("gitlab", (fix) =>
+      fix.mockRejectedValueOnce(new Error("Connection lost after dispatch")),
+    );
+    await fixture.settle();
     const [run] = await fixture.gadget.listInvestigations();
     expect(run).toMatchObject({ status: "fix_unknown" });
 
@@ -467,27 +481,26 @@ describe("Worker issue fixes", () => {
     fixture.repo.changes.set(run!.fix_branch!, [{ id: "8", url, state: "opened" }]);
     await fixture.gadget.retryInvestigation(RUN);
     expect(await fixture.gadget.listInvestigations()).toMatchObject([{ status: "change_opened", change_id: "8" }]);
-    await fixture.gadget.alarm();
+    await fixture.settle();
     expect(fixture.fix).toHaveBeenCalledTimes(1);
   });
 
   it("retries an unconfirmed fix with nothing in the repository on the same branch", async () => {
-    const fixture = await fixing();
-    fixture.fix.mockRejectedValueOnce(new Error("Connection lost after dispatch"));
-    await fixture.gadget.alarm();
+    const fixture = await fixing("gitlab", (fix) =>
+      fix.mockRejectedValueOnce(new Error("Connection lost after dispatch")),
+    );
+    await fixture.settle();
     const [before] = await fixture.gadget.listInvestigations();
     await fixture.gadget.retryInvestigation(RUN);
-    await fixture.gadget.alarm();
+    await fixture.settle();
     expect(fixture.fix).toHaveBeenCalledTimes(2);
     const task = fixture.fix.mock.calls[1]![0] as Task;
     expect((await task.getContext()).fix!.branch).toBe(before!.fix_branch);
   });
 
   it("marks a fix lost to a restart mid-dispatch as unconfirmed, not as a lost investigation", async () => {
-    const fixture = await fixing();
     const delivery = Promise.withResolvers<void>();
-    fixture.fix.mockReturnValueOnce(delivery.promise);
-    void fixture.gadget.alarm();
+    const fixture = await fixing("gitlab", (fix) => fix.mockReturnValueOnce(delivery.promise));
     await vi.waitFor(() => expect(fixture.fix).toHaveBeenCalledTimes(1));
     expect(await fixture.restart().listInvestigations()).toMatchObject([{ status: "fix_unknown" }]);
   });
@@ -499,10 +512,10 @@ describe("Worker issue fixes", () => {
     await fixture.gadget.initialize(scope);
     await fixture.gadget.enableInvestigations();
     await fixture.gadget.onNotification(notification());
-    await fixture.gadget.alarm();
+    await fixture.settle();
     await fixture.gadget.enableFixes();
     await fixture.gadget.retryInvestigation(RUN);
-    await fixture.gadget.alarm();
+    await fixture.settle();
     expect(fixture.investigate).toHaveBeenCalledTimes(1);
     expect(fixture.fix).not.toHaveBeenCalled();
   });
@@ -512,10 +525,10 @@ describe("Worker issue fixes", () => {
     await fixture.gadget.initialize(scope);
     await fixture.gadget.enableFixes();
     await fixture.gadget.onNotification(notification());
-    await fixture.gadget.alarm();
+    await fixture.settle();
     expect(fixture.spawnCallable).not.toHaveBeenCalled();
     await fixture.gadget.investigateNotification(RUN);
-    await fixture.gadget.alarm();
+    await fixture.settle();
     expect(fixture.fix).toHaveBeenCalledTimes(1);
     expect(await fixture.gadget.listInvestigations()).toMatchObject([{ status: "fixing", mode: "fix" }]);
   });
@@ -525,7 +538,7 @@ describe("Worker issue fixes", () => {
     await fixture.gadget.initialize(scope);
     await fixture.gadget.enableInvestigations();
     await fixture.gadget.onNotification(notification());
-    await fixture.gadget.alarm();
+    await fixture.settle();
     const task = fixture.investigate.mock.calls[0]![0] as Task;
     await expect(task.reportChange({ id: "1", url: null })).rejects.toThrow("cannot open");
   });

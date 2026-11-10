@@ -357,13 +357,12 @@ export class Gadget extends DurableObject<GadgetEnv, unknown> implements WorkerI
     if (this.getRun(runKey)?.status !== "received") {
       throw new Error("Only a notification that has not been investigated yet can be investigated on request.");
     }
-    // As on arrival: schedule before the claim, then claim only if still unclaimed after the
-    // alarm write yields, so two clicks start one run.
-    await this.ctx.storage.setAlarm(Date.now() + 1);
+    // The claim is conditional, so two clicks start one run.
     this.ctx.storage.sql.exec(
       "UPDATE investigations SET status = 'pending' WHERE run_key = ? AND status = 'received'",
       runKey,
     );
+    this.startPending();
   }
 
   async enableFixes(): Promise<FixSetup> {
@@ -411,9 +410,6 @@ export class Gadget extends DurableObject<GadgetEnv, unknown> implements WorkerI
       }
       return;
     }
-    // Schedule before insertion: accepted pending work must survive process loss before alarm dispatch.
-    if (enabled) await this.ctx.storage.setAlarm(Date.now() + 1);
-    if (this.getRun(identity.key)) return this.onNotification(notification);
     // Persist the claim before any asynchronous allocation. An ambiguous send is never replayed.
     this.ctx.storage.sql.exec(
       `INSERT INTO investigations (run_key, issue_id, notification, status, report, created_at)
@@ -424,19 +420,22 @@ export class Gadget extends DurableObject<GadgetEnv, unknown> implements WorkerI
       enabled ? "pending" : "received",
       Date.now(),
     );
+    if (enabled) this.startPending();
   }
 
-  async alarm(): Promise<void> {
+  /**
+   * Dispatches pending runs after the current call returns, so the webhook is acknowledged without
+   * waiting for allocation. A gadget runs as a Durable Object facet, and facets cannot set alarms,
+   * so a run left pending by a restart is picked up the next time the inbox is read or another run
+   * starts. dispatch() claims each run synchronously, so overlapping drains start it once.
+   */
+  startPending(): void {
     const pending = this.ctx.storage.sql
       .exec<StoredInvestigation>(
         "SELECT * FROM investigations WHERE status = 'pending' ORDER BY created_at LIMIT 10",
       )
       .toArray();
-    // More work or a crash must not strand later entries. No allocation runs inside the webhook.
-    if (pending.length) await this.ctx.storage.setAlarm(Date.now() + 1000);
-    await Promise.all(pending.map((run) => this.dispatch(run)));
-    // Let the final scheduled alarm fire once with no pending work. Deleting it here could race
-    // a notification scheduling a new run while allocation yielded.
+    if (pending.length) this.ctx.waitUntil(Promise.all(pending.map((run) => this.dispatch(run))));
   }
 
   /**
@@ -581,6 +580,8 @@ export class Gadget extends DurableObject<GadgetEnv, unknown> implements WorkerI
   }
 
   async listInvestigations() {
+    // Recovers runs a restart left pending; the inbox polls this while it is open.
+    this.startPending();
     return this.ctx.storage.sql
       .exec<Omit<InvestigationSummary, "has_report"> & { has_report: number }>(
         `SELECT run_key, issue_id, status, report IS NOT NULL AS has_report, created_at, mode,
@@ -604,11 +605,11 @@ export class Gadget extends DurableObject<GadgetEnv, unknown> implements WorkerI
     } else if (run?.status !== "failed") {
       throw new Error("Only a failed allocation or an unconfirmed fix can be retried.");
     }
-    await this.ctx.storage.setAlarm(Date.now() + 1);
-    // Recheck after the alarm write yields; a concurrent retry must not restart an active run.
+    // Conditional after checkChange yields: a concurrent retry must not restart an active run.
     this.ctx.storage.sql.exec(
       "UPDATE investigations SET status = 'pending' WHERE run_key = ? AND status IN ('failed', 'fix_unknown')",
       runKey,
     );
+    this.startPending();
   }
 }
