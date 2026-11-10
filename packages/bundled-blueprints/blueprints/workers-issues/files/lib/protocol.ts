@@ -64,7 +64,13 @@ export type InvestigationSummary = Omit<Investigation, "report"> & { has_report:
 
 /** Scope is absent until the inbox has been initialized. */
 export interface InboxSetupStatus extends Partial<WorkerScope> {
+  /** Whether every new notification starts a run on its own. */
   investigationsEnabled: boolean;
+  /**
+   * Whether a Worker-scoped investigator is bound, so a stored notification can be investigated
+   * on request. Binding one is the OS setup page's: it needs the user's consent and a model.
+   */
+  investigatorReady: boolean;
   /** Present once fixes are enabled. */
   fixes?: FixSetup;
 }
@@ -81,11 +87,19 @@ export interface WorkerIssueInbox {
     retryingDeliveries?: number;
   }>;
   getSetupStatus(): Promise<InboxSetupStatus>;
+  /** Start a run for every new notification. Earlier notifications are never replayed. */
   enableInvestigations(): Promise<void>;
+  /** New notifications are only stored again; each can still be investigated on request. */
+  disableInvestigations(): Promise<void>;
   /**
-   * Let new runs push a fix and open a merge or pull request through the `REPOSITORY` binding,
-   * which must be a contributor binding (one limited to a branch prefix). Investigations must be
-   * enabled first. Earlier notifications are never replayed.
+   * Start a run for one stored notification (status `received`) with the bound investigator: a
+   * fix run when fixes are enabled. Each notification is investigated at most once this way.
+   */
+  investigateNotification(runKey: string): Promise<void>;
+  /**
+   * Let runs push a fix and open a merge or pull request through the `REPOSITORY` binding,
+   * which must be a contributor binding (one limited to a branch prefix). An investigator must be
+   * bound first. Earlier runs are never replayed.
    */
   enableFixes(): Promise<FixSetup>;
   /** New runs only investigate again; runs already dispatched are unaffected. */

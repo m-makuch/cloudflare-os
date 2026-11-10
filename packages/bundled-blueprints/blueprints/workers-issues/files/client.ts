@@ -1,6 +1,7 @@
 import { el } from "@gadgets/bundled-blueprints/libraries/ui/client";
 import type {
   FixSetup,
+  InboxSetupStatus,
   InvestigationSummary,
   InvestigationStatus,
   WorkerIssueInbox,
@@ -28,6 +29,9 @@ p { margin: 0; }
 .refresh { flex-shrink: 0; padding: 7px 12px; border: 1px solid ButtonBorder; border-radius: 6px; background: ButtonFace; color: ButtonText; cursor: pointer; }
 .refresh:hover { background: color-mix(in srgb, ButtonFace 90%, ButtonText); }
 .refresh:disabled { opacity: .6; cursor: wait; }
+a.refresh { display: inline-block; text-decoration: none; }
+.actions { display: flex; flex-wrap: wrap; gap: 8px; }
+.entry .actions { margin-top: 12px; }
 .mode { display: flex; flex-wrap: wrap; align-items: center; gap: 8px 12px; margin: 20px 0 8px; }
 .badge { display: inline-flex; align-items: center; gap: 6px; flex-shrink: 0; padding: 3px 9px; border: 1px solid color-mix(in srgb, CanvasText 24%, Canvas); border-radius: 999px; font-size: 12px; font-weight: 550; }
 .badge::before { content: ""; width: 6px; height: 6px; border-radius: 50%; background: currentColor; }
@@ -64,6 +68,8 @@ const scope = el("p", { class: "scope", text: "Loading Worker scope…" });
 const refresh = el("button", { class: "refresh", type: "button", text: "Refresh inbox" });
 const mode = el("span", { class: "badge", text: "Loading setup…" });
 const modeDescription = el("span");
+const setupLink = el("a", { class: "refresh", target: "_blank", rel: "noopener noreferrer", hidden: true });
+const automaticToggle = el("button", { class: "refresh", type: "button", hidden: true });
 const description = el("p", { class: "description" });
 const summary = el("p", { role: "status", text: "Loading inbox…" });
 const updated = el("time", { class: "updated" });
@@ -80,6 +86,7 @@ document.body.replaceChildren(
       refresh,
     ]),
     el("div", { class: "mode" }, [mode, modeDescription]),
+    el("div", { class: "actions" }, [setupLink, automaticToggle]),
     description,
     el("div", { class: "summary" }, [summary, updated]),
     error,
@@ -109,6 +116,54 @@ function changeNoun(fixes: FixSetup | undefined): string {
 }
 
 let fixSetup: FixSetup | undefined;
+let setupStatus: InboxSetupStatus | undefined;
+/** The notification destination, read once: OS setup checks it matches before binding anything. */
+let destinationId: string | undefined;
+let destinationRead = false;
+
+/**
+ * This inbox's workspace. The frame is an opaque-origin srcdoc document, whose base URL is the
+ * Workshop page that hosts it, so relative links open the Workshop and its path names the
+ * workspace. Elsewhere (a gadget-only view) no setup link is offered.
+ */
+const workspaceId = (() => {
+  try {
+    return /^\/workspace\/([a-f\d]{64})(?:\/|$)/.exec(new URL(document.baseURI).pathname)?.[1];
+  } catch {
+    return undefined;
+  }
+})();
+
+/**
+ * The OS page that binds a Worker-scoped investigator to this inbox, which needs the user's
+ * consent and a model, so the inbox cannot do it itself. With a run key, it then investigates
+ * that notification.
+ */
+function setupUrl(runKey?: string): string | undefined {
+  const scope = setupStatus;
+  if (!workspaceId || !destinationId || !scope?.accountId || !scope.workerName) return undefined;
+  const url = new URL("/setup/workers-issues", document.baseURI);
+  url.searchParams.set(
+    "workers_issue_setup",
+    JSON.stringify({
+      state: crypto.randomUUID(),
+      accountId: scope.accountId,
+      workerName: scope.workerName,
+      investigation: { workspaceId, destinationId },
+      ...(runKey ? { runKey } : {}),
+    }),
+  );
+  return url.href;
+}
+
+function setLink(link: HTMLAnchorElement, href: string | undefined): void {
+  link.hidden = !href;
+  // A fresh setup state per render would rewrite the link under the pointer; keep the first.
+  if (href && !link.dataset.ready) {
+    link.href = href;
+    link.dataset.ready = "1";
+  }
+}
 
 const dateFormat = new Intl.DateTimeFormat(undefined, { dateStyle: "medium", timeStyle: "short" });
 const clockFormat = new Intl.DateTimeFormat(undefined, { timeStyle: "short" });
@@ -121,6 +176,8 @@ type EntryView = {
   report: HTMLPreElement;
   readReport: HTMLButtonElement;
   retry: HTMLButtonElement;
+  investigate: HTMLButtonElement;
+  investigateLink: HTMLAnchorElement;
   change: HTMLAnchorElement;
   reportLoaded: boolean;
 };
@@ -139,7 +196,9 @@ function reportText(run: InvestigationSummary): string {
   if (run.status === "failed")
     return "The investigator could not be started. Check the model and bindings, then retry.";
   if (run.status === "received") {
-    return "Notification stored without running a model. Enabling AI investigations does not replay earlier notifications.";
+    return setupStatus?.investigatorReady
+      ? "Notification stored without running a model. Investigate it to start a run."
+      : "Notification stored without running a model. Set up AI investigations to investigate it.";
   }
   if (run.status === "delivery_unknown") {
     return "Delivery could not be confirmed. Check the workspace conversations before sending again.";
@@ -172,13 +231,19 @@ function renderEntries(runs: InvestigationSummary[]): void {
       const report = el("pre", { class: "report" });
       const readReport = el("button", { class: "refresh", type: "button", text: "Read report" });
       const retry = el("button", { class: "refresh", type: "button", text: "Retry investigation" });
+      const investigate = el("button", { class: "refresh", type: "button", text: "Investigate" });
+      const investigateLink = el("a", {
+        class: "refresh",
+        target: "_blank",
+        rel: "noopener noreferrer",
+        text: "Set up and investigate",
+      });
       const change = el("a", { class: "change", target: "_blank", rel: "noopener noreferrer" });
       const element = el("article", { class: "entry" }, [
         el("div", { class: "entry-header" }, [el("div", {}, [title, time]), badge]),
         change,
         report,
-        readReport,
-        retry,
+        el("div", { class: "actions" }, [readReport, retry, investigate, investigateLink]),
       ]);
       const created = {
         element,
@@ -188,6 +253,8 @@ function renderEntries(runs: InvestigationSummary[]): void {
         report,
         readReport,
         retry,
+        investigate,
+        investigateLink,
         change,
         reportLoaded: false,
       };
@@ -227,6 +294,18 @@ function renderEntries(runs: InvestigationSummary[]): void {
           retry.disabled = false;
         }
       });
+      investigate.addEventListener("click", async () => {
+        investigate.disabled = true;
+        try {
+          await gadget.investigateNotification(run.run_key);
+          await render();
+        } catch {
+          setText(error, "Could not start this investigation. Check its current status and try again.");
+          error.hidden = false;
+        } finally {
+          investigate.disabled = false;
+        }
+      });
       view = created;
       views.set(run.run_key, view);
     }
@@ -243,6 +322,10 @@ function renderEntries(runs: InvestigationSummary[]): void {
     view.readReport.hidden = !run.has_report;
     view.retry.hidden = run.status !== "failed" && run.status !== "fix_unknown";
     setText(view.retry, run.mode === "fix" ? "Retry fix" : "Retry investigation");
+    const stored = run.status === "received";
+    view.investigate.hidden = !stored || !setupStatus?.investigatorReady;
+    setText(view.investigate, fixSetup ? "Investigate and propose a fix" : "Investigate");
+    setLink(view.investigateLink, stored && !setupStatus?.investigatorReady ? setupUrl(run.run_key) : undefined);
     // Only an https link the server validated is shown; it opens on the git host.
     const url = run.change_url;
     view.change.hidden = !url;
@@ -265,32 +348,52 @@ async function render(): Promise<void> {
     // Pending requests are read from the git host at most once a minute per run, server-side.
     await gadget.reconcileChanges().catch(() => undefined);
     const [runs, setup] = await Promise.all([gadget.listInvestigations(), gadget.getSetupStatus()]);
+    if (!destinationRead) {
+      // A failed read is retried on the next poll; an answer is kept for the page's life.
+      await gadget.getNotificationStatus().then(
+        (status) => {
+          destinationRead = true;
+          destinationId = status.installed && !status.suspended ? status.webhookId : undefined;
+        },
+        () => undefined,
+      );
+    }
     if (disposed) return;
     fixSetup = setup.fixes;
+    setupStatus = setup;
     setText(
       scope,
       setup.workerName
         ? [setup.workerName, setup.accountId].filter(Boolean).join(" · ")
         : "This inbox has not been connected to a Worker yet.",
     );
-    const fixes = setup.investigationsEnabled ? setup.fixes : undefined;
+    const ready = setup.investigatorReady;
+    const automatic = setup.investigationsEnabled && ready;
+    const fixes = ready ? setup.fixes : undefined;
     setText(
       mode,
-      fixes ? "AI fixes on" : setup.investigationsEnabled ? "AI investigations on" : "Notifications only",
+      !ready
+        ? "Notifications only"
+        : `${fixes ? "AI fixes" : "AI investigations"} ${automatic ? "on" : "on request"}`,
     );
+    const run = fixes ? `propose a fix as a ${changeNoun(fixes)} in ${fixes.repository}` : "start an investigation";
     setText(
       modeDescription,
-      fixes
-        ? `New issue notifications can propose a fix as a ${changeNoun(fixes)} in ${fixes.repository}.`
-        : setup.investigationsEnabled
-          ? "New issue notifications can start an investigation."
-          : "Notifications are stored without running a model.",
+      !ready
+        ? "Notifications are stored without running a model."
+        : automatic
+          ? `New issue notifications ${fixes ? "can " : ""}${run}.`
+          : `Notifications are stored. Investigate any of them to ${run}.`,
     );
+    setLink(setupLink, setupUrl());
+    setText(setupLink, ready ? "Change AI setup" : "Set up AI investigations");
+    automaticToggle.hidden = !ready;
+    setText(automaticToggle, automatic ? "Stop automatic investigations" : "Investigate new notifications automatically");
     setText(
       description,
       fixes
         ? `The fixer can push only to branches starting with "${fixes.branchPrefix}" and open ${changeNoun(fixes)}s into the default branch. It cannot merge or deploy: you review and merge, and your CI deploys. A workspace editor can change its bindings.`
-        : "Dashboard setup provisions read-only telemetry for this Worker. A workspace editor can change the investigator's bindings. Repository access, project tests, code changes, and deployments require separate capabilities.",
+        : "AI setup provisions read-only telemetry for this Worker. A workspace editor can change the investigator's bindings. Repository access, project tests, code changes, and deployments require separate capabilities.",
     );
     setText(
       summary,
@@ -333,6 +436,20 @@ async function render(): Promise<void> {
 
 refresh.addEventListener("click", () => {
   void render();
+});
+automaticToggle.addEventListener("click", async () => {
+  automaticToggle.disabled = true;
+  try {
+    // Only an inbox with a bound investigator shows this; binding one is OS setup's.
+    if (setupStatus?.investigationsEnabled) await gadget.disableInvestigations();
+    else await gadget.enableInvestigations();
+    await render();
+  } catch {
+    setText(error, "Could not change automatic investigations. Refresh and try again.");
+    error.hidden = false;
+  } finally {
+    automaticToggle.disabled = false;
+  }
 });
 const timer = setInterval(() => {
   void render();

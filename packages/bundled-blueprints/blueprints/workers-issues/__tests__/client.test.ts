@@ -20,6 +20,11 @@ const getSetupStatus = vi.fn<WorkerIssueInbox["getSetupStatus"]>();
 const getInvestigationReport = vi.fn<WorkerIssueInbox["getInvestigationReport"]>();
 const retryInvestigation = vi.fn<WorkerIssueInbox["retryInvestigation"]>();
 const reconcileChanges = vi.fn<WorkerIssueInbox["reconcileChanges"]>();
+const getNotificationStatus = vi.fn<WorkerIssueInbox["getNotificationStatus"]>();
+const investigateNotification = vi.fn<WorkerIssueInbox["investigateNotification"]>();
+const enableInvestigations = vi.fn<WorkerIssueInbox["enableInvestigations"]>();
+const disableInvestigations = vi.fn<WorkerIssueInbox["disableInvestigations"]>();
+const workspaceId = "b".repeat(64);
 
 beforeEach(() => {
   vi.resetModules();
@@ -30,17 +35,30 @@ beforeEach(() => {
   getInvestigationReport.mockReset().mockResolvedValue("Read this report without interruption.");
   retryInvestigation.mockReset().mockResolvedValue(undefined);
   reconcileChanges.mockReset().mockResolvedValue(undefined);
+  getNotificationStatus
+    .mockReset()
+    .mockResolvedValue({ installed: true, suspended: false, webhookId: "destination-1" });
+  investigateNotification.mockReset().mockResolvedValue(undefined);
+  enableInvestigations.mockReset().mockResolvedValue(undefined);
+  disableInvestigations.mockReset().mockResolvedValue(undefined);
   getSetupStatus.mockReset().mockResolvedValue({
     accountId: "a".repeat(32),
     workerName: "checkout-test",
     investigationsEnabled: false,
+    investigatorReady: false,
   });
+  // The frame's base URL is the Workshop page hosting it.
+  history.replaceState(null, "", `/workspace/${workspaceId}`);
   vi.stubGlobal("gadget", {
     listInvestigations,
     getSetupStatus,
     getInvestigationReport,
     retryInvestigation,
     reconcileChanges,
+    getNotificationStatus,
+    investigateNotification,
+    enableInvestigations,
+    disableInvestigations,
   });
 });
 
@@ -60,6 +78,17 @@ async function openReport(index = 0): Promise<void> {
   article.querySelector<HTMLButtonElement>("button")!.click();
   await vi.advanceTimersByTimeAsync(0);
 }
+
+const buttonNamed = (text: string, root: ParentNode = document) =>
+  [...root.querySelectorAll<HTMLButtonElement>("button")].find((candidate) => candidate.textContent === text);
+const linkNamed = (text: string, root: ParentNode = document) =>
+  [...root.querySelectorAll<HTMLAnchorElement>("a")].find((candidate) => candidate.textContent === text);
+const setupRequest = (anchor: HTMLAnchorElement) => {
+  const url = new URL(anchor.href);
+  expect(url.origin + url.pathname).toBe(`${location.origin}/setup/workers-issues`);
+  expect(anchor.target).toBe("_blank");
+  return JSON.parse(url.searchParams.get("workers_issue_setup")!);
+};
 
 describe("Worker issue inbox", () => {
   it("presents notification-only mode and untrusted report text without executing markup", async () => {
@@ -158,7 +187,11 @@ describe("Worker issue inbox", () => {
 
   it("shows the empty inbox and AI mode, and stops polling after the page closes", async () => {
     listInvestigations.mockResolvedValue([]);
-    getSetupStatus.mockResolvedValue({ workerName: "checkout-test", investigationsEnabled: true });
+    getSetupStatus.mockResolvedValue({
+      workerName: "checkout-test",
+      investigationsEnabled: true,
+      investigatorReady: true,
+    });
     await load();
 
     expect(document.querySelector<HTMLElement>(".empty")!.hidden).toBe(false);
@@ -198,6 +231,7 @@ describe("Worker issue inbox", () => {
       accountId: "a".repeat(32),
       workerName: "checkout-test",
       investigationsEnabled: true,
+      investigatorReady: true,
       fixes: { provider: "gitlab", repository: "acme/checkout", branchPrefix: "cloudflare-os/" },
     });
     const url = "https://gitlab.example.com/acme/checkout/-/merge_requests/7";
@@ -228,5 +262,63 @@ describe("Worker issue inbox", () => {
     await load();
     expect(document.querySelectorAll("article")).toHaveLength(1);
     expect(document.querySelector<HTMLElement>("[role=alert]")!.hidden).toBe(true);
+  });
+
+  it("links to OS setup for this inbox, and for one stored notification, before an investigator is bound", async () => {
+    await load();
+    expect(document.body.textContent).toContain("Notifications only");
+    const setup = linkNamed("Set up AI investigations")!;
+    expect(setup.hidden).toBe(false);
+    expect(setupRequest(setup)).toEqual({
+      state: expect.stringMatching(/^[a-f\d-]{36}$/),
+      accountId: "a".repeat(32),
+      workerName: "checkout-test",
+      investigation: { workspaceId, destinationId: "destination-1" },
+    });
+    const article = document.querySelector("article")!;
+    expect(buttonNamed("Investigate", article)!.hidden).toBe(true);
+    expect(setupRequest(linkNamed("Set up and investigate", article)!)).toMatchObject({
+      runKey: "account:run-1",
+    });
+    expect(buttonNamed("Investigate new notifications automatically")!.hidden).toBe(true);
+  });
+
+  it("offers no setup link outside a workspace page", async () => {
+    history.replaceState(null, "", "/gadget/1");
+    await load();
+    expect(linkNamed("Set up AI investigations")!.hidden).toBe(true);
+    expect(linkNamed("Set up and investigate")!.hidden).toBe(true);
+  });
+
+  it("investigates a stored notification on request, and turns automatic runs on and off", async () => {
+    getSetupStatus.mockResolvedValue({
+      accountId: "a".repeat(32),
+      workerName: "checkout-test",
+      investigationsEnabled: false,
+      investigatorReady: true,
+    });
+    await load();
+    expect(document.body.textContent).toContain("AI investigations on request");
+    expect(linkNamed("Change AI setup")!.hidden).toBe(false);
+    const article = document.querySelector("article")!;
+    expect(linkNamed("Set up and investigate", article)!.hidden).toBe(true);
+    buttonNamed("Investigate", article)!.click();
+    await vi.advanceTimersByTimeAsync(0);
+    expect(investigateNotification).toHaveBeenCalledWith("account:run-1");
+
+    buttonNamed("Investigate new notifications automatically")!.click();
+    await vi.advanceTimersByTimeAsync(0);
+    expect(enableInvestigations).toHaveBeenCalledTimes(1);
+    getSetupStatus.mockResolvedValue({
+      accountId: "a".repeat(32),
+      workerName: "checkout-test",
+      investigationsEnabled: true,
+      investigatorReady: true,
+    });
+    await vi.advanceTimersByTimeAsync(5000);
+    expect(document.body.textContent).toContain("AI investigations on");
+    buttonNamed("Stop automatic investigations")!.click();
+    await vi.advanceTimersByTimeAsync(0);
+    expect(disableInvestigations).toHaveBeenCalledTimes(1);
   });
 });

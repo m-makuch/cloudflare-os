@@ -71,7 +71,9 @@ const repository = (provider: "gitlab" | "github", metadata: Record<string, unkn
   };
 };
 
-const setup = (options: { repository?: ReturnType<typeof repository> } = {}) => {
+const setup = (
+  options: { repository?: ReturnType<typeof repository>; investigator?: boolean } = {},
+) => {
   const database = new DatabaseSync(":memory:");
   databases.push(database);
   const storage = new Map<string, unknown>();
@@ -101,7 +103,7 @@ const setup = (options: { repository?: ReturnType<typeof repository> } = {}) => 
       }),
   };
   const env = {
-    INVESTIGATOR: { spawnCallable },
+    ...(options.investigator === false ? {} : { INVESTIGATOR: { spawnCallable } }),
     CLOUDFLARE_NOTIFICATIONS: { subscribe, getStatus: vi.fn() },
     ...(options.repository ? { REPOSITORY: options.repository.binding } : {}),
   };
@@ -241,6 +243,50 @@ describe("Worker issue investigation inbox", () => {
     expect(await fixture.gadget.getSetupStatus()).toMatchObject({ investigationsEnabled: true });
   });
 
+  it("investigates one stored notification on request, once, without enabling automatic runs", async () => {
+    const unbound = setup({ investigator: false });
+    await unbound.gadget.initialize(scope);
+    await unbound.gadget.onNotification(notification());
+    expect(await unbound.gadget.getSetupStatus()).toMatchObject({ investigatorReady: false });
+    await expect(unbound.gadget.investigateNotification(RUN)).rejects.toThrow("investigator");
+
+    const fixture = setup();
+    await fixture.gadget.initialize(scope);
+    await fixture.gadget.onNotification(notification());
+    const next = notification();
+    next.data.state_correlation_id = "run-2";
+    await fixture.gadget.onNotification(next);
+    expect(await fixture.gadget.getSetupStatus()).toMatchObject({
+      investigationsEnabled: false,
+      investigatorReady: true,
+    });
+    await Promise.all([
+      fixture.gadget.investigateNotification(RUN),
+      fixture.gadget.investigateNotification(RUN),
+    ]);
+    await fixture.gadget.alarm();
+    expect(fixture.investigate).toHaveBeenCalledTimes(1);
+    const runs = await fixture.gadget.listInvestigations();
+    expect(runs.find((run) => run.run_key === RUN)).toMatchObject({ status: "queued", mode: "investigate" });
+    expect(runs.find((run) => run.run_key !== RUN)).toMatchObject({ status: "received" });
+    await expect(fixture.gadget.investigateNotification(RUN)).rejects.toThrow("not been investigated");
+    await expect(fixture.gadget.investigateNotification("unknown")).rejects.toThrow(
+      "not been investigated",
+    );
+  });
+
+  it("stops starting runs on arrival once automatic investigations are turned off", async () => {
+    const fixture = setup();
+    await fixture.gadget.initialize(scope);
+    await fixture.gadget.enableInvestigations();
+    await fixture.gadget.disableInvestigations();
+    await fixture.gadget.onNotification(notification());
+    await fixture.gadget.alarm();
+    expect(fixture.spawnCallable).not.toHaveBeenCalled();
+    expect(await fixture.gadget.listInvestigations()).toMatchObject([{ status: "received" }]);
+    expect(await fixture.gadget.getSetupStatus()).toMatchObject({ investigationsEnabled: false });
+  });
+
   it("returns from the notification callback before allocation and accepts another run while allocation waits", async () => {
     const fixture = setup();
     const allocation = Promise.withResolvers<{
@@ -318,16 +364,17 @@ describe("Worker issue investigation inbox", () => {
 });
 
 describe("Worker issue fixes", () => {
-  it("requires investigations and a contributor repository binding, and records the repository", async () => {
+  it("requires an investigator and a contributor repository binding, and records the repository", async () => {
     const plain = setup();
     await plain.gadget.initialize(scope);
-    await plain.gadget.enableInvestigations();
     await expect(plain.gadget.enableFixes()).rejects.toThrow("Connect a repository");
+
+    const unbound = setup({ repository: repository("gitlab"), investigator: false });
+    await unbound.gadget.initialize(scope);
+    await expect(unbound.gadget.enableFixes()).rejects.toThrow("investigator");
 
     const full = setup({ repository: repository("gitlab", { branchPrefix: undefined }) });
     await full.gadget.initialize(scope);
-    await expect(full.gadget.enableFixes()).rejects.toThrow("Enable investigations");
-    await full.gadget.enableInvestigations();
     // A binding with the whole repository's surface is refused.
     await expect(full.gadget.enableFixes()).rejects.toThrow("contributor binding");
 
@@ -458,6 +505,19 @@ describe("Worker issue fixes", () => {
     await fixture.gadget.alarm();
     expect(fixture.investigate).toHaveBeenCalledTimes(1);
     expect(fixture.fix).not.toHaveBeenCalled();
+  });
+
+  it("proposes a fix for a stored notification on request when fixes are on but not automatic", async () => {
+    const fixture = setup({ repository: repository("github") });
+    await fixture.gadget.initialize(scope);
+    await fixture.gadget.enableFixes();
+    await fixture.gadget.onNotification(notification());
+    await fixture.gadget.alarm();
+    expect(fixture.spawnCallable).not.toHaveBeenCalled();
+    await fixture.gadget.investigateNotification(RUN);
+    await fixture.gadget.alarm();
+    expect(fixture.fix).toHaveBeenCalledTimes(1);
+    expect(await fixture.gadget.listInvestigations()).toMatchObject([{ status: "fixing", mode: "fix" }]);
   });
 
   it("refuses a change report from an investigation-only run", async () => {

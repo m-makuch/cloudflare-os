@@ -329,9 +329,11 @@ export class Gadget extends DurableObject<GadgetEnv, unknown> implements WorkerI
 
   async getSetupStatus() {
     const fixes = await this.ctx.storage.get<FixSetup>("fixes");
+    const scope = await this.ctx.storage.get<WorkerScope>("scope");
     return {
-      ...(await this.ctx.storage.get<WorkerScope>("scope")),
+      ...scope,
       investigationsEnabled: Boolean(await this.ctx.storage.get("investigationsEnabled")),
+      investigatorReady: Boolean(scope && this.env.INVESTIGATOR),
       ...(fixes ? { fixes } : {}),
     };
   }
@@ -344,9 +346,29 @@ export class Gadget extends DurableObject<GadgetEnv, unknown> implements WorkerI
     // Notifications received before opt-in remain inbox entries; enabling never replays them.
   }
 
+  async disableInvestigations(): Promise<void> {
+    await this.ctx.storage.delete("investigationsEnabled");
+  }
+
+  async investigateNotification(runKey: string): Promise<void> {
+    if (!(await this.ctx.storage.get("scope")) || !this.env.INVESTIGATOR) {
+      throw new Error("Connect the Worker-scoped investigator before investigating.");
+    }
+    if (this.getRun(runKey)?.status !== "received") {
+      throw new Error("Only a notification that has not been investigated yet can be investigated on request.");
+    }
+    // As on arrival: schedule before the claim, then claim only if still unclaimed after the
+    // alarm write yields, so two clicks start one run.
+    await this.ctx.storage.setAlarm(Date.now() + 1);
+    this.ctx.storage.sql.exec(
+      "UPDATE investigations SET status = 'pending' WHERE run_key = ? AND status = 'received'",
+      runKey,
+    );
+  }
+
   async enableFixes(): Promise<FixSetup> {
-    if (!(await this.ctx.storage.get("investigationsEnabled")) || !this.env.INVESTIGATOR) {
-      throw new Error("Enable investigations before enabling fixes.");
+    if (!(await this.ctx.storage.get("scope")) || !this.env.INVESTIGATOR) {
+      throw new Error("Connect the Worker-scoped investigator before enabling fixes.");
     }
     if (!this.env.REPOSITORY) throw new Error("Connect a repository before enabling fixes.");
     const metadata = await this.env.REPOSITORY.getMetadata();
@@ -366,7 +388,7 @@ export class Gadget extends DurableObject<GadgetEnv, unknown> implements WorkerI
     }
     const fixes: FixSetup = { provider: github ? "github" : "gitlab", repository, branchPrefix: prefix };
     await this.ctx.storage.put("fixes", fixes);
-    // As with investigations, earlier notifications are not replayed.
+    // Runs already dispatched keep their mode; stored notifications become fix runs on request.
     return fixes;
   }
 
