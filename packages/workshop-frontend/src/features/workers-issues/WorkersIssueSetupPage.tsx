@@ -387,19 +387,19 @@ export const WorkersIssueSetupPage = ({ request }: { request: WorkersIssueSetupR
                 </section>
               )}
               {fromInbox && (
-                <Switch
-                  label="Investigate new notifications automatically"
-                  checked={automatic}
-                  disabled={busy}
-                  onClick={() => setAutomatic((value) => !value)}
-                />
-              )}
-              {fromInbox && (
-                <p className="text-sm text-kumo-subtle">
-                  {automatic
-                    ? "Every new issue notification runs the model, which incurs usage costs."
-                    : "New notifications are only stored. Investigate any of them from the inbox."}
-                </p>
+                <section className="grid gap-3 rounded-lg border border-kumo-line p-4">
+                  <Switch
+                    label="Investigate new notifications automatically"
+                    checked={automatic}
+                    disabled={busy}
+                    onClick={() => setAutomatic((value) => !value)}
+                  />
+                  <p className="text-sm text-kumo-subtle">
+                    {automatic
+                      ? "Every new issue notification runs the model, which incurs usage costs."
+                      : "New notifications are only stored. Investigate any of them from the inbox."}
+                  </p>
+                </section>
               )}
               {request.issueId && (
                 <Checkbox
