@@ -156,6 +156,55 @@ describe("the contributor binding", () => {
     expect(gitlab.count("POST", /git-receive-pack$/)).toBe(0);
   });
 
+  it("reports a merged merge request's merge commit, else its squash commit, else its merged head", async () => {
+    const { gitlab, props, name } = await setup();
+    const mr = (iid: number, state: string, shas: { merge?: string; squash?: string }) => ({
+      ...fx.mergeRequestResponse.data, iid, state, source_branch: BRANCH, sha: HEAD,
+      merge_commit_sha: shas.merge ?? null, squash_commit_sha: shas.squash ?? null,
+      web_url: `https://gitlab.example.com/${PROJECT}/-/merge_requests/${iid}`,
+    });
+    gitlab.on("GET", new RegExp(`^/api/v4/projects/${P}/merge_requests\\?`), () => json([
+      mr(1, "merged", { merge: "c".repeat(40), squash: "d".repeat(40) }),
+      mr(2, "merged", { squash: "d".repeat(40) }),
+      mr(3, "merged", {}),
+      mr(4, "opened", { merge: "e".repeat(40) }),
+    ]));
+    const rows = await unwrap(await hooks().session(name, props,
+      [{ method: "listMergeRequests", args: [{ sourceBranch: BRANCH, state: "all" }], drain: true }])) as
+      { id: string; mergeCommit: string | null }[];
+    expect(rows.map(({ id, mergeCommit }) => ({ id, mergeCommit }))).toEqual([
+      { id: "1", mergeCommit: "c".repeat(40) },
+      { id: "2", mergeCommit: "d".repeat(40) },
+      { id: "3", mergeCommit: HEAD },
+      { id: "4", mergeCommit: null },
+    ]);
+  });
+
+  it("tells whether a ref's history contains a commit, by their merge base", async () => {
+    const { gitlab, props, name } = await setup();
+    const [MERGE, DEPLOYED, OLD] = ["c", "e", "f"].map(c => c.repeat(40));
+    const known = new Set([BASE, MERGE, DEPLOYED, OLD]);
+    gitlab.on("GET", new RegExp(`^/api/v4/projects/${P}/repository/commits/[^/?]+(\\?|$)`), request => {
+      const ref = decodeURIComponent(request.url.pathname.split("/repository/commits/")[1]);
+      const id = gitlab.branches.get(ref)?.head ?? ref;
+      return known.has(id) ? json({ ...fx.commitResponse.data, id, short_id: id.slice(0, 8) })
+        : json({ message: "404 Commit Not Found" }, { status: 404 });
+    });
+    gitlab.on("GET", new RegExp(`^/api/v4/projects/${P}/repository/merge_base\\?`), request => {
+      const [a, b] = request.url.searchParams.getAll("refs[]");
+      const base = a === MERGE && b === DEPLOYED ? MERGE : a === MERGE && b === OLD ? OLD : undefined;
+      return base === undefined ? json({ message: "400 Bad Request" }, { status: 400 })
+        : json({ ...fx.commitResponse.data, id: base });
+    });
+    const contains = async (commit: string, ref?: string) => await unwrap(await hooks().session(name, props,
+      [{ method: "containsCommit", args: ref === undefined ? [commit] : [commit, ref] }]));
+    expect(await contains(MERGE, DEPLOYED)).toBe(true);
+    expect(await contains(MERGE, OLD)).toBe(false);
+    expect(await contains(BASE)).toBe(true);
+    expect(await contains(OLD, DEPLOYED)).toBe(false);   // no common ancestor
+    await expect(contains("0".repeat(40), DEPLOYED)).rejects.toThrow();
+  });
+
   it("refuses at apply any action its session cannot queue", async () => {
     const { gitlab, props, name } = await setup();
     gitlab.on("GET", /^\/api\/v4\/users\?username=/, () => json([]));

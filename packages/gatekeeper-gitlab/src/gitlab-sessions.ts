@@ -280,6 +280,18 @@ export class GitLabProjectSessionImpl extends RpcTarget implements GitLabProject
     }, { advertising: { gitCache: this.#gitCache, commitIds: commitIdsOfSummary } });
   }
 
+  async containsCommit(commit: string, ref?: string): Promise<boolean> {
+    const { commitId, refId, contains } = await this.#gatekeeper.containsCommit(commit, ref);
+    await this.#gatekeeper.authorizeRead(this.#approvalQueue, {
+      title: `Check whether ${ref ?? "the default branch"} contains ${commitId.slice(0, 12)}`,
+      description: `Check whether commit ${refId}`
+        + `${ref === undefined ? " (head of the default branch)" : ref === refId ? "" : ` (resolved from "${ref}")`}`
+        + ` contains commit ${commitId} in the GitLab project.`,
+    });
+    await this.#gitCache.advertise([commitId, refId]);
+    return contains;
+  }
+
   async listPipelines(options?: GitLabPipelineFilter): Promise<Cursor<GitLabPipelineSummary>> {
     return await observedListing(this.#gatekeeper, this.#approvalQueue,
       await this.#gatekeeper.listProjectPipelines(options, pageSize(options)), {
@@ -362,6 +374,10 @@ export class GitLabProjectContributorImpl extends RpcTarget implements GitLabPro
     return await this.#project.listCommits(options);
   }
 
+  async containsCommit(commit: string, ref?: string): Promise<boolean> {
+    return await this.#project.containsCommit(commit, ref);
+  }
+
   async push(branch: string, commitId: string): Promise<void> {
     this.#requireBranch(branch);
     await this.#project.push(branch, commitId, { force: false });
@@ -383,7 +399,7 @@ export class GitLabProjectContributorImpl extends RpcTarget implements GitLabPro
     });
     return {
       id: action.provisionalId, url: null, title: options.title, state: "opened", draft: options.draft ?? false,
-      sourceBranch: options.sourceBranch, targetBranch: defaultBranch, headCommit: null,
+      sourceBranch: options.sourceBranch, targetBranch: defaultBranch, headCommit: null, mergeCommit: null,
     };
   }
 
@@ -401,6 +417,7 @@ function contributorMergeRequest(mr: GitLabMergeRequestSummary): GitLabContribut
   return {
     id: mr.id, url: pending ? null : mr.url, title: mr.title, state: mr.state, draft: mr.draft,
     sourceBranch: mr.source.branch, targetBranch: mr.target.branch, headCommit: mr.source.sha,
+    mergeCommit: mr.state === "merged" ? mr.mergeCommit ?? null : null,
   };
 }
 

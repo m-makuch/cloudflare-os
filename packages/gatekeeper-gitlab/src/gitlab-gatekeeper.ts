@@ -2419,6 +2419,20 @@ export class GitLabGatekeeperImpl extends DurableObject<Env, GitLabGatekeeperImp
     throw new Error(`No commit found for ref "${ref}".`);
   }
 
+  /**
+   * Whether `ref` (the default branch when undefined) has `commit` in its history, both resolved
+   * on GitLab: a commit only queued for push is not there, so it is never "contained". A commit
+   * is an ancestor of another exactly when it is their merge base; unrelated histories have none.
+   */
+  async containsCommit(commit: string, refOrDefault: string | undefined):
+      Promise<{ commitId: GitOid; refId: GitOid; contains: boolean }> {
+    const [commitId, refId] = await Promise.all([commit, refOrDefault].map(async ref =>
+      (await this.resolveRef(ref)).id));
+    if (commitId === refId) return { commitId, refId, contains: true };
+    const base = await this.#withApi(api => api.mergeBase(this.#projectPath(), [commitId, refId]));
+    return { commitId, refId, contains: base?.id === commitId };
+  }
+
   async listCommits(filter: GitLabCommitFilter | undefined, pageSize: number, gitCache?: RpcStub<GitCache>):
       Promise<Cursor<GitLabCommitSummary>> {
     const projectPath = this.#projectPath();

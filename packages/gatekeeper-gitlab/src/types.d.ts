@@ -63,6 +63,14 @@ export interface GitLabProject {
   listCommits(options?: GitLabCommitFilter): Promise<Cursor<GitLabCommitSummary>>;
 
   /**
+   * Whether `ref`'s history contains `commit`: true when `commit` is `ref`'s own commit or one of
+   * its ancestors, e.g. to tell whether a deployed commit includes a merged merge request's
+   * `mergeCommit`. Both accept a full or unambiguously truncated commit id, a branch, or a tag;
+   * `ref` defaults to the default branch. Throws if either names no commit in this project.
+   */
+  containsCommit(commit: string, ref?: string): Promise<boolean>;
+
+  /**
    * Pushes a commit to a branch, setting the branch's head to `commitId` -- the way commits made
    * in a worktree get to GitLab. The branch is created if it does not exist.
    *
@@ -218,6 +226,14 @@ export interface GitLabProjectContributor {
   listCommits(options?: GitLabCommitFilter): Promise<Cursor<GitLabCommitSummary>>;
 
   /**
+   * Whether `ref`'s history contains `commit`: true when `commit` is `ref`'s own commit or one of
+   * its ancestors, e.g. to tell whether a deployed commit includes a merged merge request's
+   * `mergeCommit`. Both accept a full or unambiguously truncated commit id, a branch, or a tag;
+   * `ref` defaults to the default branch. Throws if either names no commit in this project.
+   */
+  containsCommit(commit: string, ref?: string): Promise<boolean>;
+
+  /**
    * Pushes a commit to a branch under the prefix, creating the branch if it does not exist.
    *
    * `commitId` must be a full 40-character commit id (e.g. a worktree `commit()` result). The
@@ -286,6 +302,11 @@ export type GitLabContributorMergeRequest = {
   targetBranch: string;
   /** Commit id of the source branch's head, when known. */
   headCommit: string | null;
+  /**
+   * The commit the merge left at the head of the target branch -- the merge commit, else the
+   * squash commit, else (a fast-forward merge) the merged head. Null until it is merged.
+   */
+  mergeCommit: string | null;
 }
 
 /**
@@ -606,6 +627,11 @@ export type GitLabMergeRequestSummary = GitLabIssuableSummary & {
   source: GitLabBranchRef;
   /** The branch the changes will be merged into. */
   target: GitLabBranchRef;
+  /**
+   * The commit the merge left at the head of the target branch -- the merge commit, else the
+   * squash commit, else (a fast-forward merge) the merged head. Absent until it is merged.
+   */
+  mergeCommit?: string;
 }
 
 /** Full merge request details returned by `GitLabMergeRequest.getDetails()`. */

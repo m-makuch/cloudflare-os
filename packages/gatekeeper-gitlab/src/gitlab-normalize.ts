@@ -299,6 +299,10 @@ export function parseChangesCount(value: string | null | undefined): { changedFi
  * differs from the target's (a merge request from a fork); the caller resolves it from
  * `source_project_id`, since the merge request object carries only the id.
  */
+function optionalCommit(sha: string | null | undefined): { mergeCommit?: string } {
+  return sha ? { mergeCommit: sha } : {};
+}
+
 export function normalizeMergeRequestSummary(
   instanceUrl: string,
   projectPath: string,
@@ -327,6 +331,10 @@ export function normalizeMergeRequestSummary(
     closedAt: parseDate(response.closed_at ?? response.merged_at),
     commentCount: response.user_notes_count,
     draft: response.draft,
+    // A merge commit sits on top of a squash commit when both are made; a fast-forward makes
+    // neither, leaving the (rebased) head at the target's tip.
+    ...(response.state === "merged" ? optionalCommit(
+      response.merge_commit_sha ?? response.squash_commit_sha ?? response.sha) : {}),
     source,
     target: {
       branch: response.target_branch,
