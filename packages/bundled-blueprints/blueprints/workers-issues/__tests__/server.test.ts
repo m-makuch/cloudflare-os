@@ -416,6 +416,8 @@ describe("Worker issue fixes", () => {
     expect(options.types).toMatch(/Scrub before committing/);
     expect(options.types).toMatch(/email addresses/);
     expect(options.types).toMatch(/Never merge it, deploy/);
+    // A description must not claim verification nobody performed.
+    expect(options.types).toMatch(/Report only verification you performed/);
 
     const task = fixture.fix.mock.calls[0]![0] as Task;
     const context = await task.getContext();

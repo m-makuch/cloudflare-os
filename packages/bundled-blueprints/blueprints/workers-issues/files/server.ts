@@ -123,7 +123,9 @@ interface Fixer {
    * 3. Otherwise mount the default branch's head of env.REPOSITORY (resolveRef(), then
    *    createWorktree) and make the smallest change that fixes the cause, plus a regression test
    *    that fails without the fix and passes with it, following the project's existing test
-   *    layout and conventions. If you cannot run the tests, say so in the description.
+   *    layout and conventions. When the cause is bad data from outside the repository, do not
+   *    mask it with a default that could be wrong for other inputs: derive the value from an
+   *    authoritative source, or reject the input with a clear error.
    * 4. Scrub before committing. Nothing derived from telemetry or the notification may appear in
    *    code, tests, fixtures, commit messages, or the description unless it is plainly not
    *    sensitive: no email addresses, names, usernames, user or customer ids, IP addresses,
@@ -136,6 +138,9 @@ interface Fixer {
    *    bodyMarkdown }), on GitHub createPullRequest({ title, head: fix.branch, bodyMarkdown }).
    *    The description states the symptom (without sensitive data), the root cause, the change,
    *    the test, how it was verified, and that Cloudflare OS generated it and it needs review.
+   *    Report only verification you performed. If you could not run the project's tests, say
+   *    so plainly; do not claim that CI will run them unless the repository shows a CI
+   *    configuration that runs on this branch.
    *    If a push or create fails, first list the requests from fix.branch
    *    (listMergeRequests({ sourceBranch }) / listPullRequests({ head })) -- it may already exist.
    * 6. task.reportChange() with the returned id and url, then task.complete() with your report. */
