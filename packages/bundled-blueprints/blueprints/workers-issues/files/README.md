@@ -9,8 +9,8 @@ The TypeScript sources (`client.ts`, `server.ts`, and `lib/`) build into the sel
 The inbox displays each logical notification separately, including repeated occurrences of the same
 issue. Refresh updates entries in place so unchanged reports keep their text selection. Notification
 receipt and optional AI enablement are displayed separately. Polls fetch summaries, full reports load
-when opened, and polling pauses while the tab is hidden. The UI restates Cloudflare's Kumo tokens
-(the sandboxed frame cannot load Kumo) and follows the viewer's light or dark scheme.
+when opened, and polling pauses while the tab is hidden. The UI restates the OS theme's Kumo tokens,
+including its orange brand and link colours (the sandboxed frame cannot load Kumo), and follows the viewer's light or dark scheme.
 
 This inbox accepts authenticated Real-Time Issues notifications only for its configured account
 and Worker. Connect it from the dashboard's Cloudflare OS destination setup and enable its

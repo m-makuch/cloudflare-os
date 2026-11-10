@@ -26,9 +26,9 @@ const style = el("style", {
   --text: light-dark(oklch(21% .006 285.885), oklch(97% 0 0));
   --strong: light-dark(oklch(14.5% 0 0), oklch(98.5% 0 0));
   --subtle: light-dark(oklch(55.6% 0 0), oklch(70.8% 0 0));
-  --link: light-dark(oklch(42.4% .199 265.638), oklch(70.7% .165 254.624));
+  --link: light-dark(#ff4801, #ff8a5c);
   --focus: light-dark(oklch(15% 0 0), oklch(93.5% 0 0));
-  --brand: light-dark(oklch(.5772 .2324 260), color-mix(in oklch, oklch(.5772 .2324 260), black 10%));
+  --brand: light-dark(#ff4801, #b84e00);
   --neutral-text: light-dark(oklch(26.9% 0 0), oklch(92.2% 0 0));
   --info: light-dark(oklch(42.4% .199 265.638), oklch(70.7% .165 254.624));
   --info-tint: light-dark(oklch(93.2% .032 255.6 / .45), oklch(38% .145 265.5 / .22));
