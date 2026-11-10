@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from "react";
-import { Banner, Button, Checkbox, Dialog, Input, LinkButton, Radio, Select, Switch } from "@cloudflare/kumo";
+import { Banner, Button, Checkbox, Dialog, Input, LinkButton, Select, Switch } from "@cloudflare/kumo";
 import type { AiChatAuthorInfo, GatekeeperVendorInfo } from "@gadgets/workshop-shared/api";
 import type { RpcStub } from "capnweb";
 import type { CloudflareAccountConfiguratorRpc } from "../../../../gatekeeper-cloudflare/src/configurator/cloudflare-configurator-types";
@@ -25,7 +25,7 @@ export const WorkersIssueSetupPage = ({ request }: { request: WorkersIssueSetupR
   // Opened from the inbox rather than handed off by the dashboard: nothing is reported back.
   const fromInbox = !request.dashboardOrigin;
   const remediation =
-    request.remediation ?? (fromInbox ? { approval: "ask" as const, allowPublic: false } : undefined);
+    request.remediation ?? (fromInbox ? { allowPublic: false } : undefined);
   const [fixesWanted, setFixesWanted] = useState(Boolean(request.remediation));
   const fixing = Boolean(remediation) && fixesWanted;
   const connection = useWorkersIssueConnections(
@@ -44,7 +44,6 @@ export const WorkersIssueSetupPage = ({ request }: { request: WorkersIssueSetupR
   // A user who came to investigate one notification has not asked for every later one.
   const [automatic, setAutomatic] = useState(!request.runKey);
   const [repositoryUrl, setRepositoryUrl] = useState(remediation?.repositoryUrl ?? "");
-  const [approval, setApproval] = useState<"ask" | "automatic">(remediation?.approval ?? "ask");
   const [allowPublic, setAllowPublic] = useState(remediation?.allowPublic ?? false);
   const [confirmingPublic, setConfirmingPublic] = useState(false);
   const [publicAcknowledged, setPublicAcknowledged] = useState(false);
@@ -166,7 +165,6 @@ export const WorkersIssueSetupPage = ({ request }: { request: WorkersIssueSetupR
             controller.signal,
           ),
           resourceUrl: repository.resourceUrl,
-          approval,
           allowPublic,
         };
         controller.signal.throwIfAborted();
@@ -346,8 +344,9 @@ export const WorkersIssueSetupPage = ({ request }: { request: WorkersIssueSetupR
                       <p className="text-sm text-kumo-subtle">
                         The fixer commits a fix and a regression test to a new branch starting with{" "}
                         <code>{FIX_BRANCH_PREFIX}</code> and opens a pull or merge request into the
-                        default branch. It cannot merge, push to other branches, or deploy: you
-                        review and merge, and your CI deploys. Fixes are written from production
+                        default branch, without asking you again: enabling fixes approves them. It
+                        cannot merge, push to other branches, or deploy: the pull or merge request
+                        is your review, you merge, and your CI deploys. Fixes are written from production
                         telemetry and notification text, which can contain personal data or
                         attacker-controlled content; the fixer is instructed to leave such data out,
                         but review every change before merging.
@@ -376,25 +375,16 @@ export const WorkersIssueSetupPage = ({ request }: { request: WorkersIssueSetupR
                             : undefined
                         }
                       />
-                      <Radio.Group
-                        legend="Before each push and pull or merge request"
-                        value={approval}
-                        disabled={busy}
-                        onValueChange={(value) => setApproval(value === "automatic" ? "automatic" : "ask")}
-                      >
-                        <Radio.Item label="Ask me in the workspace (recommended)" value="ask" />
-                        <Radio.Item label="Push and open it automatically" value="automatic" />
-                      </Radio.Group>
                       <Switch
                         label="Allow public repositories"
                         checked={allowPublic}
                         disabled={busy}
                         onClick={() => (allowPublic ? setAllowPublic(false) : setConfirmingPublic(true))}
                       />
-                      {allowPublic && approval === "automatic" && (
+                      {allowPublic && (
                         <Banner
                           variant="alert"
-                          description="With a public repository and automatic approval, each proposed change, and anything it contains, becomes public without your review."
+                          description="With a public repository, each proposed change, and anything it contains, becomes public as soon as it is pushed, before you review it."
                         />
                       )}
                     </>

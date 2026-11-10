@@ -71,8 +71,10 @@ from its branch: one found there is shown instead of attempted again.
 
 The fixer's instructions require scrubbing personal and secret data from code, tests, commit
 messages, and descriptions before committing. Nothing is merged or deployed by the inbox or the
-fixer: a person merges, and the project's CI deploys. Whether each push and request waits for a
-person is the workspace's approval setting for the repository binding, chosen at setup.
+fixer: a person merges, and the project's CI deploys. Enabling fixes at setup is the approval of
+every later push and request, so setup auto-approves the repository binding's push and request
+kinds, and the request itself is the review. A push still waits (`push_pending`) if a workspace
+editor removes those rules, or once the workspace has read restricted data, when no rule fires.
 
 ## Following a fix to production
 

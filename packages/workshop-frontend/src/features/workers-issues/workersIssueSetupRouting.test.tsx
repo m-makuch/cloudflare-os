@@ -35,7 +35,7 @@ const request: WorkersIssueSetupRequest = {
   issueId: "issue-1",
   dashboardOrigin: "https://dash.cloudflare.com",
   investigation: { workspaceId: "b".repeat(64), destinationId: "destination-1" },
-  remediation: { approval: "ask", allowPublic: false, repositoryUrl: "https://github.com/acme/widgets" },
+  remediation: { allowPublic: false, repositoryUrl: "https://github.com/acme/widgets" },
 };
 
 let received: WorkersIssueSetupRequest | undefined | "unset" = "unset";

@@ -1,12 +1,12 @@
 export const WORKERS_ISSUE_SETUP_PARAM = "workers_issue_setup";
 
 /**
- * What the dashboard asks for when the user opted into fixes: whether each push and merge or pull
- * request waits for approval, whether public repositories are allowed, and the repository Workers
- * Builds deploys from, to prefill. The OS page shows each choice again before applying it.
+ * What the dashboard asks for when the user opted into fixes: whether public repositories are
+ * allowed, and the repository Workers Builds deploys from, to prefill. The OS page shows each
+ * choice again before applying it. Enabling fixes there is the user's approval of every later push
+ * and request, so there is no per-change choice.
  */
 export type WorkersIssueRemediationRequest = {
-  approval: "ask" | "automatic";
   allowPublic: boolean;
   repositoryUrl?: string;
 };
@@ -33,17 +33,17 @@ export type WorkersIssueSetupRequest = {
 
 const parseRemediation = (value: unknown): WorkersIssueRemediationRequest | null => {
   if (typeof value !== "object" || value === null) return null;
-  const { approval, allowPublic, repositoryUrl } = value as Record<string, unknown>;
-  if ((approval !== "ask" && approval !== "automatic") || typeof allowPublic !== "boolean")
-    return null;
-  if (repositoryUrl === undefined) return { approval, allowPublic };
+  // A dashboard released before approval moved to setup may still send `approval`; it is ignored.
+  const { allowPublic, repositoryUrl } = value as Record<string, unknown>;
+  if (typeof allowPublic !== "boolean") return null;
+  if (repositoryUrl === undefined) return { allowPublic };
   if (typeof repositoryUrl !== "string" || repositoryUrl.length > 300) return null;
   try {
     if (new URL(repositoryUrl).protocol !== "https:") return null;
   } catch {
     return null;
   }
-  return { approval, allowPublic, repositoryUrl };
+  return { allowPublic, repositoryUrl };
 };
 
 /**

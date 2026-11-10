@@ -8,13 +8,15 @@ import type {
 import type { WorkerIssueInbox } from "../../../../bundled-blueprints/blueprints/workers-issues/files/protocol";
 import type { WorkersIssueSetupRequest } from "./workersIssueSetup";
 
-/** What fixes need: the repository's contributor binding and the approval the user chose. */
+/**
+ * What fixes need: the repository's contributor binding. Enabling fixes is the user's approval of
+ * the fixer's pushes and requests, so they are auto-approved.
+ */
 export type WorkersIssueFixSetup = {
   /** The connected git account to create the binding with. */
   accountId: number;
   /** The contributor binding URL (see `resolveContributorRepository`). */
   resourceUrl: string;
-  approval: "ask" | "automatic";
   allowPublic: boolean;
 };
 
@@ -204,13 +206,11 @@ export const provisionWorkersIssueInbox = async (
       );
       if (!resolving) throw new Error("Resolving this Worker's issues could not be approved.");
       if (!resolving.alreadyEnabled) await workspace.setAutoApprovedActionKind(releasesId, resolving.actionKind);
-      if (fix.approval === "automatic") {
-        // Only the kinds the repository binding offers: pushing (never force) and opening a
-        // merge or pull request. Merging is never auto-approvable.
-        for (const offered of offers) {
-          if (offered.gatekeeperId === repositoryId && !offered.alreadyEnabled)
-            await workspace.setAutoApprovedActionKind(repositoryId, offered.actionKind);
-        }
+      // Only the kinds the repository binding offers: pushing (never force, only to its prefix)
+      // and opening a merge or pull request. Merging is never auto-approvable; it stays a person's.
+      for (const offered of offers) {
+        if (offered.gatekeeperId === repositoryId && !offered.alreadyEnabled)
+          await workspace.setAutoApprovedActionKind(repositoryId, offered.actionKind);
       }
       await configuredInbox.enableFixes();
       // Without them the inbox still follows releases whenever it is opened, so fixes stand.

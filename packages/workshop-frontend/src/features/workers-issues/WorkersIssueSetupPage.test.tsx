@@ -47,7 +47,7 @@ const render = async (
     investigationsEnabled?: boolean;
     bindFailure?: boolean;
     spawnerFailure?: boolean;
-    remediation?: { approval: "ask" | "automatic"; allowPublic: boolean; repositoryUrl?: string };
+    remediation?: { allowPublic: boolean; repositoryUrl?: string };
     publicRepository?: boolean;
     restricted?: boolean;
     /** Opened from the inbox: no dashboard origin, optionally for one stored notification. */
@@ -533,13 +533,12 @@ const switchLabelled = (text: string) =>
 
 describe("Worker issue fixes", () => {
   const remediation = {
-    approval: "ask" as const,
     allowPublic: false,
     repositoryUrl: "https://github.com/acme/checkout",
   };
   const CONTRIBUTOR = "https://github.com/:owner/:repo\\?branchPrefix=*";
 
-  it("connects a contributor repository for the fixer and inbox, enabling fixes with approval required", async () => {
+  it("connects a contributor repository for the fixer and inbox, approving its pushes and requests at setup", async () => {
     const fixture = await render({ investigation: true, investigationsEnabled: true, remediation });
     expect(container!.textContent).toContain("Enable AI fixes");
     expect(container!.textContent).toContain("GitHub · acme/checkout");
@@ -560,9 +559,11 @@ describe("Worker issue fixes", () => {
     expect(fixture.gadget.bind).toHaveBeenCalledWith("REPOSITORY", 8);
     expect(fixture.inbox.enableInvestigations).toHaveBeenCalled();
     expect(fixture.inbox.enableFixes).toHaveBeenCalled();
-    // Pushes and requests still wait for approval.
+    // Only the repository binding's push and request kinds, and resolving the Worker's issues.
     expect(fixture.workspace.setAutoApprovedActionKind.mock.calls).toEqual([
       [10, { tag: "resolve-worker-issue", label: "Resolve Worker issues" }],
+      [8, { tag: "github.push", label: "Push commits" }],
+      [8, { tag: "github.createPullRequest", label: "Create pull requests" }],
     ]);
     const posted = fixture.completion();
     expect(posted).toHaveBeenCalledWith(
@@ -628,20 +629,6 @@ describe("Worker issue fixes", () => {
       "Resolving this Worker's issues could not be approved",
     );
     expect(fixture.inbox.enableFixes).not.toHaveBeenCalled();
-  });
-
-  it("auto-approves only the repository binding's push and request kinds in automatic mode", async () => {
-    const fixture = await render({
-      investigation: true,
-      investigationsEnabled: true,
-      remediation: { ...remediation, approval: "automatic" },
-    });
-    await act(async () => fixture.submit().click());
-    expect(fixture.workspace.setAutoApprovedActionKind.mock.calls).toEqual([
-      [10, { tag: "resolve-worker-issue", label: "Resolve Worker issues" }],
-      [8, { tag: "github.push", label: "Push commits" }],
-      [8, { tag: "github.createPullRequest", label: "Create pull requests" }],
-    ]);
   });
 
   it("refuses a public repository unless allowed, removing everything it created", async () => {
