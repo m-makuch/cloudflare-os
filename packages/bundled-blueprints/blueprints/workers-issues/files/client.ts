@@ -10,66 +10,110 @@ import type {
 // The Workshop iframe bootstrap supplies the RPC stub before this module runs.
 declare const gadget: WorkerIssueInbox;
 
+// The look follows Cloudflare's Kumo design system, which the dashboard and the Workshop use. The
+// sandboxed frame cannot load Kumo, so its tokens (theme-kumo.css) and the Button, Badge and
+// Banner variants are restated here; light-dark() follows the viewer's colour scheme.
 const style = el("style", {
   text: `
-:root { color-scheme: light dark; }
+:root {
+  color-scheme: light dark;
+  --base: light-dark(#fff, oklch(17% 0 0));
+  --elevated: light-dark(oklch(98% 0 0), oklch(12% 0 0));
+  --tint: light-dark(oklch(97% 0 0), oklch(26.9% 0 0));
+  --fill: light-dark(oklch(92.2% 0 0), oklch(26.9% 0 0));
+  --line: light-dark(oklch(14.5% 0 0 / .1), oklch(32% 0 0));
+  --hairline: light-dark(oklch(93.5% 0 0), oklch(26.9% 0 0));
+  --text: light-dark(oklch(21% .006 285.885), oklch(97% 0 0));
+  --strong: light-dark(oklch(14.5% 0 0), oklch(98.5% 0 0));
+  --subtle: light-dark(oklch(55.6% 0 0), oklch(70.8% 0 0));
+  --link: light-dark(oklch(42.4% .199 265.638), oklch(70.7% .165 254.624));
+  --focus: light-dark(oklch(15% 0 0), oklch(93.5% 0 0));
+  --brand: light-dark(oklch(.5772 .2324 260), color-mix(in oklch, oklch(.5772 .2324 260), black 10%));
+  --neutral-text: light-dark(oklch(26.9% 0 0), oklch(92.2% 0 0));
+  --info: light-dark(oklch(42.4% .199 265.638), oklch(70.7% .165 254.624));
+  --info-tint: light-dark(oklch(93.2% .032 255.6 / .45), oklch(38% .145 265.5 / .22));
+  --success: light-dark(oklch(43.2% .095 166.913), oklch(90.5% .093 164.15));
+  --success-tint: light-dark(oklch(96.2% .043 156.7 / .57), oklch(39.3% .096 152.3 / .2));
+  --warning: light-dark(oklch(59.7% .144 57.5), oklch(75% .183 55.934));
+  --warning-tint: light-dark(oklch(93.1% .107 94.6 / .2), oklch(35.3% .079 65 / .37));
+  --danger: light-dark(oklch(50.5% .213 27.518), oklch(70.4% .191 22.216));
+  --danger-tint: light-dark(oklch(93.6% .032 17.7 / .42), oklch(42.9% .176 28.7 / .17));
+  --shadow-xs: 0 1px 2px 0 rgb(0 0 0 / .05);
+}
 * { box-sizing: border-box; }
-html, body { margin: 0; min-height: 100%; background: Canvas; color: CanvasText; }
-body { font: 13.5px/1.5 ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif; }
+html, body { margin: 0; min-height: 100%; background: var(--base); color: var(--text); }
+body { font: 14px/1.5 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", "Noto Sans", Arial, sans-serif; -webkit-font-smoothing: antialiased; }
 button { font: inherit; }
-:focus-visible { outline: 2px solid Highlight; outline-offset: 3px; }
+:focus-visible { outline: 2px solid var(--brand); outline-offset: 2px; }
 .inbox { max-width: 1000px; margin: 0 auto; padding: 28px; }
 .header, .entry-header, .summary { display: flex; align-items: center; justify-content: space-between; gap: 16px; }
-.header { align-items: flex-start; padding-bottom: 20px; border-bottom: 1px solid color-mix(in srgb, CanvasText 18%, Canvas); }
-h1 { margin: 0; font-size: 22px; font-weight: 650; letter-spacing: -.02em; }
-h2 { margin: 0; font-size: 15px; font-weight: 600; overflow-wrap: anywhere; }
+.header { align-items: flex-start; }
+h1 { margin: 0; font-size: 20px; font-weight: 600; color: var(--strong); }
+h2 { margin: 0; font-size: 14px; font-weight: 600; color: var(--strong); font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace; overflow-wrap: anywhere; }
 p { margin: 0; }
-.scope, .metadata, .updated, .description { color: GrayText; }
-.scope { margin-top: 4px; overflow-wrap: anywhere; }
-.refresh { flex-shrink: 0; padding: 7px 12px; border: 1px solid ButtonBorder; border-radius: 6px; background: ButtonFace; color: ButtonText; cursor: pointer; }
-.refresh:hover { background: color-mix(in srgb, ButtonFace 90%, ButtonText); }
-.refresh:disabled { opacity: .6; cursor: wait; }
-a.refresh { display: inline-block; text-decoration: none; }
-.actions { display: flex; flex-wrap: wrap; gap: 8px; }
-.entry .actions { margin-top: 12px; }
-.mode { display: flex; flex-wrap: wrap; align-items: center; gap: 8px 12px; margin: 20px 0 8px; }
-.badge { display: inline-flex; align-items: center; gap: 6px; flex-shrink: 0; padding: 3px 9px; border: 1px solid color-mix(in srgb, CanvasText 24%, Canvas); border-radius: 999px; font-size: 12px; font-weight: 550; }
-.badge::before { content: ""; width: 6px; height: 6px; border-radius: 50%; background: currentColor; }
-.badge[data-status="received"]::before { background: transparent; border: 1px solid currentColor; }
-.badge[data-status="delivery_unknown"] { border-style: dashed; }
-.badge[data-status="completed"], .badge[data-status="change_opened"] { font-weight: 700; }
-.badge[data-status="fix_unknown"] { border-style: dashed; }
-.change { display: inline-block; margin-top: 10px; color: LinkText; overflow-wrap: anywhere; }
-.description { max-width: 76ch; font-size: 13px; }
-.summary { margin: 24px 0 12px; flex-wrap: wrap; font-size: 12px; }
+.scope, .metadata, .updated, .description { color: var(--subtle); }
+.scope { margin-top: 2px; font-size: 13px; overflow-wrap: anywhere; }
+.btn {
+  display: inline-flex; align-items: center; justify-content: center; flex-shrink: 0; height: 36px; padding: 0 12px 2px;
+  border: 0; border-radius: 8px; font-size: 14px; font-weight: 500; line-height: 1; text-decoration: none; white-space: nowrap; cursor: pointer;
+  background: var(--base); color: var(--text); box-shadow: 0 0 0 1px var(--line), var(--shadow-xs);
+}
+.btn:hover:not(:disabled) { background: var(--tint); }
+.btn:disabled { cursor: not-allowed; opacity: .7; }
+.btn.primary {
+  --ring: color-mix(in oklch, var(--brand), black 10%); --top: color-mix(in oklch, var(--brand), white 30%);
+  color: #fff; background: linear-gradient(to bottom, color-mix(in oklch, var(--brand), white 15%), var(--brand));
+  box-shadow: 0 0 0 1px var(--ring), inset 0 1px 0 0 var(--top), var(--shadow-xs);
+}
+.btn.primary:hover:not(:disabled) { background: linear-gradient(to bottom, var(--top), var(--brand)); }
+.btn.primary:disabled { opacity: .5; }
+.btn.ghost { background: transparent; box-shadow: none; }
+.btn.ghost:hover:not(:disabled) { background: var(--tint); }
+.actions { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; }
+.setup { margin-top: 20px; padding: 16px; border-radius: 8px; background: var(--elevated); box-shadow: 0 0 0 1px var(--hairline); }
+.setup .actions { margin-top: 14px; }
+.setup .description { margin-top: 10px; }
+.mode { display: flex; flex-wrap: wrap; align-items: center; gap: 6px 10px; }
+.mode-description { color: var(--text); }
+.badge { display: inline-flex; align-items: center; gap: 6px; flex-shrink: 0; padding: 2px 8px; border-radius: 999px; font-size: 12px; font-weight: 500; line-height: 16px; white-space: nowrap; background: var(--fill); color: var(--neutral-text); }
+.badge::before { content: ""; width: 7px; height: 7px; border-radius: 50%; background: currentColor; }
+.badge[data-tone="info"] { background: var(--info-tint); color: var(--info); }
+.badge[data-tone="success"] { background: var(--success-tint); color: var(--success); }
+.badge[data-tone="warning"] { background: var(--warning-tint); color: var(--warning); }
+.badge[data-tone="danger"] { background: var(--danger-tint); color: var(--danger); }
+.change { display: inline-block; margin-top: 10px; color: var(--link); font-weight: 500; overflow-wrap: anywhere; }
+.description { max-width: 80ch; font-size: 13px; }
+.summary { margin: 24px 0 12px; flex-wrap: wrap; font-size: 13px; color: var(--subtle); }
 .updated { font-variant-numeric: tabular-nums; }
-.notice { padding: 12px 14px; margin-bottom: 12px; border: 1px solid ButtonBorder; border-radius: 8px; }
+.notice { padding: 12px 14px; margin-top: 16px; border-radius: 8px; background: var(--danger-tint); color: var(--danger); box-shadow: 0 0 0 1px color-mix(in oklch, var(--danger), transparent 75%); }
 [hidden] { display: none !important; }
 .entries { display: grid; gap: 12px; }
-.entry { min-width: 0; padding: 18px; border: 1px solid color-mix(in srgb, CanvasText 18%, Canvas); border-radius: 8px; }
+.entry { min-width: 0; padding: 16px; border-radius: 8px; background: var(--base); box-shadow: 0 0 0 1px var(--line), var(--shadow-xs); }
 .entry-header { align-items: flex-start; flex-wrap: wrap; gap: 8px 16px; }
-.metadata { display: block; margin-top: 4px; font-size: 12px; }
-.report { margin: 16px 0 0; padding-top: 14px; border-top: 1px solid color-mix(in srgb, CanvasText 12%, Canvas); font: inherit; line-height: 1.65; white-space: pre-wrap; overflow-wrap: anywhere; }
-.report.placeholder { color: GrayText; font-size: 13px; }
-.empty { padding: 40px 20px; border: 1px dashed color-mix(in srgb, CanvasText 24%, Canvas); border-radius: 8px; text-align: center; }
-.empty p { max-width: 55ch; margin: 8px auto 0; color: GrayText; }
+.metadata { display: block; margin-top: 2px; font-size: 13px; }
+.entry .actions { margin-top: 14px; }
+.actions:not(:has(> :not([hidden]))) { display: none; }
+.report { margin: 14px 0 0; padding-top: 14px; border-top: 1px solid var(--hairline); font: inherit; line-height: 1.6; white-space: pre-wrap; overflow-wrap: anywhere; }
+.report.placeholder { color: var(--subtle); font-size: 13px; }
+.empty { padding: 40px 20px; border-radius: 8px; background: var(--elevated); box-shadow: 0 0 0 1px var(--hairline); text-align: center; }
+.empty h2 { font-family: inherit; }
+.empty p { max-width: 55ch; margin: 6px auto 0; color: var(--subtle); font-size: 13px; }
 @media (max-width: 580px) {
   .inbox { padding: 18px 14px; }
   .header { flex-wrap: wrap; }
-  .entry { padding: 14px; }
-  h1 { font-size: 20px; }
+  .entry, .setup { padding: 14px; }
 }
-@media (pointer: coarse) { .refresh { min-height: 44px; } }
+@media (pointer: coarse) { .btn { min-height: 44px; } }
 `,
 });
 document.head.append(style);
 
 const scope = el("p", { class: "scope", text: "Loading Worker scope…" });
-const refresh = el("button", { class: "refresh", type: "button", text: "Refresh inbox" });
+const refresh = el("button", { class: "btn", type: "button", text: "Refresh inbox" });
 const mode = el("span", { class: "badge", text: "Loading setup…" });
-const modeDescription = el("span");
-const setupLink = el("a", { class: "refresh", target: "_blank", rel: "noopener noreferrer", hidden: true });
-const automaticToggle = el("button", { class: "refresh", type: "button", hidden: true });
+const modeDescription = el("span", { class: "mode-description" });
+const setupLink = el("a", { class: "btn", target: "_blank", rel: "noopener noreferrer", hidden: true });
+const automaticToggle = el("button", { class: "btn", type: "button", hidden: true });
 const description = el("p", { class: "description" });
 const summary = el("p", { role: "status", text: "Loading inbox…" });
 const updated = el("time", { class: "updated" });
@@ -85,11 +129,13 @@ document.body.replaceChildren(
       el("div", {}, [el("h1", { text: "Worker issue inbox" }), scope]),
       refresh,
     ]),
-    el("div", { class: "mode" }, [mode, modeDescription]),
-    el("div", { class: "actions" }, [setupLink, automaticToggle]),
-    description,
-    el("div", { class: "summary" }, [summary, updated]),
+    el("section", { class: "setup", "aria-label": "AI setup" }, [
+      el("div", { class: "mode" }, [mode, modeDescription]),
+      description,
+      el("div", { class: "actions" }, [setupLink, automaticToggle]),
+    ]),
     error,
+    el("div", { class: "summary" }, [summary, updated]),
     empty,
     entries,
   ]),
@@ -108,6 +154,24 @@ const STATUS_LABELS: Record<InvestigationStatus, string> = {
   push_pending: "Waiting for your approval",
   change_opened: "Change proposed",
   fix_unknown: "Fix delivery unconfirmed",
+};
+
+type Tone = "neutral" | "info" | "success" | "warning" | "danger";
+
+/** The Kumo badge variant for each status: work in progress, done, waiting on you, failed. */
+const STATUS_TONES: Record<InvestigationStatus, Tone> = {
+  received: "neutral",
+  pending: "info",
+  failed: "danger",
+  allocating: "info",
+  dispatching: "info",
+  queued: "info",
+  delivery_unknown: "warning",
+  completed: "success",
+  fixing: "info",
+  push_pending: "warning",
+  change_opened: "success",
+  fix_unknown: "warning",
 };
 
 /** What the git host calls a proposed change. */
@@ -229,11 +293,11 @@ function renderEntries(runs: InvestigationSummary[]): void {
       const time = el("time", { class: "metadata" });
       const badge = el("span", { class: "badge" });
       const report = el("pre", { class: "report" });
-      const readReport = el("button", { class: "refresh", type: "button", text: "Read report" });
-      const retry = el("button", { class: "refresh", type: "button", text: "Retry investigation" });
-      const investigate = el("button", { class: "refresh", type: "button", text: "Investigate" });
+      const readReport = el("button", { class: "btn", type: "button", text: "Read report" });
+      const retry = el("button", { class: "btn", type: "button", text: "Retry investigation" });
+      const investigate = el("button", { class: "btn primary", type: "button", text: "Investigate" });
       const investigateLink = el("a", {
-        class: "refresh",
+        class: "btn primary",
         target: "_blank",
         rel: "noopener noreferrer",
         text: "Set up and investigate",
@@ -314,6 +378,7 @@ function renderEntries(runs: InvestigationSummary[]): void {
     view.time.dateTime = new Date(run.created_at).toISOString();
     setText(view.badge, STATUS_LABELS[run.status] ?? "Unknown status");
     view.badge.dataset.status = run.status;
+    view.badge.dataset.tone = STATUS_TONES[run.status] ?? "neutral";
     if (!view.reportLoaded) {
       setText(view.report, reportText(run));
       view.report.hidden = run.has_report;
@@ -385,8 +450,12 @@ async function render(): Promise<void> {
           ? `New issue notifications ${fixes ? "can " : ""}${run}.`
           : `Notifications are stored. Investigate any of them to ${run}.`,
     );
+    mode.dataset.tone = !ready ? "neutral" : automatic ? "success" : "info";
     setLink(setupLink, setupUrl());
     setText(setupLink, ready ? "Change AI setup" : "Set up AI investigations");
+    // Setting up is the inbox's one next step until an investigator is bound; then it is secondary.
+    setupLink.classList.toggle("primary", !ready);
+    setupLink.classList.toggle("ghost", ready);
     automaticToggle.hidden = !ready;
     setText(automaticToggle, automatic ? "Stop automatic investigations" : "Investigate new notifications automatically");
     setText(
@@ -426,6 +495,7 @@ async function render(): Promise<void> {
       empty.hidden = true;
       setText(scope, "Worker scope unavailable");
       setText(mode, "Setup unavailable");
+      mode.dataset.tone = "danger";
       setText(summary, "Inbox unavailable.");
     }
   } finally {
