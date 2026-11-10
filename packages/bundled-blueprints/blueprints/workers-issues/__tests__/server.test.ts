@@ -418,6 +418,9 @@ describe("Worker issue fixes", () => {
     expect(options.types).toMatch(/Never merge it, deploy/);
     // A description must not claim verification nobody performed.
     expect(options.types).toMatch(/Report only verification you performed/);
+    // The request is the only review: edits go in an in-memory worktree, never the mount.
+    expect(options.types).toMatch(/env\.GIT\.newWorktree\(base\)/);
+    expect(options.types).toMatch(/never write to or\s+\*\s+commit on that mount/);
 
     const task = fixture.fix.mock.calls[0]![0] as Task;
     const context = await task.getContext();

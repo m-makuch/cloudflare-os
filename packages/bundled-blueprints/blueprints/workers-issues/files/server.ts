@@ -120,22 +120,29 @@ interface Fixer {
    *    before filtering; use bounded reads.
    * 2. If you cannot identify the root cause with confidence, or the fix is not a small, local
    *    code change, do not push: call task.complete() with your diagnosis and stop.
-   * 3. Otherwise mount the default branch's head of env.REPOSITORY (resolveRef(), then
-   *    createWorktree) and make the smallest change that fixes the cause, plus a regression test
-   *    that fails without the fix and passes with it, following the project's existing test
-   *    layout and conventions. When the cause is bad data from outside the repository, do not
-   *    mask it with a default that could be wrong for other inputs: derive the value from an
-   *    authoritative source, or reject the input with a clear error.
+   * 3. Otherwise read the default branch's head of env.REPOSITORY: resolveRef() gives its commit
+   *    id (\`base\`). You may mount it with createWorktree to read and grep, but never write to or
+   *    commit on that mount: its edits become workspace changes someone must accept, and the
+   *    merge or pull request is the only review this fix needs. Make every change in an in-memory
+   *    worktree inside executeCode instead -- \`const wt = await env.GIT.newWorktree(base)\`, then
+   *    wt.readFile / wt.writeFile / wt.deleteFile -- and finish the edit, review and commit in that
+   *    same call, since uncommitted edits are lost when it returns. To revise, start again from
+   *    \`base\` so the branch carries one commit. Make the smallest change that fixes the cause,
+   *    plus a regression test that fails without the fix and passes with it, following the
+   *    project's existing test layout and conventions. When the cause is bad data from outside
+   *    the repository, do not mask it with a default that could be wrong for other inputs: derive
+   *    the value from an authoritative source, or reject the input with a clear error.
    * 4. Scrub before committing. Nothing derived from telemetry or the notification may appear in
    *    code, tests, fixtures, commit messages, or the description unless it is plainly not
    *    sensitive: no email addresses, names, usernames, user or customer ids, IP addresses,
    *    request or response bodies, headers, cookies, URLs with query strings, tokens, API keys,
    *    passwords, secrets, or account ids. Use synthetic placeholders (user@example.com,
-   *    203.0.113.7, "test-token"). Review the full diff and the message for such data before
-   *    you commit, and again before you push.
-   * 5. Commit, then env.REPOSITORY.push(fix.branch, commitId). Then open the request into the
-   *    default branch: on GitLab createMergeRequest({ title, sourceBranch: fix.branch,
-   *    bodyMarkdown }), on GitHub createPullRequest({ title, head: fix.branch, bodyMarkdown }).
+   *    203.0.113.7, "test-token"). Review the full diff (wt.diff(base)) and the message for such
+   *    data before you commit, and again before you push.
+   * 5. \`const commitId = await wt.commit(message)\`, then env.REPOSITORY.push(fix.branch, commitId).
+   *    Then open the request into the default branch: on GitLab createMergeRequest({ title,
+   *    sourceBranch: fix.branch, bodyMarkdown }), on GitHub createPullRequest({ title,
+   *    head: fix.branch, bodyMarkdown }).
    *    The description states the symptom (without sensitive data), the root cause, the change,
    *    the test, how it was verified, and that Cloudflare OS generated it and it needs review.
    *    Report only verification you performed. If you could not run the project's tests, say
