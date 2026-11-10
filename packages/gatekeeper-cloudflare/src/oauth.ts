@@ -10,7 +10,10 @@ const CF_OAUTH_TOKEN_URL = "https://dash.cloudflare.com/oauth2/token";
 import {
   createPkce, isInvalidGrant, OAuthClient, OAuthResponseError, type OAuthTokens,
 } from "@gadgets/gatekeeper-kit/oauth-client";
-import { observabilityScopesForResources, NOTIFICATIONS_RESOURCE, NOTIFICATIONS_SCOPE } from "./resources.js";
+import {
+  observabilityScopesForResources, NOTIFICATIONS_RESOURCE, NOTIFICATIONS_SCOPE,
+  WORKER_RELEASES_RESOURCE, WORKER_RELEASES_SCOPES,
+} from "./resources.js";
 
 /**
  * Scopes for the AI Gateway billing/BYOK flow: read account details and route inference
@@ -26,15 +29,22 @@ export const BILLING_SCOPES = [
   "account-settings.read",
 ];
 
-/** Persistent billing scopes plus the explicitly selected gadget resources. */
+/**
+ * Persistent billing scopes plus the explicitly selected gadget resources. Notifications and Worker
+ * releases are opt-in: an omitted list ("all resource types") requests neither, since both carry
+ * write scopes.
+ */
 export function persistentScopesForResources(resourceUrlPatterns?: string[]): string[] {
-  return [
+  const optIn = [NOTIFICATIONS_RESOURCE.urlPattern, WORKER_RELEASES_RESOURCE.urlPattern];
+  return [...new Set([
     ...BILLING_SCOPES,
     ...observabilityScopesForResources(resourceUrlPatterns?.filter(
-      pattern => pattern !== NOTIFICATIONS_RESOURCE.urlPattern)),
+      pattern => !optIn.includes(pattern))),
+    ...(resourceUrlPatterns?.includes(WORKER_RELEASES_RESOURCE.urlPattern)
+      ? WORKER_RELEASES_SCOPES : []),
     ...(resourceUrlPatterns?.includes(NOTIFICATIONS_RESOURCE.urlPattern)
       ? [NOTIFICATIONS_SCOPE] : []),
-  ];
+  ])];
 }
 
 /**

@@ -1,10 +1,12 @@
 import { OAuthResponseError } from "@gadgets/gatekeeper-kit/oauth-client";
 import { afterEach, describe, expect, it, vi } from "vitest";
+import { WORKER_RELEASES_RESOURCE } from "../src/resources";
 import {
   buildAuthorizeUrl,
   exchangeCode,
   generatePkce,
   isGrantDeath,
+  persistentScopesForResources,
   refreshTokens,
   type CloudflareOAuthConfig,
 } from "../src/oauth";
@@ -181,5 +183,17 @@ describe("isGrantDeath", () => {
     vi.stubGlobal("fetch", vi.fn(async () => respond()));
 
     expect(isGrantDeath(await rejection(refreshTokens(config, "refresh")))).toBe(dead);
+  });
+});
+
+describe("persistentScopesForResources", () => {
+  it("asks for the Worker releases scopes, write included, only for that resource", async () => {
+    const url = new URL(buildAuthorizeUrl(config, "state-1", "challenge-1",
+      persistentScopesForResources([WORKER_RELEASES_RESOURCE.urlPattern])));
+
+    expect(url.searchParams.get("scope")!.split(" ")).toEqual(expect.arrayContaining([
+      "workers-scripts.read", "workers-ci.read", "workers-observability.read", "workers-observability.write",
+    ]));
+    expect(persistentScopesForResources([])).not.toContain("workers-scripts.read");
   });
 });

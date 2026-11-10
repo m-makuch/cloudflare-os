@@ -6,6 +6,7 @@ import {
   type ObservabilityFilter,
 } from "../src/observability-api";
 import { CloudflareObservabilityApiError } from "../src/observability-parse";
+import { CloudflareWorkerReleasesApi } from "../src/releases-api";
 
 const ACCOUNT_ID = "0123456789abcdef0123456789abcdef";
 const TEST_NOW = new Date("2026-08-14T12:00:00Z");
@@ -1171,5 +1172,300 @@ describe("indexed field names", () => {
       { kind: "filter", key: "$metadata.service", operation: "eq", type: "string", value: "api-worker" },
       { kind: "filter", key: "event", operation: "eq", type: "string", value: "x" },
     ]);
+  });
+});
+
+const VERSION_A = "aaaaaaaa-0000-4000-8000-000000000001";
+const VERSION_B = "bbbbbbbb-0000-4000-8000-000000000002";
+const VERSION_C = "cccccccc-0000-4000-8000-000000000003";
+const BUILD_A = "dddddddd-0000-4000-8000-000000000004";
+const BUILD_B = "eeeeeeee-0000-4000-8000-000000000005";
+const API = `https://api.cloudflare.com/client/v4/accounts/${ACCOUNT_ID}`;
+
+type Routed = { method: string; url: URL; body?: unknown };
+
+/** Stubs Cloudflare by `METHOD path` (path below the account), recording every request. */
+function routeCloudflare(routes: Record<string, (request: Routed) => Response>): Routed[] {
+  const requests: Routed[] = [];
+  vi.stubGlobal("fetch", vi.fn(async (input: string, init: RequestInit) => {
+    const url = new URL(input);
+    const request = {
+      method: init.method ?? "GET", url, ...(init.body ? { body: JSON.parse(String(init.body)) } : {}),
+    };
+    requests.push(request);
+    const path = url.pathname.slice(new URL(API).pathname.length);
+    const route = routes[`${request.method} ${path}`];
+    if (!route) return Response.json({ success: false, errors: [{ code: 7003, message: "No route" }] }, { status: 404 });
+    return route(request);
+  }));
+  return requests;
+}
+
+const ok = (result: unknown) => Response.json({ success: true, result });
+
+const deploymentsRoute = () => ok({
+  deployments: [
+    {
+      id: "dep-2", source: "wrangler", strategy: "percentage", author_email: "dev@example.com",
+      annotations: { "workers/triggered_by": "deployment", "workers/message": "Gradual rollout" },
+      versions: [{ version_id: VERSION_A, percentage: 90 }, { version_id: VERSION_B, percentage: 10 }],
+      created_on: "2026-08-14T11:00:00Z",
+    },
+    {
+      id: "dep-1", source: "api", strategy: "percentage",
+      annotations: { "workers/triggered_by": "upload" },
+      versions: [{ version_id: VERSION_C, percentage: 100 }],
+      created_on: "2026-08-13T11:00:00Z",
+    },
+  ],
+});
+
+const versionRoutes = {
+  [`GET /workers/scripts/api-worker/versions/${VERSION_A}`]: () => ok({
+    id: VERSION_A, number: 3, metadata: { created_on: "2026-08-14T10:59:00Z", source: "wrangler" },
+    annotations: { "workers/tag": "abc1234", "workers/message": "Fix the login loop" },
+  }),
+  [`GET /workers/scripts/api-worker/versions/${VERSION_B}`]: () => ok({
+    id: VERSION_B, number: 2, metadata: {}, annotations: {},
+  }),
+  // A version without annotations at all.
+  [`GET /workers/scripts/api-worker/versions/${VERSION_C}`]: () => ok({ id: VERSION_C, number: 1 }),
+};
+
+const ISSUE = {
+  id: "issue-1", service: "api-worker", fingerprint: "fp-1", title: "TypeError: x is undefined",
+  type: "exception", status: "active", statusUpdated: 1, count: 12, firstObserved: 1,
+  lastObserved: 2, created: 1, updated: 2,
+};
+
+describe("CloudflareWorkerReleasesApi", () => {
+  it("joins deployments with version annotations and Workers Builds commits", async () => {
+    const requests = routeCloudflare({
+      "GET /workers/scripts/api-worker/deployments": deploymentsRoute,
+      ...versionRoutes,
+      "GET /builds/builds": () => ok({
+        builds: {
+          [VERSION_A]: {
+            build_uuid: BUILD_A, status: "stopped", build_outcome: "success",
+            build_trigger_metadata: {
+              branch: "main", commit_hash: "0123abcd", commit_message: "Fix", build_trigger_source: "push",
+            },
+          },
+          // A manual build reports no commit.
+          [VERSION_B]: {
+            build_uuid: BUILD_B, status: "stopped", build_outcome: "success",
+            build_trigger_metadata: { branch: "", commit_hash: "", build_trigger_source: "manual" },
+          },
+          // VERSION_C was not built by Workers Builds, so it is simply absent.
+        },
+      }),
+    });
+    const api = new CloudflareWorkerReleasesApi(async () => "token", ACCOUNT_ID, "api-worker");
+
+    const deployments = await api.listDeployments();
+
+    expect(deployments).toEqual([
+      {
+        id: "dep-2", createdOn: "2026-08-14T11:00:00Z", source: "wrangler", message: "Gradual rollout",
+        versions: [
+          {
+            versionId: VERSION_A, percentage: 90, tag: "abc1234", message: "Fix the login loop",
+            commit: "0123abcd", branch: "main", buildUuid: BUILD_A,
+          },
+          { versionId: VERSION_B, percentage: 10 },
+        ],
+      },
+      {
+        id: "dep-1", createdOn: "2026-08-13T11:00:00Z", source: "api",
+        versions: [{ versionId: VERSION_C, percentage: 100 }],
+      },
+    ]);
+    const builds = requests.find(request => request.url.pathname.endsWith("/builds/builds"))!;
+    expect(builds.url.searchParams.get("version_ids")).toBe([VERSION_A, VERSION_B, VERSION_C].join(","));
+    expect(requests.every(request => request.method === "GET")).toBe(true);
+  });
+
+  it("lists without commits when the builds lookup is denied", async () => {
+    const warnings: unknown[] = [];
+    vi.spyOn(console, "warn").mockImplementation((...args: unknown[]) => void warnings.push(...args));
+    routeCloudflare({
+      "GET /workers/scripts/api-worker/deployments": deploymentsRoute,
+      ...versionRoutes,
+      "GET /builds/builds": () => Response.json({
+        success: false, errors: [{ code: 10000, message: "Authentication error for dev@example.com" }],
+      }, { status: 403 }),
+    });
+    const api = new CloudflareWorkerReleasesApi(async () => "token", ACCOUNT_ID, "api-worker");
+
+    const [live] = await api.listDeployments(1);
+
+    expect(live!.versions).toEqual([
+      { versionId: VERSION_A, percentage: 90, tag: "abc1234", message: "Fix the login loop" },
+      { versionId: VERSION_B, percentage: 10 },
+    ]);
+    expect(warnings).toContainEqual(expect.objectContaining({
+      event: "releases.builds.refused", status: 403, providerCodes: "10000",
+    }));
+    expect(JSON.stringify(warnings)).not.toContain("dev@example.com");
+  });
+
+  it("fails the listing when Workers Builds fails for another reason", async () => {
+    routeCloudflare({
+      "GET /workers/scripts/api-worker/deployments": deploymentsRoute,
+      ...versionRoutes,
+      "GET /builds/builds": () => Response.json({ success: false }, { status: 500 }),
+    });
+    const api = new CloudflareWorkerReleasesApi(async () => "token", ACCOUNT_ID, "api-worker");
+
+    await expect(api.listDeployments()).rejects.toMatchObject({ status: 500 });
+  });
+
+  it("bounds the listing and addresses the Worker by its escaped name", async () => {
+    const requests = routeCloudflare({
+      "GET /workers/scripts/my%20worker/deployments": () => ok({ deployments: [] }),
+    });
+    const api = new CloudflareWorkerReleasesApi(async () => "token", ACCOUNT_ID, "my worker");
+
+    expect(await api.listDeployments()).toEqual([]);
+    await expect(api.listDeployments(21)).rejects.toThrow("from 1 to 20");
+    await expect(api.listDeployments(0)).rejects.toThrow("from 1 to 20");
+    expect(requests).toHaveLength(1);
+  });
+
+  it("reads an issue of its own Worker", async () => {
+    routeCloudflare({ "GET /workers/observability/issues/issue-1": () => ok({ issue: ISSUE }) });
+    const api = new CloudflareWorkerReleasesApi(async () => "token", ACCOUNT_ID, "api-worker");
+
+    expect(await api.getIssue("issue-1")).toEqual({
+      id: "issue-1", title: "TypeError: x is undefined", status: "active", count: 12,
+      firstObserved: 1, lastObserved: 2, statusUpdated: 1, fingerprint: "fp-1",
+    });
+  });
+
+  it("refuses an issue of another Worker, and never patches it", async () => {
+    const requests = routeCloudflare({
+      "GET /workers/observability/issues/issue-1": () => ok({ issue: { ...ISSUE, service: "other-worker" } }),
+      "PATCH /workers/observability/issues/issue-1": () => ok({}),
+    });
+    const api = new CloudflareWorkerReleasesApi(async () => "token", ACCOUNT_ID, "api-worker");
+
+    const error = await api.getIssue("issue-1").catch(caught => caught);
+    expect(error).toMatchObject({ status: 404 });
+    expect(String(error)).not.toContain("TypeError");
+    await expect(api.setIssueStatus("issue-1", "resolved")).rejects.toMatchObject({ status: 404 });
+    expect(requests.map(request => request.method)).toEqual(["GET", "GET"]);
+  });
+
+  it("patches an issue's status once, after checking it is the Worker's", async () => {
+    const requests = routeCloudflare({
+      "GET /workers/observability/issues/issue-1": () => ok({ issue: ISSUE }),
+      "PATCH /workers/observability/issues/issue-1": () => ok({ issue: { ...ISSUE, status: "resolved" } }),
+    });
+    const api = new CloudflareWorkerReleasesApi(async () => "token", ACCOUNT_ID, "api-worker");
+
+    expect(await api.setIssueStatus("issue-1", "resolved")).toMatchObject({ status: "active" });
+    expect(requests.map(({ method, body }) => ({ method, body }))).toEqual([
+      { method: "GET" },
+      { method: "PATCH", body: { status: "resolved" } },
+    ]);
+  });
+
+  it("never retries a status write", async () => {
+    const requests = routeCloudflare({
+      "GET /workers/observability/issues/issue-1": () => ok({ issue: ISSUE }),
+      "PATCH /workers/observability/issues/issue-1": () => Response.json({ success: false }, {
+        status: 503, headers: { "retry-after": "0" },
+      }),
+    });
+    const api = new CloudflareWorkerReleasesApi(async () => "token", ACCOUNT_ID, "api-worker");
+
+    await expect(api.setIssueStatus("issue-1", "resolved")).rejects.toMatchObject({ status: 503 });
+    expect(requests.filter(request => request.method === "PATCH")).toHaveLength(1);
+  });
+
+  it("validates issue IDs before asking Cloudflare", async () => {
+    const requests = routeCloudflare({});
+    const api = new CloudflareWorkerReleasesApi(async () => "token", ACCOUNT_ID, "api-worker");
+
+    for (const id of ["", "../issues", "a/b", "x".repeat(129), "issue 1"]) {
+      await expect(api.getIssue(id), id).rejects.toThrow("Invalid Workers Observability issue ID");
+    }
+    expect(requests).toEqual([]);
+  });
+
+  it("refuses a malformed issue rather than guessing its status", async () => {
+    routeCloudflare({ "GET /workers/observability/issues/issue-1": () => ok({ issue: { ...ISSUE, status: "muted" } }) });
+    const api = new CloudflareWorkerReleasesApi(async () => "token", ACCOUNT_ID, "api-worker");
+
+    await expect(api.getIssue("issue-1")).rejects.toMatchObject({ status: 502 });
+  });
+});
+
+function stubCalculations(value?: number) {
+  const bodies: Record<string, unknown>[] = [];
+  vi.stubGlobal("fetch", vi.fn(async (_input: string, init: RequestInit) => {
+    bodies.push(JSON.parse(String(init.body)));
+    return ok({
+      statistics: { elapsed: 0.01, rows_read: 5, bytes_read: 50 },
+      calculations: value === undefined ? [] : [{
+        calculation: "uniq", alias: "invocations",
+        aggregates: [{ value, count: value, interval: 1, sampleInterval: 1 }], series: [],
+      }],
+    });
+  }));
+  return bodies;
+}
+
+describe("countInvocations", () => {
+  it("counts the version's distinct requests, scoped to the Worker", async () => {
+    const bodies = stubCalculations(42);
+    const api = new CloudflareObservabilityApi(async () => "token", ACCOUNT_ID, "api-worker");
+    const since = TEST_NOW.valueOf() - 60 * 60_000;
+
+    const result = await api.countInvocations(VERSION_A.toUpperCase(), since);
+
+    expect(result.count).toBe(42);
+    expect(bodies[0]).toMatchObject({
+      view: "calculations",
+      timeframe: { from: since, to: TEST_NOW.valueOf() },
+      parameters: {
+        filters: [
+          { key: "$metadata.service", operation: "eq", value: "api-worker" },
+          { key: "$workers.scriptVersion.id", operation: "eq", type: "string", value: VERSION_A },
+        ],
+        calculations: [{ operator: "uniq", key: "$metadata.requestId", keyType: "string" }],
+      },
+    });
+  });
+
+  it("reports zero when no telemetry matched", async () => {
+    stubCalculations();
+    const api = new CloudflareObservabilityApi(async () => "token", ACCOUNT_ID, "api-worker");
+
+    expect((await api.countInvocations(VERSION_A, TEST_NOW.valueOf() - 1000)).count).toBe(0);
+  });
+
+  it("clamps `since` to the retention window and to before now", async () => {
+    const bodies = stubCalculations(1);
+    const api = new CloudflareObservabilityApi(async () => "token", ACCOUNT_ID, "api-worker");
+
+    await api.countInvocations(VERSION_A, 0);
+    await api.countInvocations(VERSION_A, TEST_NOW.valueOf() + 5000);
+
+    expect(bodies[0]).toMatchObject({
+      timeframe: { from: TEST_NOW.valueOf() - 7 * 24 * 60 * 60_000, to: TEST_NOW.valueOf() },
+    });
+    expect(bodies[1]).toMatchObject({ timeframe: { from: TEST_NOW.valueOf() - 1, to: TEST_NOW.valueOf() } });
+  });
+
+  it("validates its arguments before asking Cloudflare", async () => {
+    const bodies = stubCalculations(1);
+    const worker = new CloudflareObservabilityApi(async () => "token", ACCOUNT_ID, "api-worker");
+    const account = new CloudflareObservabilityApi(async () => "token", ACCOUNT_ID);
+
+    await expect(worker.countInvocations("not-a-version", 0)).rejects.toThrow("version ID");
+    await expect(worker.countInvocations(VERSION_A, Number.NaN)).rejects.toThrow("since");
+    await expect(account.countInvocations(VERSION_A, 0)).rejects.toThrow("Worker binding");
+    expect(bodies).toEqual([]);
   });
 });

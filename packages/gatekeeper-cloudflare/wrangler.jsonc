@@ -48,6 +48,12 @@
         "CloudflareNotificationsGatekeeper",
         "CloudflareNotificationReceiver"
       ]
+    },
+    {
+      "tag": "v3",
+      "new_sqlite_classes": [
+        "CloudflareWorkerReleasesGatekeeper"
+      ]
     }
   ]
 }

@@ -832,3 +832,93 @@ export interface CloudflareNotificationsSession {
   /** Inspect setup and delivery health without exposing credentials or event content. */
   getStatus(): Promise<CloudflareNotificationStatus>;
 }
+
+/**
+ * One Worker's releases and Real-Time Issues: which versions are deployed, whether a version has
+ * served traffic, and the issues Workers Observability raised for the Worker. Every method answers
+ * for the bound Worker only; an issue of another Worker is refused.
+ *
+ * @example
+ * const [live] = await releases.listDeployments({ limit: 1 });
+ * const version = live.versions[0];
+ * const served = await releases.countInvocations(version.versionId, Date.parse(live.createdOn));
+ * const issue = await releases.getIssue(issueId);
+ * if (served > 0 && issue.lastObserved < Date.parse(live.createdOn)) {
+ *   await releases.resolveIssue(issueId);
+ * }
+ */
+export interface CloudflareWorkerReleases {
+  /**
+   * The Worker's most recent deployments, newest first; the first is the one serving traffic.
+   * `limit` defaults to 10 and may be at most 20.
+   */
+  listDeployments(options?: { limit?: number }): Promise<CloudflareWorkerDeployment[]>;
+
+  /**
+   * How many invocations `versionId` served since `since` (ms since epoch), up to now. Counts
+   * distinct requests that left telemetry under that version, so an invocation with no telemetry
+   * at all is not counted, and the count may be approximate on busy Workers: use it to tell
+   * whether a version has served traffic, not as an exact total. Telemetry is kept for seven days,
+   * so an earlier `since` counts from seven days ago.
+   */
+  countInvocations(versionId: string, since: number): Promise<number>;
+
+  /** A Real-Time Issue of this Worker. Throws for an issue of another Worker. */
+  getIssue(issueId: string): Promise<CloudflareWorkerIssue>;
+
+  /**
+   * Marks the issue resolved. Workers Observability reactivates a resolved issue if it occurs
+   * again. Resolving an issue that is already resolved does nothing.
+   */
+  resolveIssue(issueId: string): Promise<void>;
+}
+
+/** One deployment of the bound Worker. */
+export type CloudflareWorkerDeployment = {
+  /** Deployment identifier. */
+  id: string;
+  /** ISO time the deployment was created. */
+  createdOn: string;
+  /** e.g. "wrangler", "api", "dash" -- as Cloudflare reports it. */
+  source?: string;
+  /** The deployment's message annotation. */
+  message?: string;
+  /** The versions the deployment splits traffic between. */
+  versions: CloudflareWorkerDeploymentVersion[];
+};
+
+/** One version in a deployment. */
+export type CloudflareWorkerDeploymentVersion = {
+  /** Version identifier, as passed to `countInvocations()`. */
+  versionId: string;
+  /** Share of traffic, 0-100. */
+  percentage: number;
+  /** The version's `workers/tag` annotation (e.g. a commit id a CI set with `--tag`). */
+  tag?: string;
+  /** The version's `workers/message` annotation. */
+  message?: string;
+  /** The commit Workers Builds built this version from, when it built it from a git push. */
+  commit?: string;
+  /** The branch Workers Builds built it from. */
+  branch?: string;
+};
+
+/** A Real-Time Issue: one group of similar errors Workers Observability detected. */
+export type CloudflareWorkerIssue = {
+  /** Issue identifier. */
+  id: string;
+  /** Summary of the error. */
+  title: string;
+  /** `active` until resolved or ignored; a resolved issue becomes active again if it recurs. */
+  status: "active" | "resolved" | "ignored";
+  /** Occurrences counted so far. */
+  count: number;
+  /** First occurrence, as ms since epoch. */
+  firstObserved: number;
+  /** Latest occurrence, as ms since epoch. */
+  lastObserved: number;
+  /** When `status` last changed, as ms since epoch. */
+  statusUpdated: number;
+  /** Stable grouping hash of the error, when reported. */
+  fingerprint?: string;
+};
