@@ -123,8 +123,9 @@ function RootComponent() {
   // !isAuthenticated branches all return early above.
   if (!authenticatedApi) return null
   // Dashboard links and signup returns may still land on Home. Other routes never interpret this query.
-  if (pathname === '/' && workersIssueSetupSearch(search).workers_issue_setup) {
-    return <Navigate to="/setup/workers-issues" search={{ workers_issue_setup: workersIssueSetupSearch(search).workers_issue_setup }} replace />
+  const workersIssueSetup = pathname === '/' ? workersIssueSetupSearch(search) : {}
+  if (workersIssueSetup.workers_issue_setup) {
+    return <Navigate to="/setup/workers-issues" search={workersIssueSetup} replace />
   }
   // The native handoff is a dedicated destination: never render the Workshop home page
   // behind it while the browser is returning credentials to the app.

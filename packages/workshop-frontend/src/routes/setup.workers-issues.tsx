@@ -1,10 +1,10 @@
-import { createFileRoute, useRouterState } from "@tanstack/react-router";
+import { createFileRoute } from "@tanstack/react-router";
 import { WorkersIssueSetupPage } from "../features/workers-issues/WorkersIssueSetupPage";
-import { parseWorkersIssueSetup } from "../features/workers-issues/workersIssueSetup";
+import { validateWorkersIssueSetupSearch } from "../features/workers-issues/workersIssueSetup";
 
 const WorkersIssueSetupRoute = () => {
-  const search = useRouterState({ select: (state) => state.location.searchStr });
-  const request = parseWorkersIssueSetup(search);
+  // Validated by validateSearch, which the router hands the request already JSON-decoded.
+  const request = Route.useSearch().workers_issue_setup;
   return request ? (
     <WorkersIssueSetupPage key={request.state} request={request} />
   ) : (
@@ -17,10 +17,5 @@ const WorkersIssueSetupRoute = () => {
 
 export const Route = createFileRoute("/setup/workers-issues")({
   component: WorkersIssueSetupRoute,
-  validateSearch: (search: Record<string, unknown>) => ({
-    workers_issue_setup:
-      typeof search.workers_issue_setup === "string" && search.workers_issue_setup.length <= 2048
-        ? search.workers_issue_setup
-        : undefined,
-  }),
+  validateSearch: validateWorkersIssueSetupSearch,
 });

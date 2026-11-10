@@ -33,7 +33,7 @@ describe("dashboard issue setup context", () => {
   it("preserves the Worker and issue across sign-in without accepting unrelated parameters", () => {
     expect(parseWorkersIssueSetup(search(request))).toEqual(request);
     expect(workersIssueSetupSearch(`${search(request)}&redirect=https://evil.example`)).toEqual({
-      workers_issue_setup: JSON.stringify(request),
+      workers_issue_setup: request,
     });
   });
 
@@ -80,7 +80,7 @@ describe("dashboard issue setup context", () => {
     };
     expect(parseWorkersIssueSetup(search(value))).toEqual(value);
     expect(workersIssueSetupSearch(search(value))).toEqual({
-      workers_issue_setup: JSON.stringify(value),
+      workers_issue_setup: value,
     });
     expect(
       parseWorkersIssueSetup(

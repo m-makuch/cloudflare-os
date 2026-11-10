@@ -76,12 +76,25 @@ export const isDashboardOrigin = (value: string, extra = EXTRA_DASHBOARD_ORIGINS
   }
 };
 
+/** Above this a request is refused: it is carried in a URL, and every real one is far smaller. */
+const MAX_SETUP_REQUEST_LENGTH = 2048;
+
+/** The setup request from the raw query string, e.g. `window.location.search`. */
 export const parseWorkersIssueSetup = (search: string): WorkersIssueSetupRequest | null => {
   const values = new URLSearchParams(search).getAll(WORKERS_ISSUE_SETUP_PARAM);
-  if (values.length !== 1 || values[0].length > 2048) return null;
+  return values.length === 1 ? parseWorkersIssueSetupValue(values[0]) : null;
+};
+
+/**
+ * The setup request from one search value: the JSON text, or, from TanStack Router, the object its
+ * default search parser already decoded that text into. Either is held to the same rules.
+ */
+export const parseWorkersIssueSetupValue = (value: unknown): WorkersIssueSetupRequest | null => {
   try {
-    const request: unknown = JSON.parse(values[0]);
-    if (typeof request !== "object" || request === null) return null;
+    const text = typeof value === "string" ? value : JSON.stringify(value);
+    if (typeof text !== "string" || text.length > MAX_SETUP_REQUEST_LENGTH) return null;
+    const request: unknown = typeof value === "string" ? JSON.parse(value) : value;
+    if (typeof request !== "object" || request === null || Array.isArray(request)) return null;
     const { state, accountId, workerName, issueId, dashboardOrigin, investigation, remediation } =
       request as Record<string, unknown>;
     if (
@@ -127,11 +140,23 @@ export const parseWorkersIssueSetup = (search: string): WorkersIssueSetupRequest
   }
 };
 
-/** Carry only a validated setup request through signup and sign-in navigation. */
-export const workersIssueSetupSearch = (search: string): { workers_issue_setup?: string } => {
+/**
+ * Carry only a validated setup request through signup, sign-in and Home. It is handed to the router
+ * as the object: the router serializes it as JSON, where a JSON string would be quoted.
+ */
+export const workersIssueSetupSearch = (
+  search: string,
+): { workers_issue_setup?: WorkersIssueSetupRequest } => {
   const request = parseWorkersIssueSetup(search);
-  return request ? { workers_issue_setup: JSON.stringify(request) } : {};
+  return request ? { workers_issue_setup: request } : {};
 };
+
+/** `validateSearch` for the routes a setup request passes through: Home and the setup page. */
+export const validateWorkersIssueSetupSearch = (
+  search: Record<string, unknown>,
+): { workers_issue_setup?: WorkersIssueSetupRequest } => ({
+  workers_issue_setup: parseWorkersIssueSetupValue(search[WORKERS_ISSUE_SETUP_PARAM]) ?? undefined,
+});
 
 export const respondToWorkersIssueSetup = (
   request: WorkersIssueSetupRequest,

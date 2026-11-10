@@ -34,7 +34,7 @@ export default function SignupPage({ rpcStub }: SignupPageProps) {
 
   const handleSignupSuccess = () => {
     const url = new URL(deviceSessionDestination("/", window.location.search), window.location.origin);
-    for (const [key, value] of Object.entries(workersIssueSetupSearch(window.location.search))) url.searchParams.set(key, value);
+    for (const [key, value] of Object.entries(workersIssueSetupSearch(window.location.search))) url.searchParams.set(key, JSON.stringify(value));
     window.location.href = url.href;
   };
 
