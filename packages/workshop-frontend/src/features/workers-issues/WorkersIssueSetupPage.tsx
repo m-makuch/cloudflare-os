@@ -9,6 +9,7 @@ import { FIX_BRANCH_PREFIX, resolveContributorRepository } from "./contributorRe
 import { provisionWorkersIssueInbox } from "./provisionWorkersIssueInbox";
 import {
   NOTIFICATIONS_PATTERN,
+  RELEASES_PATTERN,
   WORKER_PATTERN,
   useWorkersIssueConnections,
 } from "./useWorkersIssueConnections";
@@ -16,16 +17,21 @@ import { respondToWorkersIssueSetup, type WorkersIssueSetupRequest } from "./wor
 
 const DESTINATION_PATTERNS = [NOTIFICATIONS_PATTERN];
 const INVESTIGATION_PATTERNS = [WORKER_PATTERN];
+const FIX_PATTERNS = [WORKER_PATTERN, RELEASES_PATTERN];
 
 export const WorkersIssueSetupPage = ({ request }: { request: WorkersIssueSetupRequest }) => {
   const { authenticatedApi } = useAuthenticatedApi();
   const isInvestigation = Boolean(request.investigation);
   // Opened from the inbox rather than handed off by the dashboard: nothing is reported back.
   const fromInbox = !request.dashboardOrigin;
+  const remediation =
+    request.remediation ?? (fromInbox ? { approval: "ask" as const, allowPublic: false } : undefined);
+  const [fixesWanted, setFixesWanted] = useState(Boolean(request.remediation));
+  const fixing = Boolean(remediation) && fixesWanted;
   const connection = useWorkersIssueConnections(
     authenticatedApi,
     request.accountId,
-    isInvestigation ? INVESTIGATION_PATTERNS : DESTINATION_PATTERNS,
+    fixing ? FIX_PATTERNS : isInvestigation ? INVESTIGATION_PATTERNS : DESTINATION_PATTERNS,
   );
   const [accountId, setAccountId] = useState("");
   const [modelSettings, setModelSettings] = useState<{
@@ -35,9 +41,6 @@ export const WorkersIssueSetupPage = ({ request }: { request: WorkersIssueSetupR
   const [modelId, setModelId] = useState("");
   const [changeModel, setChangeModel] = useState(false);
   const [investigateCurrent, setInvestigateCurrent] = useState(false);
-  const remediation =
-    request.remediation ?? (fromInbox ? { approval: "ask" as const, allowPublic: false } : undefined);
-  const [fixesWanted, setFixesWanted] = useState(Boolean(request.remediation));
   // A user who came to investigate one notification has not asked for every later one.
   const [automatic, setAutomatic] = useState(!request.runKey);
   const [repositoryUrl, setRepositoryUrl] = useState(remediation?.repositoryUrl ?? "");
@@ -75,7 +78,6 @@ export const WorkersIssueSetupPage = ({ request }: { request: WorkersIssueSetupR
     models.find((model) => model.id === modelId) ??
     preferredModel ??
     (models.length === 1 ? models[0] : undefined);
-  const fixing = Boolean(remediation) && fixesWanted;
   const repository =
     fixing && vendors ? resolveContributorRepository(vendors, repositoryUrl, allowPublic) : undefined;
   const repositoryReady = !fixing || (repository !== undefined && !("error" in repository));
@@ -196,11 +198,17 @@ export const WorkersIssueSetupPage = ({ request }: { request: WorkersIssueSetupR
         !fromInbox || automatic,
       );
       if (controller.signal.aborted) return;
+      // Only the inbox's own concern; the dashboard is told what it asked for.
+      const { backgroundChecks, ...outcome } = { backgroundChecks: undefined, ...result };
       setReady({
-        ...result,
+        ...outcome,
         investigateCurrent: isInvestigation && Boolean(request.issueId) && investigateCurrent,
       });
-      const enabled = fix ? "AI fixes are enabled." : "AI investigations are enabled.";
+      const enabled = fix
+        ? backgroundChecks === false
+          ? "AI fixes are enabled. Background checks could not be turned on, so merged fixes are followed to production while the inbox is open."
+          : "AI fixes are enabled."
+        : "AI investigations are enabled.";
       const investigated = "investigated" in result ? result.investigated : undefined;
       const notification =
         investigated === undefined
@@ -343,6 +351,13 @@ export const WorkersIssueSetupPage = ({ request }: { request: WorkersIssueSetupR
                         telemetry and notification text, which can contain personal data or
                         attacker-controlled content; the fixer is instructed to leave such data out,
                         but review every change before merging.
+                      </p>
+                      <p className="text-sm text-kumo-subtle">
+                        Once you merge, the inbox follows the fix to production through this
+                        Worker&apos;s deployments and builds. When every live version contains it and
+                        an hour of traffic passes without the issue, the inbox marks the issue
+                        resolved in Workers Observability without asking. It checks every 15
+                        minutes with Scheduled Tasks, which setup turns on.
                       </p>
                       <Input
                         label="Repository"

@@ -7,7 +7,7 @@ import type { AccountsSubscriberAdapter } from "../../accountsSubscriber";
 import type { AuthenticatedApi } from "@gadgets/workshop-shared/api";
 import type { WorkerIssueInbox } from "../../../../bundled-blueprints/blueprints/workers-issues/files/protocol";
 import { WorkersIssueSetupPage } from "./WorkersIssueSetupPage";
-import { NOTIFICATIONS_PATTERN, WORKER_PATTERN } from "./useWorkersIssueConnections";
+import { NOTIFICATIONS_PATTERN, RELEASES_PATTERN, WORKER_PATTERN } from "./useWorkersIssueConnections";
 
 let api: object;
 vi.mock("../../AuthContext", () => ({ useAuthenticatedApi: () => ({ authenticatedApi: api }) }));
@@ -53,6 +53,8 @@ const render = async (
     /** Opened from the inbox: no dashboard origin, optionally for one stored notification. */
     fromInbox?: { runKey?: string };
     fixesEnabled?: boolean;
+    /** Scheduled Tasks: provisioned (default), only offered, or disabled by the deployment. */
+    scheduler?: "provisioned" | "offered" | "disabled";
   } = {},
 ) => {
   let subscriber: AccountsSubscriberAdapter;
@@ -76,6 +78,8 @@ const render = async (
       workerName: options.wrongScope ? "other-worker" : request.workerName,
       investigationsEnabled: options.investigationsEnabled ?? false,
       investigatorReady: Boolean(options.existingInvestigator),
+      releasesReady: false,
+      backgroundChecks: false,
       ...(options.fixesEnabled
         ? { fixes: { provider: "github", repository: "acme/checkout", branchPrefix: "cloudflare-os/" } }
         : {}),
@@ -90,6 +94,9 @@ const render = async (
       .fn<WorkerIssueInbox["investigateNotification"]>()
       .mockResolvedValue(undefined),
     disableFixes: vi.fn<WorkerIssueInbox["disableFixes"]>().mockResolvedValue(undefined),
+    enableBackgroundChecks: vi
+      .fn<WorkerIssueInbox["enableBackgroundChecks"]>()
+      .mockResolvedValue(undefined),
     enableFixes: vi.fn<WorkerIssueInbox["enableFixes"]>().mockResolvedValue({
       provider: "github",
       repository: "acme/checkout",
@@ -100,7 +107,10 @@ const render = async (
       .mockResolvedValue({ installed: true, suspended: false, webhookId: "destination-1" }),
     [Symbol.dispose]() {},
   };
-  let bindings = options.existingInvestigator ? [{ name: "INVESTIGATOR", target: 9 }] : [];
+  let bindings = [
+    { name: "CLOUDFLARE_NOTIFICATIONS", target: 3 },
+    ...(options.existingInvestigator ? [{ name: "INVESTIGATOR", target: 9 }] : []),
+  ];
   const gadget = {
     connectToGadget: vi.fn<() => Promise<typeof inbox>>().mockResolvedValue(inbox),
     listBindings: vi.fn<() => Promise<typeof bindings>>(async () => bindings),
@@ -134,7 +144,21 @@ const render = async (
     }),
     [Symbol.dispose]() {},
   };
+  const releases = {
+    getId: async () => 10,
+    remove: vi.fn<() => Promise<void>>().mockResolvedValue(undefined),
+    [Symbol.dispose]() {},
+  };
+  const scheduler = { getId: async () => 11, [Symbol.dispose]() {} };
+  let schedulerProvisioned = (options.scheduler ?? "provisioned") === "provisioned";
+  const provisionAmbientAccount = vi.fn<(vendorId: string) => Promise<void>>(async () => {
+    if (options.scheduler === "disabled") throw new Error("Scheduled Tasks are disabled.");
+    schedulerProvisioned = true;
+  });
   const workspace = {
+    getAmbientGatekeeper: vi.fn<(vendorId: string) => Promise<object | null>>(async (vendorId) =>
+      vendorId === "scheduler" && schedulerProvisioned ? scheduler : null,
+    ),
     getMetadata: vi
       .fn<() => Promise<object>>()
       .mockResolvedValue({
@@ -146,7 +170,11 @@ const render = async (
     getGadget: vi.fn<() => Promise<typeof gadget>>().mockResolvedValue(gadget),
     newGatekeeper: vi.fn<(accountId: number, url: string) => Promise<object>>(
       async (_accountId: number, url: string) =>
-        url.startsWith("https://github.com/") ? repository : telemetry,
+        url.startsWith("https://github.com/")
+          ? repository
+          : url.endsWith("/deployments")
+            ? releases
+            : telemetry,
     ),
     listPreApprovableActions: vi.fn<() => Promise<object[]>>().mockResolvedValue([
       {
@@ -164,6 +192,11 @@ const render = async (
         actionKind: { tag: "cloudflare.other", label: "Other" },
         alreadyEnabled: false,
       },
+      {
+        gatekeeperId: 10,
+        actionKind: { tag: "resolve-worker-issue", label: "Resolve Worker issues" },
+        alreadyEnabled: false,
+      },
     ]),
     setAutoApprovedActionKind: vi
       .fn<(id: number, kind: object) => Promise<void>>()
@@ -173,7 +206,10 @@ const render = async (
       .mockResolvedValue(investigator),
     listHooks: vi
       .fn<() => Promise<object[]>>()
-      .mockResolvedValue([{ id: 1, gadgetId: 0, enabled: false }]),
+      .mockResolvedValue([
+        { id: 2, gadgetId: 0, gatekeeperId: 11, enabled: false },
+        { id: 1, gadgetId: 0, gatekeeperId: 3, enabled: false },
+      ]),
     enableHook: options.failEnable
       ? vi.fn<() => Promise<void>>().mockRejectedValue(new Error("Provider unavailable"))
       : vi.fn<() => Promise<void>>().mockResolvedValue(undefined),
@@ -256,6 +292,7 @@ const render = async (
       .fn<() => Promise<object>>()
       .mockResolvedValue({ url: "https://example.test/connect", nonce: "c".repeat(64) }),
     ensureAccountResources: ensure,
+    provisionAmbientAccount,
     newWorkspaceFromBlueprint: create,
     openWorkspace: open,
   };
@@ -300,6 +337,8 @@ const render = async (
     telemetry,
     investigator,
     repository,
+    releases,
+    provisionAmbientAccount,
     create,
     open,
     ensure,
@@ -344,7 +383,8 @@ describe("Destination-first Worker issue onboarding", () => {
     expect(fixture.listModels).not.toHaveBeenCalled();
     expect(fixture.getPreferredModel).not.toHaveBeenCalled();
     expect(fixture.workspace.newAgentSpawnerGatekeeper).not.toHaveBeenCalled();
-    expect(fixture.workspace.enableHook).toHaveBeenCalledWith(1);
+    // Only the notification subscription; any other hook of the inbox is not setup's to enable here.
+    expect(fixture.workspace.enableHook.mock.calls).toEqual([[1]]);
     expect(fixture.completion()).toHaveBeenCalledWith(
       expect.objectContaining({
         destinationId: "destination-1",
@@ -505,6 +545,7 @@ describe("Worker issue fixes", () => {
     expect(container!.textContent).toContain("GitHub · acme/checkout");
     await act(async () => fixture.submit().click());
 
+    expect(fixture.ensure).toHaveBeenCalledWith(1, [WORKER_PATTERN, RELEASES_PATTERN]);
     expect(fixture.ensure).toHaveBeenCalledWith(7, [CONTRIBUTOR]);
     expect(fixture.workspace.newGatekeeper).toHaveBeenCalledWith(
       7,
@@ -519,11 +560,74 @@ describe("Worker issue fixes", () => {
     expect(fixture.gadget.bind).toHaveBeenCalledWith("REPOSITORY", 8);
     expect(fixture.inbox.enableInvestigations).toHaveBeenCalled();
     expect(fixture.inbox.enableFixes).toHaveBeenCalled();
-    expect(fixture.workspace.setAutoApprovedActionKind).not.toHaveBeenCalled();
-    expect(fixture.completion()).toHaveBeenCalledWith(
+    // Pushes and requests still wait for approval.
+    expect(fixture.workspace.setAutoApprovedActionKind.mock.calls).toEqual([
+      [10, { tag: "resolve-worker-issue", label: "Resolve Worker issues" }],
+    ]);
+    const posted = fixture.completion();
+    expect(posted).toHaveBeenCalledWith(
       expect.objectContaining({ fixesEnabled: true, investigationsEnabled: true }),
       { targetOrigin: request.dashboardOrigin },
     );
+    expect(posted.mock.calls[0]![0]).not.toHaveProperty("backgroundChecks");
+  });
+
+  it("follows fixes to production: binds the Worker's releases and Scheduled Tasks, and turns on background checks", async () => {
+    const fixture = await render({ investigation: true, investigationsEnabled: true, remediation });
+    await act(async () => fixture.submit().click());
+    expect(fixture.workspace.newGatekeeper).toHaveBeenCalledWith(
+      1,
+      `https://dash.cloudflare.com/${request.accountId}/workers/services/view/checkout-test/production/deployments`,
+    );
+    // The inbox follows releases; the fixer never sees them.
+    expect(fixture.workspace.newAgentSpawnerGatekeeper).toHaveBeenCalledWith(
+      expect.objectContaining({ env: { WORKER_OBSERVABILITY: 5, REPOSITORY: 8 } }),
+    );
+    expect(fixture.gadget.bind).toHaveBeenCalledWith("WORKER_RELEASES", 10);
+    expect(fixture.gadget.bind).toHaveBeenCalledWith("SCHEDULER", 11);
+    expect(fixture.provisionAmbientAccount).not.toHaveBeenCalled();
+    expect(fixture.inbox.enableBackgroundChecks).toHaveBeenCalledTimes(1);
+    expect(fixture.workspace.enableHook.mock.calls).toEqual([[2]]);
+    expect(container!.textContent).toContain("AI fixes are enabled.");
+    expect(container!.textContent).not.toContain("Background checks could not");
+  });
+
+  it("opts into Scheduled Tasks when the deployment only offers them", async () => {
+    const fixture = await render({
+      investigation: true,
+      investigationsEnabled: true,
+      remediation,
+      scheduler: "offered",
+    });
+    await act(async () => fixture.submit().click());
+    expect(fixture.provisionAmbientAccount).toHaveBeenCalledWith("scheduler");
+    expect(fixture.gadget.bind).toHaveBeenCalledWith("SCHEDULER", 11);
+    expect(fixture.inbox.enableBackgroundChecks).toHaveBeenCalledTimes(1);
+  });
+
+  it("keeps fixes enabled when background checks are unavailable", async () => {
+    const fixture = await render({
+      investigation: true,
+      investigationsEnabled: true,
+      remediation,
+      scheduler: "disabled",
+    });
+    await act(async () => fixture.submit().click());
+    expect(fixture.inbox.enableFixes).toHaveBeenCalled();
+    expect(fixture.inbox.enableBackgroundChecks).not.toHaveBeenCalled();
+    expect(fixture.gadget.bind).not.toHaveBeenCalledWith("SCHEDULER", expect.anything());
+    expect(container!.querySelector("[role=alert]")).toBeNull();
+    expect(container!.textContent).toContain("Background checks could not be turned on");
+  });
+
+  it("does not enable fixes when resolving issues cannot be approved", async () => {
+    const fixture = await render({ investigation: true, investigationsEnabled: true, remediation });
+    fixture.workspace.listPreApprovableActions.mockResolvedValue([]);
+    await act(async () => fixture.submit().click());
+    expect(container!.querySelector("[role=alert]")?.textContent).toContain(
+      "Resolving this Worker's issues could not be approved",
+    );
+    expect(fixture.inbox.enableFixes).not.toHaveBeenCalled();
   });
 
   it("auto-approves only the repository binding's push and request kinds in automatic mode", async () => {
@@ -534,6 +638,7 @@ describe("Worker issue fixes", () => {
     });
     await act(async () => fixture.submit().click());
     expect(fixture.workspace.setAutoApprovedActionKind.mock.calls).toEqual([
+      [10, { tag: "resolve-worker-issue", label: "Resolve Worker issues" }],
       [8, { tag: "github.push", label: "Push commits" }],
       [8, { tag: "github.createPullRequest", label: "Create pull requests" }],
     ]);
@@ -551,6 +656,7 @@ describe("Worker issue fixes", () => {
       "This repository is public",
     );
     expect(fixture.repository.remove).toHaveBeenCalled();
+    expect(fixture.releases.remove).toHaveBeenCalled();
     expect(fixture.telemetry.remove).toHaveBeenCalled();
     expect(fixture.workspace.newAgentSpawnerGatekeeper).not.toHaveBeenCalled();
     expect(fixture.gadget.bind).not.toHaveBeenCalled();
