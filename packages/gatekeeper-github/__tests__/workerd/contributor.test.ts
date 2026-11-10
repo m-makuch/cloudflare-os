@@ -7,7 +7,7 @@
 import { RpcStub, RpcTarget } from "cloudflare:workers";
 import { env, runInDurableObject } from "cloudflare:test";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import type { GitHubActionData, GatekeeperProps, Outcome } from "./worker";
+import type { GitHubActionData, GatekeeperProps, Outcome, SessionCall } from "./worker";
 
 afterEach(() => {
   vi.unstubAllGlobals();
@@ -31,9 +31,22 @@ class UnusedGitCache extends RpcTarget {
   async consumePack(): Promise<never> { throw new Error("test: nothing may be pulled"); }
 }
 
+/** A cache that holds nothing, so every read goes to (fake) GitHub; it records what is advertised. */
+class EmptyGitCache extends RpcTarget {
+  readonly advertised: string[] = [];
+  async get(): Promise<null> { return null; }
+  async stat(): Promise<null> { return null; }
+  async advertiseCommit(id: string): Promise<void> { this.advertised.push(id); }
+}
+
 class TestApprovalQueue extends RpcTarget {
-  async authorizeObservation(): Promise<void> {}
+  readonly observations: string[] = [];
+  readonly cache = new EmptyGitCache();
+  async authorizeObservation(description: { title: string }): Promise<void> {
+    this.observations.push(description.title);
+  }
   async submitAction(): Promise<void> {}
+  async getGitCache(): Promise<EmptyGitCache> { return this.cache; }
 }
 
 /** A repository whose visibility, default branch, and branches (with protection) the test controls. */
@@ -42,6 +55,12 @@ class FakeGitHub {
   defaultBranch = "main";
   readonly branches = new Map<string, { head: string; protected: boolean }>([["main", { head: BASE, protected: true }]]);
   readonly writes: string[] = [];
+  /** What `/commits/<ref>` resolves each ref to, beyond the branches. */
+  readonly refs = new Map<string, string>();
+  /** Merge bases by `<base>...<head>`. */
+  readonly mergeBases = new Map<string, string>();
+  /** The `/pulls` listing, as GitHub returns it. */
+  pulls: unknown[] = [];
 
   install(): void {
     vi.stubGlobal("fetch", this.#handle.bind(this));
@@ -62,6 +81,22 @@ class FakeGitHub {
         default_branch: this.defaultBranch, owner: { login: OWNER, html_url: `https://github.com/${OWNER}` },
       });
     }
+    if (path.startsWith(`${API_BASE}/commits/`)) {
+      const ref = decodeURIComponent(path.slice(`${API_BASE}/commits/`.length));
+      const sha = this.refs.get(ref) ?? this.branches.get(ref)?.head;
+      if (sha === undefined) return Response.json({ message: `No commit found for SHA: ${ref}` }, { status: 422 });
+      return new Response(sha);
+    }
+    if (path.startsWith(`${API_BASE}/compare/`)) {
+      const basehead = decodeURIComponent(path.slice(`${API_BASE}/compare/`.length));
+      const mergeBase = this.mergeBases.get(basehead);
+      if (mergeBase === undefined) return Response.json({ message: "Not Found" }, { status: 404 });
+      return Response.json({
+        base_commit: { sha: basehead.split("...")[0] }, merge_base_commit: { sha: mergeBase },
+        commits: [], total_commits: 0, files: [],
+      });
+    }
+    if (path === `${API_BASE}/pulls`) return Response.json(this.pulls);
     for (const [prefix, shape] of [
       [`${API_BASE}/git/ref/heads/`, "ref"], [`${API_BASE}/branches/`, "branch"],
       [`${NAME_ROOT}/git/ref/heads/`, "ref"], [`${NAME_ROOT}/branches/`, "branch"],
@@ -114,6 +149,8 @@ async function contributor(scope: { allowPublic?: boolean } = {}) {
     pullRequest: async (head: string, base = "main") =>
       await submit(await unwrap(hooks.prepareCreatePullRequest(scenario, props, { title: "Fix checkout", head, base }))),
     submit,
+    read: <T>(calls: SessionCall[], drain = false) =>
+      unwrap(hooks.sessionRead(scenario, props, queue(), calls, drain)) as Promise<T>,
     apply: (actionId: number) => unwrap(hooks.applyAction(scenario, props, actionId, new RpcStub(new UnusedGitCache()) as never)),
   };
 }
@@ -192,6 +229,40 @@ describe("the contributor binding", () => {
     gk.github.branches.set("cloudflare-os/other", { head: BASE, protected: true });
     await expect(gk.apply(push!.approvalId)).rejects.toThrow(/protected branch/);
     expect(gk.github.writes).toEqual([]);
+  });
+
+  it("reports a merged pull request's merge commit, never GitHub's test merge commit", async () => {
+    const gk = await contributor();
+    const MERGE = "c".repeat(40);
+    const pull = (number: number, merged: boolean) => ({
+      number, html_url: `https://github.com/${OWNER}/${REPO}/pull/${number}`, title: "Fix", state: merged ? "closed" : "open",
+      user: null, labels: [], created_at: "2026-01-01T00:00:00Z", updated_at: "2026-01-01T00:00:00Z", comments: 0,
+      draft: false, merged_at: merged ? "2026-01-02T00:00:00Z" : null, merge_commit_sha: merged ? MERGE : "d".repeat(40),
+      commits: 1, additions: 1, deletions: 0, changed_files: 1,
+      head: { ref: BRANCH, sha: HEAD, repo: null }, base: { ref: "main", sha: BASE, repo: null },
+    });
+    gk.github.pulls = [pull(7, true), pull(8, false)];
+    const rows = await gk.read<{ id: string; merged: boolean; mergeCommit: string | null }[]>(
+      [{ method: "listPullRequests", args: [{ head: BRANCH, state: "all" }] }], true);
+    expect(rows.map(({ id, merged, mergeCommit }) => ({ id, merged, mergeCommit }))).toEqual([
+      { id: "7", merged: true, mergeCommit: MERGE },
+      { id: "8", merged: false, mergeCommit: null },
+    ]);
+  });
+
+  it("tells whether a ref's history contains a commit, by their merge base", async () => {
+    const gk = await contributor();
+    const MERGE = "c".repeat(40);
+    const DEPLOYED = "e".repeat(40);
+    const OLD = "f".repeat(40);
+    gk.github.refs.set(MERGE, MERGE).set(DEPLOYED, DEPLOYED).set(OLD, OLD).set(BASE, BASE);
+    gk.github.mergeBases.set(`${MERGE}...${DEPLOYED}`, MERGE).set(`${MERGE}...${OLD}`, OLD);
+    const contains = (commit: string, ref?: string) =>
+      gk.read<boolean>([{ method: "containsCommit", args: ref === undefined ? [commit] : [commit, ref] }]);
+    expect(await contains(MERGE, DEPLOYED)).toBe(true);
+    expect(await contains(MERGE, OLD)).toBe(false);
+    expect(await contains(BASE)).toBe(true);   // the default branch's own head
+    await expect(contains("0".repeat(40), DEPLOYED)).rejects.toThrow();
   });
 
   it("refuses at apply any action its session cannot queue", async () => {

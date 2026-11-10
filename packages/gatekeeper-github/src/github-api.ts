@@ -88,6 +88,8 @@ export type GitHubPullRequestResponse = {
   comments: number;
   draft: boolean;
   merged_at?: string | null;
+  /** Before a merge, GitHub's test merge commit; after it, the commit the merge put on the base. */
+  merge_commit_sha?: string | null;
   mergeable?: boolean | null;
   /** Why it can or cannot merge, e.g. `clean` or `blocked`; unset until GitHub has computed it. */
   mergeable_state?: string | null;
