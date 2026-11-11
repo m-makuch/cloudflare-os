@@ -193,7 +193,6 @@ describe("Worker issue investigation inbox", () => {
     expect(fixture.subscribe).toHaveBeenCalledWith(expect.anything(), {
       alertType: "workers_observability_real_time_issue",
       createPolicy: false,
-      destinationName: `Cloudflare OS: ${scope.workerName}`,
     });
     await expect(
       fixture.gadget.initialize({ ...scope, workerName: "other-worker" }),
