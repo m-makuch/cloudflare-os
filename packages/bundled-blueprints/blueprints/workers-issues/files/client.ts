@@ -215,10 +215,12 @@ const workspaceId = (() => {
 /**
  * The OS page that binds a Worker-scoped investigator to this inbox, which needs the user's
  * consent and a model, so the inbox cannot do it itself. With a run key, it then investigates
- * that notification.
+ * that notification. With fixes on, it asks for them again, so changing the setup keeps them.
+ * Only a GitHub repository's URL is known here: GitLab's host is the deployment's.
  */
 function setupUrl(runKey?: string): string | undefined {
   const scope = setupStatus;
+  const fixes = scope?.fixes;
   if (!workspaceId || !destinationId || !scope?.accountId || !scope.workerName) return undefined;
   const url = new URL("/setup/workers-issues", document.baseURI);
   url.searchParams.set(
@@ -228,6 +230,14 @@ function setupUrl(runKey?: string): string | undefined {
       accountId: scope.accountId,
       workerName: scope.workerName,
       investigation: { workspaceId, destinationId },
+      ...(fixes
+        ? {
+            remediation: {
+              allowPublic: false,
+              ...(fixes.provider === "github" ? { repositoryUrl: `https://github.com/${fixes.repository}` } : {}),
+            },
+          }
+        : {}),
       ...(runKey ? { runKey } : {}),
     }),
   );

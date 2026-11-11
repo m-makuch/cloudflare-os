@@ -746,6 +746,20 @@ describe("Worker issue setup opened from the inbox", () => {
     expect(container!.textContent).toContain("return to the inbox");
   });
 
+  it("keeps fixes on when the inbox that proposes them changes its setup", async () => {
+    const fixture = await render({
+      investigation: true,
+      fromInbox: {},
+      fixesEnabled: true,
+      remediation: { allowPublic: false, repositoryUrl: "https://github.com/acme/checkout" },
+    });
+    expect(switchLabelled("Propose fixes").getAttribute("aria-checked")).toBe("true");
+    expect(container!.textContent).toContain("GitHub · acme/checkout");
+    await act(async () => fixture.submit().click());
+    expect(fixture.inbox.enableFixes).toHaveBeenCalledTimes(1);
+    expect(fixture.inbox.disableFixes).not.toHaveBeenCalled();
+  });
+
   it("turns off stored fixes when the replacement investigator has no repository", async () => {
     const fixture = await render({ investigation: true, fromInbox: {}, fixesEnabled: true });
     await act(async () => fixture.submit().click());

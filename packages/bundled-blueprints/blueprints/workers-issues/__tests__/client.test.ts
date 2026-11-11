@@ -330,6 +330,23 @@ describe("Worker issue inbox", () => {
     expect(buttonNamed("Investigate new notifications automatically")!.hidden).toBe(true);
   });
 
+  it("asks for fixes again when changing the setup of an inbox that proposes them", async () => {
+    getSetupStatus.mockResolvedValue({
+      accountId: "a".repeat(32),
+      workerName: "checkout-test",
+      investigationsEnabled: true,
+      investigatorReady: true,
+      releasesReady: true,
+      backgroundChecks: true,
+      fixes: { provider: "github", repository: "acme/checkout", branchPrefix: "cloudflare-os/" },
+    });
+    await load();
+    expect(setupRequest(linkNamed("Change AI setup")!).remediation).toEqual({
+      allowPublic: false,
+      repositoryUrl: "https://github.com/acme/checkout",
+    });
+  });
+
   it("offers no setup link outside a workspace page", async () => {
     history.replaceState(null, "", "/gadget/1");
     await load();
