@@ -239,260 +239,263 @@ export const WorkersIssueSetupPage = ({ request }: { request: WorkersIssueSetupR
   };
 
   return (
-    <main className="mx-auto flex min-h-screen w-full max-w-xl flex-col justify-center gap-6 p-6">
-      <div className="grid gap-2">
-        <p className="text-sm font-medium text-kumo-subtle">Cloudflare OS</p>
-        <h1 className="text-2xl font-semibold text-kumo-default">
-          {fixing ? "Enable AI fixes" : isInvestigation ? "Enable AI investigations" : "Connect Cloudflare OS"}
-        </h1>
-        <p className="text-sm text-kumo-subtle">
-          {isInvestigation ? "Analyze logs and traces for" : "Receive issue notifications for"}{" "}
-          <strong className="text-kumo-default">{request.workerName}</strong>.
-        </p>
-      </div>
-      <dl className="grid gap-4 rounded-lg border border-kumo-line bg-kumo-base p-4 text-sm">
-        <div className="grid gap-1">
-          <dt className="text-kumo-subtle">Cloudflare account</dt>
-          <dd className="break-all text-kumo-default">
-            {selectedAccount?.accountName ?? request.accountId}
-          </dd>
+    // The fullscreen app shell does not scroll, so this page scrolls itself in short windows.
+    <div className="h-full overflow-y-auto">
+      <main className="mx-auto flex min-h-full w-full max-w-xl flex-col justify-center gap-6 p-6">
+        <div className="grid gap-2">
+          <p className="text-sm font-medium text-kumo-subtle">Cloudflare OS</p>
+          <h1 className="text-2xl font-semibold text-kumo-default">
+            {fixing ? "Enable AI fixes" : isInvestigation ? "Enable AI investigations" : "Connect Cloudflare OS"}
+          </h1>
+          <p className="text-sm text-kumo-subtle">
+            {isInvestigation ? "Analyze logs and traces for" : "Receive issue notifications for"}{" "}
+            <strong className="text-kumo-default">{request.workerName}</strong>.
+          </p>
         </div>
-        {selectedAccount && (
+        <dl className="grid gap-4 rounded-lg border border-kumo-line bg-kumo-base p-4 text-sm">
           <div className="grid gap-1">
-            <dt className="text-kumo-subtle">Connected as</dt>
-            <dd className="text-kumo-default">
-              {selectedAccount.description.displayName ?? selectedAccount.description.uniqueName}
+            <dt className="text-kumo-subtle">Cloudflare account</dt>
+            <dd className="break-all text-kumo-default">
+              {selectedAccount?.accountName ?? request.accountId}
             </dd>
           </div>
-        )}
-      </dl>
-      {!ready && (
-        <>
-          {connection.checking ? (
-            <p role="status" className="text-sm text-kumo-subtle">
-              Checking existing Cloudflare connections…
-            </p>
-          ) : connection.error ? (
-            <div className="grid gap-2">
-              <p role="alert" className="text-sm text-kumo-danger">
-                {connection.error}
-              </p>
-              <Button onClick={connection.retry}>Try again</Button>
+          {selectedAccount && (
+            <div className="grid gap-1">
+              <dt className="text-kumo-subtle">Connected as</dt>
+              <dd className="text-kumo-default">
+                {selectedAccount.description.displayName ?? selectedAccount.description.uniqueName}
+              </dd>
             </div>
-          ) : connection.choices.length > 1 ? (
-            <Select
-              label="Cloudflare connection"
-              placeholder="Choose a connection for this account"
-              disabled={busy}
-              value={accountId}
-              onValueChange={(value) => setAccountId(value ?? "")}
-              items={connection.choices.map((account) => ({
-                value: String(account.id),
-                label:
-                  account.description.displayName ??
-                  account.description.uniqueName ??
-                  `Connection ${account.id}`,
-              }))}
-            />
-          ) : (
-            <p className="text-sm text-kumo-subtle">
-              {selectedAccount?.credentialsValid
-                ? "Your existing Cloudflare connection will be reused."
-                : "Cloudflare authorization is needed. Setup will continue automatically when you finish."}
-            </p>
           )}
-          {isInvestigation ? (
-            <div className="grid gap-3">
-              <p className="text-sm text-kumo-subtle">
-                {fixing
-                  ? "Setup installs a new fixer with the selected model, read-only telemetry for this Worker, and access to propose changes to one repository, replacing any existing investigator binding. Workspace editors can change its bindings later."
-                  : "Setup installs a new investigator with the selected model and read-only telemetry for this Worker, replacing any existing investigator binding. Workspace editors can change its bindings later. Repository access, tests, code changes, and deployments require separate capabilities."}
+        </dl>
+        {!ready && (
+          <>
+            {connection.checking ? (
+              <p role="status" className="text-sm text-kumo-subtle">
+                Checking existing Cloudflare connections…
               </p>
-              {selectedModel && !changeModel ? (
-                <div className="flex flex-wrap items-center justify-between gap-2 text-sm text-kumo-default">
-                  <span>Model: {selectedModel.name}</span>
-                  <Button variant="ghost" disabled={busy} onClick={() => setChangeModel(true)}>
-                    Change
-                  </Button>
-                </div>
-              ) : (
-                <Select
-                  label="Investigation model"
-                  placeholder="Choose a language model"
-                  disabled={busy}
-                  value={selectedModel?.id ?? ""}
-                  onValueChange={(value) => setModelId(value ?? "")}
-                  items={models.map((model) => ({ value: model.id, label: model.name }))}
-                />
-              )}
-              {modelSettings && models.length === 0 && (
-                <p className="text-sm text-kumo-subtle">
-                  Configure a language model in OS Settings, then reload this setup. Your
-                  notification destination is already connected.
+            ) : connection.error ? (
+              <div className="grid gap-2">
+                <p role="alert" className="text-sm text-kumo-danger">
+                  {connection.error}
                 </p>
-              )}
-              {remediation && (
-                <section className="grid gap-3 rounded-lg border border-kumo-line p-4">
-                  <Switch
-                    label="Propose fixes as pull or merge requests"
-                    checked={fixesWanted}
+                <Button onClick={connection.retry}>Try again</Button>
+              </div>
+            ) : connection.choices.length > 1 ? (
+              <Select
+                label="Cloudflare connection"
+                placeholder="Choose a connection for this account"
+                disabled={busy}
+                value={accountId}
+                onValueChange={(value) => setAccountId(value ?? "")}
+                items={connection.choices.map((account) => ({
+                  value: String(account.id),
+                  label:
+                    account.description.displayName ??
+                    account.description.uniqueName ??
+                    `Connection ${account.id}`,
+                }))}
+              />
+            ) : (
+              <p className="text-sm text-kumo-subtle">
+                {selectedAccount?.credentialsValid
+                  ? "Your existing Cloudflare connection will be reused."
+                  : "Cloudflare authorization is needed. Setup will continue automatically when you finish."}
+              </p>
+            )}
+            {isInvestigation ? (
+              <div className="grid gap-3">
+                <p className="text-sm text-kumo-subtle">
+                  {fixing
+                    ? "Setup installs a new fixer with the selected model, read-only telemetry for this Worker, and access to propose changes to one repository, replacing any existing investigator binding. Workspace editors can change its bindings later."
+                    : "Setup installs a new investigator with the selected model and read-only telemetry for this Worker, replacing any existing investigator binding. Workspace editors can change its bindings later. Repository access, tests, code changes, and deployments require separate capabilities."}
+                </p>
+                {selectedModel && !changeModel ? (
+                  <div className="flex flex-wrap items-center justify-between gap-2 text-sm text-kumo-default">
+                    <span>Model: {selectedModel.name}</span>
+                    <Button variant="ghost" disabled={busy} onClick={() => setChangeModel(true)}>
+                      Change
+                    </Button>
+                  </div>
+                ) : (
+                  <Select
+                    label="Investigation model"
+                    placeholder="Choose a language model"
                     disabled={busy}
-                    onClick={() => setFixesWanted((value) => !value)}
+                    value={selectedModel?.id ?? ""}
+                    onValueChange={(value) => setModelId(value ?? "")}
+                    items={models.map((model) => ({ value: model.id, label: model.name }))}
                   />
-                  {fixesWanted && (
-                    <>
-                      <p className="text-sm text-kumo-subtle">
-                        The fixer commits a fix and a regression test to a new branch starting with{" "}
-                        <code>{FIX_BRANCH_PREFIX}</code> and opens a pull or merge request into the
-                        default branch, without asking you again: enabling fixes approves them. It
-                        cannot merge, push to other branches, or deploy: the pull or merge request
-                        is your review, you merge, and your CI deploys. Fixes are written from production
-                        telemetry and notification text, which can contain personal data or
-                        attacker-controlled content; the fixer is instructed to leave such data out,
-                        but review every change before merging.
-                      </p>
-                      <p className="text-sm text-kumo-subtle">
-                        Once you merge, the inbox follows the fix to production through this
-                        Worker&apos;s deployments and builds. When every live version contains it and
-                        an hour of traffic passes without the issue, the inbox marks the issue
-                        resolved in Workers Observability without asking. It checks every 15
-                        minutes with Scheduled Tasks, which setup turns on.
-                      </p>
-                      <Input
-                        label="Repository"
-                        placeholder="https://github.com/owner/repo"
-                        value={repositoryUrl}
-                        disabled={busy}
-                        onChange={(event) => setRepositoryUrl(event.target.value)}
-                        description={
-                          repository && !("error" in repository)
-                            ? `${repository.vendorName} · ${repository.path}`
-                            : "The repository this Worker is built from."
-                        }
-                        error={
-                          repositoryUrl && repository && "error" in repository
-                            ? repository.error
-                            : undefined
-                        }
-                      />
-                      <Switch
-                        label="Allow public repositories"
-                        checked={allowPublic}
-                        disabled={busy}
-                        onClick={() => (allowPublic ? setAllowPublic(false) : setConfirmingPublic(true))}
-                      />
-                      {allowPublic && (
-                        <Banner
-                          variant="alert"
-                          description="With a public repository, each proposed change, and anything it contains, becomes public as soon as it is pushed, before you review it."
-                        />
-                      )}
-                    </>
-                  )}
-                </section>
-              )}
-              {fromInbox && (
-                <section className="grid gap-3 rounded-lg border border-kumo-line p-4">
-                  <Switch
-                    label="Investigate new notifications automatically"
-                    checked={automatic}
-                    disabled={busy}
-                    onClick={() => setAutomatic((value) => !value)}
-                  />
+                )}
+                {modelSettings && models.length === 0 && (
                   <p className="text-sm text-kumo-subtle">
-                    {automatic
-                      ? "Every new issue notification runs the model, which incurs usage costs."
-                      : "New notifications are only stored. Investigate any of them from the inbox."}
+                    Configure a language model in OS Settings, then reload this setup. Your
+                    notification destination is already connected.
                   </p>
-                </section>
-              )}
-              {request.issueId && (
-                <Checkbox
-                  label="Also investigate the issue I came from"
-                  checked={investigateCurrent}
-                  disabled={busy}
-                  onCheckedChange={setInvestigateCurrent}
-                />
-              )}
+                )}
+                {remediation && (
+                  <section className="grid gap-3 rounded-lg border border-kumo-line p-4">
+                    <Switch
+                      label="Propose fixes as pull or merge requests"
+                      checked={fixesWanted}
+                      disabled={busy}
+                      onClick={() => setFixesWanted((value) => !value)}
+                    />
+                    {fixesWanted && (
+                      <>
+                        <p className="text-sm text-kumo-subtle">
+                          The fixer commits a fix and a regression test to a new branch starting with{" "}
+                          <code>{FIX_BRANCH_PREFIX}</code> and opens a pull or merge request into the
+                          default branch, without asking you again: enabling fixes approves them. It
+                          cannot merge, push to other branches, or deploy: the pull or merge request
+                          is your review, you merge, and your CI deploys. Fixes are written from production
+                          telemetry and notification text, which can contain personal data or
+                          attacker-controlled content; the fixer is instructed to leave such data out,
+                          but review every change before merging.
+                        </p>
+                        <p className="text-sm text-kumo-subtle">
+                          Once you merge, the inbox follows the fix to production through this
+                          Worker&apos;s deployments and builds. When every live version contains it and
+                          an hour of traffic passes without the issue, the inbox marks the issue
+                          resolved in Workers Observability without asking. It checks every 15
+                          minutes with Scheduled Tasks, which setup turns on.
+                        </p>
+                        <Input
+                          label="Repository"
+                          placeholder="https://github.com/owner/repo"
+                          value={repositoryUrl}
+                          disabled={busy}
+                          onChange={(event) => setRepositoryUrl(event.target.value)}
+                          description={
+                            repository && !("error" in repository)
+                              ? `${repository.vendorName} · ${repository.path}`
+                              : "The repository this Worker is built from."
+                          }
+                          error={
+                            repositoryUrl && repository && "error" in repository
+                              ? repository.error
+                              : undefined
+                          }
+                        />
+                        <Switch
+                          label="Allow public repositories"
+                          checked={allowPublic}
+                          disabled={busy}
+                          onClick={() => (allowPublic ? setAllowPublic(false) : setConfirmingPublic(true))}
+                        />
+                        {allowPublic && (
+                          <Banner
+                            variant="alert"
+                            description="With a public repository, each proposed change, and anything it contains, becomes public as soon as it is pushed, before you review it."
+                          />
+                        )}
+                      </>
+                    )}
+                  </section>
+                )}
+                {fromInbox && (
+                  <section className="grid gap-3 rounded-lg border border-kumo-line p-4">
+                    <Switch
+                      label="Investigate new notifications automatically"
+                      checked={automatic}
+                      disabled={busy}
+                      onClick={() => setAutomatic((value) => !value)}
+                    />
+                    <p className="text-sm text-kumo-subtle">
+                      {automatic
+                        ? "Every new issue notification runs the model, which incurs usage costs."
+                        : "New notifications are only stored. Investigate any of them from the inbox."}
+                    </p>
+                  </section>
+                )}
+                {request.issueId && (
+                  <Checkbox
+                    label="Also investigate the issue I came from"
+                    checked={investigateCurrent}
+                    disabled={busy}
+                    onCheckedChange={setInvestigateCurrent}
+                  />
+                )}
+              </div>
+            ) : (
+              <p className="text-sm text-kumo-subtle">
+                AI investigations are optional. You can enable them after saving your automation. Each
+                Cloudflare connection supports up to 100 notification subscriptions per account.
+              </p>
+            )}
+            <div className="flex flex-wrap justify-end gap-2 border-t border-kumo-line pt-4">
+              <Button
+                disabled={busy && !message.startsWith("Checking")}
+                onClick={() => {
+                  operation.current?.abort();
+                  window.close();
+                }}
+              >
+                {isInvestigation ? "Not now" : "Cancel"}
+              </Button>
+              <Button
+                variant="primary"
+                loading={busy}
+                disabled={
+                  busy ||
+                  connection.checking ||
+                  Boolean(connection.error) ||
+                  (connection.choices.length > 1 && !selectedAccount) ||
+                  (isInvestigation && !selectedModel) ||
+                  !repositoryReady
+                }
+                onClick={() => void setup()}
+              >
+                {fixing ? "Enable fixes" : isInvestigation ? "Enable investigations" : "Connect destination"}
+              </Button>
             </div>
-          ) : (
-            <p className="text-sm text-kumo-subtle">
-              AI investigations are optional. You can enable them after saving your automation. Each
-              Cloudflare connection supports up to 100 notification subscriptions per account.
-            </p>
-          )}
-          <div className="flex flex-wrap justify-end gap-2 border-t border-kumo-line pt-4">
-            <Button
-              disabled={busy && !message.startsWith("Checking")}
-              onClick={() => {
-                operation.current?.abort();
-                window.close();
-              }}
-            >
-              {isInvestigation ? "Not now" : "Cancel"}
-            </Button>
-            <Button
-              variant="primary"
-              loading={busy}
-              disabled={
-                busy ||
-                connection.checking ||
-                Boolean(connection.error) ||
-                (connection.choices.length > 1 && !selectedAccount) ||
-                (isInvestigation && !selectedModel) ||
-                !repositoryReady
-              }
-              onClick={() => void setup()}
-            >
-              {fixing ? "Enable fixes" : isInvestigation ? "Enable investigations" : "Connect destination"}
-            </Button>
-          </div>
-        </>
-      )}
-      {error && (
-        <p role="alert" className="text-sm text-kumo-danger">
-          {error}
-        </p>
-      )}
-      {message && (
-        <p role="status" className="text-sm text-kumo-subtle">
-          {message}
-        </p>
-      )}
-      {ready && (
-        <LinkButton variant="secondary" href={`/workspace/${ready.workspaceId}`} external>
-          Open issue inbox
-        </LinkButton>
-      )}
-      <Dialog.Root open={confirmingPublic} onOpenChange={(open) => !open && closePublicDialog()}>
-        <Dialog className="grid gap-4 p-6">
-          <Dialog.Title className="text-lg font-semibold">Allow public repositories?</Dialog.Title>
-          <Dialog.Description className="text-sm text-kumo-subtle">
-            Anyone can read what is pushed to a public repository: the fix, its test, the commit
-            message, and the description. They are written from production telemetry, which can
-            contain personal or secret data. The fixer is instructed to leave such data out, but it
-            can make mistakes.
-          </Dialog.Description>
-          <Checkbox
-            label="I understand that proposed changes to a public repository are visible to anyone"
-            checked={publicAcknowledged}
-            onCheckedChange={setPublicAcknowledged}
-          />
-          <div className="flex justify-end gap-2">
-            <Button onClick={closePublicDialog}>Cancel</Button>
-            <Button
-              variant="primary"
-              disabled={!publicAcknowledged}
-              onClick={() => {
-                setAllowPublic(true);
-                closePublicDialog();
-              }}
-            >
-              Allow
-            </Button>
-          </div>
-        </Dialog>
-      </Dialog.Root>
-    </main>
+          </>
+        )}
+        {error && (
+          <p role="alert" className="text-sm text-kumo-danger">
+            {error}
+          </p>
+        )}
+        {message && (
+          <p role="status" className="text-sm text-kumo-subtle">
+            {message}
+          </p>
+        )}
+        {ready && (
+          <LinkButton variant="secondary" href={`/workspace/${ready.workspaceId}`} external>
+            Open issue inbox
+          </LinkButton>
+        )}
+        <Dialog.Root open={confirmingPublic} onOpenChange={(open) => !open && closePublicDialog()}>
+          <Dialog className="grid gap-4 p-6">
+            <Dialog.Title className="text-lg font-semibold">Allow public repositories?</Dialog.Title>
+            <Dialog.Description className="text-sm text-kumo-subtle">
+              Anyone can read what is pushed to a public repository: the fix, its test, the commit
+              message, and the description. They are written from production telemetry, which can
+              contain personal or secret data. The fixer is instructed to leave such data out, but it
+              can make mistakes.
+            </Dialog.Description>
+            <Checkbox
+              label="I understand that proposed changes to a public repository are visible to anyone"
+              checked={publicAcknowledged}
+              onCheckedChange={setPublicAcknowledged}
+            />
+            <div className="flex justify-end gap-2">
+              <Button onClick={closePublicDialog}>Cancel</Button>
+              <Button
+                variant="primary"
+                disabled={!publicAcknowledged}
+                onClick={() => {
+                  setAllowPublic(true);
+                  closePublicDialog();
+                }}
+              >
+                Allow
+              </Button>
+            </div>
+          </Dialog>
+        </Dialog.Root>
+      </main>
+    </div>
   );
 };
