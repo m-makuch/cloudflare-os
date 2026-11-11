@@ -75,6 +75,7 @@ interface GadgetEnv {
       subscription: {
         alertType: string;
         createPolicy: boolean;
+        destinationName?: string;
       },
     ): Promise<void>;
     getStatus(): ReturnType<WorkerIssueInbox["getNotificationStatus"]>;
@@ -392,6 +393,8 @@ export class Gadget extends DurableObject<GadgetEnv, unknown> implements WorkerI
         await this.env.CLOUDFLARE_NOTIFICATIONS.subscribe(callback, {
           alertType: "workers_observability_real_time_issue",
           createPolicy: false,
+          // Each inbox accepts only its own Worker, so name the destination after it in Cloudflare.
+          destinationName: `Cloudflare OS: ${scope.workerName}`,
         });
         await this.ctx.storage.put("subscribed", true);
       }

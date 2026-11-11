@@ -193,6 +193,7 @@ describe("Worker issue investigation inbox", () => {
     expect(fixture.subscribe).toHaveBeenCalledWith(expect.anything(), {
       alertType: "workers_observability_real_time_issue",
       createPolicy: false,
+      destinationName: `Cloudflare OS: ${scope.workerName}`,
     });
     await expect(
       fixture.gadget.initialize({ ...scope, workerName: "other-worker" }),
@@ -767,6 +768,7 @@ describe("following a fix to production", () => {
     await fixture.gadget.onNotification(again);
     const runs = await fixture.gadget.listInvestigations();
     expect(runs.find((entry) => entry.run_key === RUN)?.status).toBe("regressed");
+    await fixture.settle();
   });
 
   it("follows nothing without a releases binding: a merge just waits, and setup says so", async () => {
