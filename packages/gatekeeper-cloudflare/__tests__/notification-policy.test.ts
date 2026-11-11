@@ -30,3 +30,9 @@ it("rejects extra subscription authority and accepts unfamiliar syntactically va
   expect(() => validateNotificationSubscription({ alertType: "new_provider_alert", credentials: "token" } as unknown as CloudflareNotificationSubscription)).toThrow("Unsupported");
   expect(validateNotificationSubscription({ alertType: "new_provider_alert", policy: { filters: { zones: ["a"] } } })).toEqual({ filters: { zones: ["a"] } });
 });
+
+it("accepts a destination name and rejects blank, padded, oversized, or control-character names", () => {
+  expect(() => validateNotificationSubscription({ alertType: "test_alert", destinationName: "Cloudflare OS: checkout-api" })).not.toThrow();
+  for (const destinationName of ["", " padded", "x".repeat(101), "line\nbreak", 7])
+    expect(() => validateNotificationSubscription({ alertType: "test_alert", destinationName } as unknown as CloudflareNotificationSubscription)).toThrow("destination names");
+});

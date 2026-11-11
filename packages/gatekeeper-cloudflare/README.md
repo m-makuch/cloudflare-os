@@ -270,6 +270,8 @@ or billing/sign-in flow. The account resource is `https://dash.cloudflare.com/<a
    **Connections**. Enabling creates an authenticated generic webhook destination and an enabled
    Cloudflare notification policy for that alert type by default. Managed hooks for the same type and settings
    share the policy; `createPolicy: false` uses only the destination.
+   The destination is named "Cloudflare OS" unless the first subscription sets `destinationName`
+   (for example after the Worker it serves); later subscriptions and recovery keep that name.
 4. Use Cloudflare's **Save and Test** to verify ingress. `getStatus()` reports destination and policy
 IDs, authorization health, pending/retrying handoff counts, the subscriber limit, and last test and
 receive times. It never returns credentials. An installed destination alone is not proof of a healthy grant.
@@ -386,7 +388,7 @@ Transient disconnect-cleanup failures retain credentials and arm the account's d
 retry. Reauthorization cannot replace a grant while cleanup is pending. A fresh connection has a new
 account identity; old receiver tombstones prevent stale capabilities from resurrecting it. If the grant has expired
 or no longer has access to the account, provider resources cannot be removed, so disconnect completes
-locally and logs `notification.revoke.cleanup.skipped`; delete the `Cloudflare OS` destination and
+locally and logs `notification.revoke.cleanup.skipped`; delete the connection's destination and
 policies in the dashboard. Provider-side setup is reconciled by the exact webhook URL, allowing recovery from
 interrupted creation without taking over similarly named destinations owned by other connections.
 Policies are reconciled by a connection-specific description and matching type, settings, enabled state and sole destination.

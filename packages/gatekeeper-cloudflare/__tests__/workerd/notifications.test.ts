@@ -714,6 +714,63 @@ it.each([false, true])(
   },
 );
 
+it("names a new destination once and keeps that name through recovery and migration", async () => {
+  const name = "named-destination";
+  const account = env.USER_ACCOUNT.get(env.USER_ACCOUNT.idFromString(userObjectId));
+  await runInDurableObject(account, (_instance, state) => {
+    state.storage.kv.put("refreshToken", "test-refresh");
+    state.storage.kv.put("accessToken", { token: "test-access", expires: Date.now() + 86400_000 });
+    state.storage.kv.put("grantedScopes", ["notifications.write"]);
+  });
+  const bodies: { method?: string; name: string }[] = [];
+  let deleted = false;
+  vi.stubGlobal(
+    "fetch",
+    vi.fn(async (url: string, init: RequestInit) => {
+      if (init.method === "GET" && url.endsWith(`/webhooks/${"d".repeat(32)}`))
+        return deleted
+          ? new Response(null, { status: 404 })
+          : Response.json({
+              success: true,
+              result: { id: "d".repeat(32), url: "https://old.example" },
+            });
+      if (init.method === "GET") return Response.json({ success: true, result: [] });
+      bodies.push({ method: init.method, name: JSON.parse(init.body as string).name });
+      return Response.json({ success: true, result: { id: "d".repeat(32) } });
+    }),
+  );
+  const stub = env.NOTIFICATION_RECEIVER.getByName(name);
+  const enable = (hookId: string, destinationName: string) =>
+    runInDurableObject(stub, async (instance, state) => {
+      const exports = state.exports as unknown as {
+        NotificationTestHooks(options: object): Fetcher<NotificationTestHooks>;
+      };
+      await instance.enable(
+        {
+          accountId,
+          userObjectId,
+          hookId,
+          alertType: "test_alert",
+          createPolicy: false,
+          destinationName,
+        },
+        exports.NotificationTestHooks({ props: { hookId } }) as unknown as Parameters<
+          typeof instance.enable
+        >[1],
+      );
+    });
+  await enable("hook-1", "Cloudflare OS: checkout-api");
+  // The provider reports another URL, so the second enable migrates the address in place.
+  await enable("hook-2", "Cloudflare OS: other-worker");
+  deleted = true;
+  await enable("hook-3", "Cloudflare OS: other-worker");
+  expect(bodies).toEqual([
+    { method: "POST", name: "Cloudflare OS: checkout-api" },
+    { method: "PUT", name: "Cloudflare OS: checkout-api" },
+    { method: "POST", name: "Cloudflare OS: checkout-api" },
+  ]);
+});
+
 it.each([403, 503])(
   "does not replace a destination or enable a hook when its live lookup fails with HTTP %s",
   async (status) => {

@@ -69,6 +69,13 @@ it("creates a generic webhook destination", async () => {
   });
 });
 
+it("creates a destination with the subscriber's name", async () => {
+  const calls = mock([[], { id: webhook }]);
+  const name = "Cloudflare OS: checkout-api";
+  await provisionNotificationInstallation("token", account, url, "secret", name);
+  expect(JSON.parse(calls[1]!.init.body as string)).toMatchObject({ name });
+});
+
 it("identifies a rejected webhook configuration without exposing its URL, secret, or provider message", async () => {
   mock([
     [],

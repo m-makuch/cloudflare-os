@@ -169,6 +169,9 @@ export async function getNotificationDestinationUrl(
   }
 }
 
+/** Name for destinations whose subscriber did not choose one. */
+export const DEFAULT_DESTINATION_NAME = "Cloudflare OS";
+
 /** Reconcile by the exact connection URL, never adopt another connection's similarly named webhook.
  */
 export async function provisionNotificationInstallation(
@@ -176,6 +179,7 @@ export async function provisionNotificationInstallation(
   accountId: string,
   webhookUrl: string,
   apiKey: string,
+  name = DEFAULT_DESTINATION_NAME,
 ): Promise<NotificationInstallation> {
   const root = `/accounts/${assertCloudflareAccountId(accountId)}/alerting/v3`;
   const matches = (await list(token, `${root}/destinations/webhooks`)).filter(
@@ -185,7 +189,7 @@ export async function provisionNotificationInstallation(
     throw new Error(
       "Multiple notification destinations use this connection URL. Remove the duplicate in Cloudflare and retry.",
     );
-  const body = { name: "Cloudflare OS", type: "generic", url: webhookUrl, secret: apiKey };
+  const body = { name, type: "generic", url: webhookUrl, secret: apiKey };
   const webhookId = matches[0]
     ? id(matches[0].id)
     : id(object(await request(token, `${root}/destinations/webhooks`, "POST", body)).id);
@@ -331,11 +335,12 @@ export async function updateNotificationDestination(
   webhookId: string,
   webhookUrl: string,
   apiKey: string,
+  name = DEFAULT_DESTINATION_NAME,
 ): Promise<void> {
   await request(
     token,
     `/accounts/${assertCloudflareAccountId(accountId)}/alerting/v3/destinations/webhooks/${id(webhookId)}`,
     "PUT",
-    { name: "Cloudflare OS", type: "generic", url: webhookUrl, secret: apiKey },
+    { name, type: "generic", url: webhookUrl, secret: apiKey },
   );
 }
