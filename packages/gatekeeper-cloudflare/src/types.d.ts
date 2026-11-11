@@ -784,9 +784,6 @@ export interface CloudflareNotificationSubscription {
   createPolicy?: boolean;
   /** Configure a managed policy. Cannot be supplied with createPolicy: false. */
   policy?: CloudflareNotificationPolicySettings;
-  /** Name for this connection's webhook destination when it is first created, for example the
-   * Worker it serves (default "Cloudflare OS"). Later subscriptions keep the existing name. */
-  destinationName?: string;
 }
 
 /** Persistent notification callback implemented by a workspace or Gadget. */

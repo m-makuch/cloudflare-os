@@ -79,11 +79,9 @@ type HookProps = NotificationsProps & {
   createPolicy?: boolean;
   policy?: CloudflareNotificationPolicySettings;
   policyKey?: string;
-  destinationName?: string;
 };
 type StoredHook = { props: HookProps; initiator: Fetcher<HookInitiator<HookTarget>> };
-type Installation = NotificationInstallation &
-  NotificationsProps & { authHash: string; destinationName?: string };
+type Installation = NotificationInstallation & NotificationsProps & { authHash: string };
 type AddressMigration = { apiKey: string; authHash: string; webhookUrl: string };
 type PolicyIntent = Partial<NotificationPolicy> & {
   alertType: string;
@@ -146,7 +144,6 @@ class CloudflareNotificationsSessionImpl
       alertType: subscription.alertType,
       createPolicy: subscription.createPolicy ?? true,
       ...(Object.keys(policy).length ? { policy } : {}),
-      ...(subscription.destinationName ? { destinationName: subscription.destinationName } : {}),
     };
     const controller = this.#ctx.exports.CloudflareNotificationHookController({ props });
     await this.#queue.bindHook(
@@ -339,7 +336,7 @@ export class CloudflareNotificationReceiver extends DurableObject<NotificationEn
     return token;
   }
 
-  async #provision(props: NotificationsProps & { destinationName?: string }): Promise<void> {
+  async #provision(props: NotificationsProps): Promise<void> {
     const token = await this.#token(props);
     const base = notificationWebhookBaseUrl(configuredNotificationBaseUrl(this.env));
     // Record ownership before external side effects, so disconnect can stop incomplete setup.
@@ -350,24 +347,17 @@ export class CloudflareNotificationReceiver extends DurableObject<NotificationEn
     const authHash = await hashWebhookApiKey(apiKey);
     this.ctx.storage.kv.put("pendingAuthHash", authHash);
     this.ctx.storage.kv.put("owner", props);
-    // Keep the first chosen name across recovery; a later subscriber cannot rename the destination.
-    const destinationName =
-      this.ctx.storage.kv.get<Installation>("installation")?.destinationName ??
-      props.destinationName;
     try {
       const installation = await provisionNotificationInstallation(
         token,
         props.accountId,
         webhookUrl,
         apiKey,
-        destinationName,
       );
       this.ctx.storage.kv.put<Installation>("installation", {
         ...installation,
-        accountId: props.accountId,
-        userObjectId: props.userObjectId,
+        ...props,
         authHash,
-        ...(destinationName ? { destinationName } : {}),
       });
       this.ctx.storage.kv.put("setupComplete", true);
     } finally {
@@ -414,7 +404,6 @@ export class CloudflareNotificationReceiver extends DurableObject<NotificationEn
       installation.webhookId,
       migration.webhookUrl,
       migration.apiKey,
-      installation.destinationName,
     );
     installation.authHash = migration.authHash;
     this.ctx.storage.kv.put("installation", installation);

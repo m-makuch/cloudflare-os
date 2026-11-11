@@ -156,20 +156,11 @@ export function validateNotificationSubscription(
   )
     throw new Error("Choose one valid Cloudflare alert type for this hook.");
   for (const key of Object.keys(subscription)) {
-    if (!["alertType", "createPolicy", "policy", "destinationName"].includes(key))
+    if (!["alertType", "createPolicy", "policy"].includes(key))
       throw new Error(`Unsupported notification subscription setting: ${key}`);
   }
   if (subscription.createPolicy !== undefined && typeof subscription.createPolicy !== "boolean")
     throw new Error("Invalid createPolicy setting.");
-  if (
-    subscription.destinationName !== undefined &&
-    (typeof subscription.destinationName !== "string" ||
-      subscription.destinationName !== subscription.destinationName.trim() ||
-      !/^[^\p{Cc}]{1,100}$/u.test(subscription.destinationName))
-  )
-    throw new Error(
-      "Notification destination names must be 1-100 characters with no surrounding spaces.",
-    );
   if (subscription.createPolicy === false && subscription.policy !== undefined)
     throw new Error("External notification subscriptions cannot configure a policy.");
   return canonicalNotificationPolicy(subscription.policy);
