@@ -22,13 +22,19 @@ import {
   parseNotificationsResourceUrl, assertCloudflareAccountId, grantedCloudflareResourcePatterns,
   ACCOUNT_OBSERVABILITY_RESOURCE,
   WORKER_OBSERVABILITY_RESOURCE,
+  WORKER_RELEASES_RESOURCE,
   accountObservabilityUrl,
   workerObservabilityUrl,
   parseObservabilityResourceUrl,
+  parseWorkerReleasesResourceUrl,
   observabilitySubresourceId,
   parseObservabilitySubresourceId,
+  parseCloudflareSubresourceId,
+  type CloudflareSubresource,
 } from "./resources.js";
 import { CloudflareObservabilityApi, deniesAccess } from "./observability-api.js";
+import { canReadWorkerBuild, canReadWorkerScript } from "./releases-api.js";
+import type { CloudflareSubresourceVerifierApi } from "./releases.js";
 import { CloudflareObservabilitySessionImpl } from "./observability-session.js";
 import {
   CloudflareAccountConfiguratorUI,
@@ -37,6 +43,7 @@ import {
 } from "./cloudflare-configurators.js";
 import ACCOUNT_CONFIGURATOR_HTML from "./generated/cloudflare-account-configurator-ui.txt";
 import WORKER_CONFIGURATOR_HTML from "./generated/cloudflare-worker-configurator-ui.txt";
+import WORKER_RELEASES_CONFIGURATOR_HTML from "./generated/cloudflare-worker-releases-configurator-ui.txt";
 import NOTIFICATIONS_CONFIGURATOR_HTML from "./generated/cloudflare-notifications-configurator-ui.txt";
 import type { CloudflareObservabilitySession } from "./types.js";
 import { VENDOR_ID } from "./vendor.js";
@@ -47,6 +54,7 @@ import { parseNotificationWebhookPath, notificationReceiverName, configuredNotif
   notificationWebhookBaseUrl, MAX_NOTIFICATION_BODY_BYTES } from "./notifications-webhook.js";
 export { CloudflareNotificationsGatekeeper, CloudflareNotificationHookController,
   CloudflareNotificationReceiver } from "./notifications.js";
+export { CloudflareWorkerReleasesGatekeeper } from "./releases.js";
 
 const logger = obsContext.createLogger({
   component: "gatekeeper.cloudflare", vendorId: VENDOR_ID,
@@ -84,6 +92,24 @@ const ACCESS_TOKEN_EXPIRY_SAFETY_MS = 60 * 1000;
 // new grant is noticed soon.
 const TELEMETRY_ACCESS_ALLOWED_TTL_MS = 15 * 60_000;
 const TELEMETRY_ACCESS_DENIED_TTL_MS = 15_000;
+
+// The scope without which a connection cannot read a kind of subresource at all, so it is denied
+// without asking Cloudflare.
+const SUBRESOURCE_SCOPES: Record<CloudflareSubresource["kind"], string> = {
+  telemetry: "workers-observability.read",
+  script: "workers-scripts.read",
+  build: "workers-ci.read",
+};
+
+// Where checkSubresourceAccess caches an answer. A telemetry answer keeps the bare account ID it
+// was cached under before other kinds existed.
+function accessCacheKey(subresource: CloudflareSubresource): string {
+  switch (subresource.kind) {
+    case "telemetry": return subresource.accountId;
+    case "script": return `script/${subresource.accountId}/${encodeURIComponent(subresource.workerName)}`;
+    case "build": return `build/${subresource.accountId}/${subresource.buildUuid}`;
+  }
+}
 
 // Official Cloudflare logomark (orange cloud on a transparent background), as a data URI so it can
 // be rendered directly as the vendor/account avatar.
@@ -233,7 +259,8 @@ export class GatekeeperVendor extends WorkerEntrypoint<Env> implements Gatekeepe
       description:
           "Sign in with your Cloudflare account and use your own Cloudflare AI Gateway credits for " +
           "usage beyond the free tier. You can also connect Workers Observability to inspect logs, " +
-          "invocations, traces, and aggregate metrics, or receive Cloudflare notifications in your workspaces.",
+          "invocations, traces, and aggregate metrics, follow a Worker's releases and resolve its issues, " +
+          "or receive Cloudflare notifications in your workspaces.",
       providesAuth: true,
     };
   }
@@ -427,24 +454,39 @@ export class UserAccount extends DurableObject<Env> {
    * account is reconnected mid-check.
    */
   async checkTelemetryAccess(accountIds: string[]): Promise<boolean[]> {
+    return this.#checkAccess(accountIds.map(accountId => ({ kind: "telemetry", accountId })));
+  }
+
+  /**
+   * Whether these credentials can read each subresource (any ID parseCloudflareSubresourceId
+   * reads), in order: an account's telemetry by a telemetry read there, a Worker's deployments by
+   * reading them, a Workers Builds build by reading it. Answers are reused, and a connection
+   * without usable credentials or the kind's scope denied, as in checkTelemetryAccess. Throws for
+   * an ID it does not know, before asking anything.
+   */
+  async checkSubresourceAccess(subresources: string[]): Promise<boolean[]> {
+    return this.#checkAccess(subresources.map(parseCloudflareSubresourceId));
+  }
+
+  async #checkAccess(subresources: CloudflareSubresource[]): Promise<boolean[]> {
     // Every answer must come from the grant installed when the check began, or one principal's
     // answer for one account could be paired with another's for the next.
     const generation = this.#grantGeneration;
     const token = await this.getAccessToken();
     // Read after the token, since a refresh records the scopes it returned, which may have narrowed.
     const scopes = await this.getGrantedScopes();
+    const getToken = () => this.getAccessToken();
     const allowed: boolean[] = [];
-    if (!token || !grantedCloudflareResourcePatterns(scopes)
-        .includes(ACCOUNT_OBSERVABILITY_RESOURCE.urlPattern)) {
-      allowed.push(...accountIds.map(() => false));
-    } else {
-      // Asked one at a time, so a long list doesn't trip Cloudflare's per-user rate limit. Each
-      // probe reads the token live, so an answer is stored only under the grant that gave it.
-      for (const accountId of accountIds) {
-        allowed.push(await this.#access.cached(accountId,
-          granted => granted ? TELEMETRY_ACCESS_ALLOWED_TTL_MS : TELEMETRY_ACCESS_DENIED_TTL_MS,
-          () => canReadTelemetry(() => this.getAccessToken(), accountId)));
+    // Asked one at a time, so a long list doesn't trip Cloudflare's per-user rate limit. Each probe
+    // reads the token live, so an answer is stored only under the grant that gave it.
+    for (const subresource of subresources) {
+      if (!token || !scopes.includes(SUBRESOURCE_SCOPES[subresource.kind])) {
+        allowed.push(false);
+        continue;
       }
+      allowed.push(await this.#access.cached(accessCacheKey(subresource),
+        granted => granted ? TELEMETRY_ACCESS_ALLOWED_TTL_MS : TELEMETRY_ACCESS_DENIED_TTL_MS,
+        () => canReadSubresource(getToken, subresource)));
     }
     if (this.#grantGeneration !== generation) {
       throw new Error("This Cloudflare connection was reconnected while its access was being checked.");
@@ -644,6 +686,20 @@ export class GatekeeperUserImpl extends WorkerEntrypoint<Env, GatekeeperUserImpl
         resource: NOTIFICATIONS_RESOURCE,
       };
     }
+    let releases: { accountId: string; workerName: string } | undefined;
+    try { releases = parseWorkerReleasesResourceUrl(url); } catch { /* Try telemetry below. */ }
+    if (releases) {
+      if (!grantedCloudflareResourcePatterns(await this.#account().getGrantedScopes())
+          .includes(WORKER_RELEASES_RESOURCE.urlPattern)) {
+        throw new Error("Reconnect Cloudflare with Worker releases access first.");
+      }
+      return {
+        class: this.ctx.exports.CloudflareWorkerReleasesGatekeeper({
+          props: { userObjectId: this.ctx.props.userObjectId, ...releases },
+        }),
+        resource: WORKER_RELEASES_RESOURCE,
+      };
+    }
     const parsed = parseObservabilityResourceUrl(url);
     return {
       class: this.ctx.exports.CloudflareObservabilityGatekeeper({
@@ -701,6 +757,12 @@ export class GatekeeperUserImpl extends WorkerEntrypoint<Env, GatekeeperUserImpl
         ui: new RpcStub(new CloudflareWorkerConfiguratorUI(getToken)),
       };
     }
+    if (resourceUrlPattern === WORKER_RELEASES_RESOURCE.urlPattern) {
+      return {
+        iframeHtml: WORKER_RELEASES_CONFIGURATOR_HTML,
+        ui: new RpcStub(new CloudflareWorkerConfiguratorUI(getToken)),
+      };
+    }
     throw new Error(`Unsupported Cloudflare resource configurator type: ${resourceUrlPattern}`);
   }
 
@@ -747,8 +809,21 @@ async function canReadTelemetry(
   }
 }
 
+/**
+ * Whether these credentials can read a subresource: false when Cloudflare denies access, throwing
+ * when it can't tell.
+ */
+function canReadSubresource(
+    getToken: () => Promise<string | null>, subresource: CloudflareSubresource): Promise<boolean> {
+  switch (subresource.kind) {
+    case "telemetry": return canReadTelemetry(getToken, subresource.accountId);
+    case "script": return canReadWorkerScript(getToken, subresource.accountId, subresource.workerName);
+    case "build": return canReadWorkerBuild(getToken, subresource.accountId, subresource.buildUuid);
+  }
+}
+
 /** Vendor-specific verifier methods trusted only after the overseer's same-vendor handoff. */
-export interface CloudflareVerifierApi extends GatekeeperUserVerifier {
+export interface CloudflareVerifierApi extends CloudflareSubresourceVerifierApi {
   /** Check whether this connected Cloudflare account can read the bound telemetry resource. */
   hasObservabilityAccess(accountId: string, workerName?: string): Promise<boolean>;
 
@@ -773,6 +848,11 @@ export class CloudflareVerifier extends WorkerEntrypoint<Env, GatekeeperUserImpl
   async checkTelemetryAccess(accountIds: string[]): Promise<boolean[]> {
     const id = this.ctx.exports.UserAccount.idFromString(this.ctx.props.userObjectId);
     return this.ctx.exports.UserAccount.get(id).checkTelemetryAccess(accountIds);
+  }
+
+  async checkSubresourceAccess(subresources: string[]): Promise<boolean[]> {
+    const id = this.ctx.exports.UserAccount.idFromString(this.ctx.props.userObjectId);
+    return this.ctx.exports.UserAccount.get(id).checkSubresourceAccess(subresources);
   }
 }
 

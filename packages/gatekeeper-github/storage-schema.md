@@ -178,8 +178,8 @@ Implemented TTL cache families:
 - `cache:repo-v2:<owner>:<repo>` -> `GitHubRepoMetadata` (v2: the shape gained `defaultBranch`,
   and etag revalidation can keep an old-shaped entry alive past the TTL)
 - `cache:issue:<realId>` -> `GitHubIssueDetails`
-- `cache:pull-v2:<realId>` -> `GitHubPullRequestDetails` (v2: the shape gained `mergeState`, and
-  etag revalidation can keep an old-shaped entry alive past the TTL)
+- `cache:pull-v3:<realId>` -> `GitHubPullRequestDetails` (v2: the shape gained `mergeState`; v3:
+  `mergeCommit`. Etag revalidation can keep an old-shaped entry alive past the TTL)
 - `cache:list-issues-v2:<encodedQuery>:p<page>` -> `(GitHubIssueSummary | null)[]`, one entry per
   upstream row (`null` for pull requests), so a page keeps the length that ends the walk (v2: v1
   stored filtered, short pages)
@@ -196,9 +196,9 @@ Implemented TTL cache families:
   public (`visibility: "public"`, not `private`), reused by `verifyObserverAccess` for up to 15
   minutes from when its request started and then asked again; an answer that says nothing is not
   stored
-- `cache:list-pulls-v2:<encodedQuery>:p<page>` -> `GitHubPullRequestSummary[]`, unfiltered (v2: v1
-  dropped rows with pending actions)
-- `cache:search-pulls-v2:<state>:p<page>` -> `GitHubPullRequestSummary & { bodyMarkdown }` rows of
+- `cache:list-pulls-v3:<encodedQuery>:p<page>` -> `GitHubPullRequestSummary[]`, unfiltered (v2: v1
+  dropped rows with pending actions; v3: rows gained `mergeCommit`)
+- `cache:search-pulls-v3:<state>:p<page>` -> `GitHubPullRequestSummary & { bodyMarkdown }` rows of
   the `/pulls` listing (newest-updated first) that PR text search filters after the overlay
 - `cache:discussion-reviews-v2:<realId>:p<page>` -> review-summary pages for pull discussions:
   `GitHubDiscussionEntry` reviews *without* `diffComments`, which every read attaches from the
@@ -218,7 +218,7 @@ Implemented TTL cache families:
 ### Cache TTLs
 
 - Viewer cache: 5 minutes
-- Entity caches (`repo-v2`, `issue`, `pull-v2`, `discussion-reviews-v2`, `resolve-ref`, `diff-v2`,
+- Entity caches (`repo-v2`, `issue`, `pull-v3`, `discussion-reviews-v2`, `resolve-ref`, `diff-v2`,
   `required-checks`): 30 seconds
 - List/search caches: 15 seconds
 - `merge-base` entries never expire (a merge base is a pure function of its two key commits);

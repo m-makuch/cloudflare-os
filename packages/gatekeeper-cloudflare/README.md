@@ -1,6 +1,6 @@
 # Gatekeeper Cloudflare
 
-This package provides Cloudflare OAuth integration for Gadgets. It serves four purposes:
+This package provides Cloudflare OAuth integration for Gadgets. It serves five purposes:
 
 - **Sign-in:** when `cloudflare` is in the deployment's `AUTH_GATEKEEPERS` allowlist, "Continue with
   Cloudflare" appears on the login page. The grant reads the account email (verified by Cloudflare,
@@ -17,6 +17,9 @@ This package provides Cloudflare OAuth integration for Gadgets. It serves four p
   defensively discard foreign-service events. Distributed trace summaries are account-only because
   their names, timing, services, and counts describe the whole cross-service trace; a Worker binding
   can still retrieve its own events for a known trace ID.
+- **Worker releases:** one Worker's recent deployments (with each version's annotations and Workers
+  Builds commit), the invocations a version served, and its Real-Time Issues, which a binding may
+  mark resolved. See [Worker releases](#worker-releases) below.
 - **Notifications:** account-scoped generic webhooks, approved workspace callbacks, and subscriber
   handoff. See setup below.
 
@@ -122,12 +125,60 @@ account picker's substring match also stays client-side: `name` is the only docu
 filter and whether it matches exactly or by substring is not specified, so pushing it down would trade
 a visible truncation for an invisible one.
 
+## Worker releases
+
+The resource `https://dash.cloudflare.com/<accountId>/workers/services/view/<workerName>/production/deployments`
+(suggested binding `WORKER_RELEASES`, type `CloudflareWorkerReleases`) is separate from the Worker
+observability resource on purpose: an agent investigating a Worker holds the read-only observability
+binding and can never resolve an issue, while this one is meant for the Worker issue inbox gadget.
+
+```ts
+const [live] = await env.WORKER_RELEASES.listDeployments({ limit: 1 });
+const served = await env.WORKER_RELEASES.countInvocations(live.versions[0].versionId, Date.parse(live.createdOn));
+const issue = await env.WORKER_RELEASES.getIssue(issueId);
+await env.WORKER_RELEASES.resolveIssue(issueId);
+```
+
+It needs four OAuth scopes, all opt-in (an unspecified resource selection requests none of them):
+`workers-scripts.read` (deployments and versions), `workers-ci.read` (Workers Builds commits),
+`workers-observability.read` (invocation counts and issues) and `workers-observability.write`
+(the issue status). The resource counts as granted only when all four are, so a connection holding
+some of them is asked for the rest by `ensureResources` rather than handed a binding that 403s.
+
+- `listDeployments` reads `GET …/workers/scripts/<worker>/deployments`, each version's
+  annotations (`workers/tag`, `workers/message`) from `GET …/versions/<id>`, and commits from
+  `GET …/builds/builds?version_ids=…` (at most 20 per lookup, so at most 20 deployments). A manual
+  build's empty `commit_hash` is no commit, a version Workers Builds did not build has none, and a
+  refused builds lookup (no Workers CI access, or no Builds connection) lists deployments without
+  commits, logging only Cloudflare's numeric codes.
+- `countInvocations` is a `calculate` of distinct `$metadata.requestId`s filtered to
+  `$workers.scriptVersion.id`, under the binding's immutable `$metadata.service` filter, from
+  `since` (clamped to the seven-day retention window) to now: invocations that left no telemetry are
+  not counted, and the distinct count may be approximate, so it is a traffic check.
+- `getIssue` reads `GET …/workers/observability/issues/<id>` and refuses an issue whose `service`
+  is not the bound Worker; `resolveIssue` checks the same, then submits an action of kind
+  `resolve-worker-issue` ("Resolve Worker issues"), which is auto-approvable: the Workshop's setup
+  flow can enable the rule so issues resolve without prompting. Apply checks the issue's Worker
+  again and sends `PATCH {"status":"resolved"}` once, recording the status it replaced; revert sets
+  that status back unless the issue has since changed (for example, recurred). Until the action
+  applies, `getIssue` reports the issue resolved.
+
+Observers: deployments and versions report `account/<accountId>/workers-script/<workerName>`,
+checked by reading the Worker's deployments with the observer's own connection; each build whose
+commit or branch a listing returned reports `account/<accountId>/workers-build/<buildUuid>`, checked
+by reading that build; invocation counts and issues report `account/<accountId>`, checked as for
+Workers Observability. Each answer is cached in the observer's account like the telemetry check
+(15 minutes allowed, 15 seconds denied), and a connection lacking the kind's scope is denied
+without asking. The Workers Builds API shapes used here (`version_ids` lookup, build by UUID) and
+the issues API are as observed, not from public reference documentation.
+
 ## Setting Up Cloudflare OAuth Credentials
 
 You need a Cloudflare dashboard OAuth client (client id + secret). The dashboard OAuth endpoints and
 scopes are hardcoded in `src/oauth.ts`, so you only configure the client id/secret and register the
 redirect URI. Ensure the client's scope allowlist includes `workers-observability.read` when this
-deployment offers Workers Observability resources.
+deployment offers Workers Observability resources, and `workers-scripts.read`, `workers-ci.read` and
+`workers-observability.write` as well when it offers Worker releases.
 
 ### Step 1: Register the redirect URI
 
@@ -367,8 +418,9 @@ private OAuth client in **Manage account → OAuth clients** with response type 
 http://localhost:8787/gatekeeper/cloudflare/oauth
 ```
 
-Allow User Details Read, Account Settings Read, AI Gateway Read/Run, Workers Observability Read, and
-Notifications Write. Keep resource scopes optional. Put credentials in the root **gitignored**
+Allow User Details Read, Account Settings Read, AI Gateway Read/Run, Workers Observability Read,
+Notifications Write, and, for Worker releases, Workers Scripts Read, Workers CI Read and Workers
+Observability Write. Keep resource scopes optional. Put credentials in the root **gitignored**
 `.dev.vars` (do not commit it):
 
 ```dotenv

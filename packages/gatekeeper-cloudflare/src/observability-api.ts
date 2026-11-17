@@ -298,6 +298,110 @@ async function wait(milliseconds: number): Promise<void> {
   await new Promise(resolve => setTimeout(resolve, milliseconds));
 }
 
+/** One Cloudflare API v4 request against an account, as requestCloudflareApi sends it. */
+export type CloudflareApiRequest = {
+  method: "GET" | "POST" | "PATCH";
+  /**
+   * Path below `/accounts/<accountId>`, starting with `/`. The caller escapes every
+   * caller-influenced segment with `encodeURIComponent`.
+   */
+  path: string;
+  /** Query parameters. */
+  query?: Record<string, string>;
+  /** JSON body, for POST and PATCH. */
+  body?: unknown;
+  /**
+   * The `path` the request log names: a fixed label rather than the request path, which can carry
+   * caller-supplied IDs.
+   */
+  label: string;
+};
+
+/**
+ * Send one Cloudflare API v4 request for an account, returning the envelope's `result`.
+ *
+ * The one place this gatekeeper talks to the Cloudflare API outside sign-in and notifications, so
+ * every request has the same token handling, size cap, timeout, typed errors (`deniesAccess` reads
+ * their status) and log hygiene. Reads -- GETs and the telemetry POSTs, which are queries -- get the
+ * single bounded retry; a PATCH is sent once, since nothing here can tell whether a write that timed
+ * out landed.
+ */
+export async function requestCloudflareApi(
+  getToken: () => Promise<string | null>,
+  accountId: string,
+  request: CloudflareApiRequest,
+): Promise<unknown> {
+  const token = await getToken();
+  if (!token) throw new CloudflareObservabilityApiError(401, "Cloudflare credentials have expired.");
+
+  const query = request.query ? `?${new URLSearchParams(request.query).toString()}` : "";
+  const url = `${API_BASE}/accounts/${encodeURIComponent(assertCloudflareAccountId(accountId))}` +
+    `${request.path}${query}`;
+  const path = request.label;
+  const attempts = request.method === "PATCH" ? 1 : 2;
+  for (let attempt = 1; attempt <= attempts; attempt++) {
+    let response: Response | undefined;
+    try {
+      response = await fetch(url, {
+        method: request.method,
+        headers: {
+          "Authorization": `Bearer ${token}`,
+          ...(request.body === undefined ? {} : { "Content-Type": "application/json" }),
+          "Accept": "application/json",
+        },
+        ...(request.body === undefined ? {} : { body: JSON.stringify(request.body) }),
+        signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
+      });
+      const data = await readJson(response);
+      if (!response.ok || !isRecord(data) || data.success !== true) {
+        throw providerError(data, response.status);
+      }
+      if (!("result" in data) || data.result === undefined || data.result === null) {
+        throw invalidResponse();
+      }
+      return data.result;
+    } catch (caught) {
+      const timedOut = isTimeout(caught);
+      // A connection reset or DNS failure is not an `AbortError` and not a typed provider error, so
+      // normalize it here rather than letting a raw TypeError reach callers that switch on status.
+      const error = timedOut
+        ? new CloudflareObservabilityApiError(504, "Cloudflare Workers Observability request timed out.")
+        : caught instanceof CloudflareObservabilityApiError
+          ? caught
+          : new CloudflareObservabilityApiError(
+            502, "Could not reach the Cloudflare Workers Observability API.");
+      // The provider's own message is deliberately absent here: Cloudflare can echo a
+      // caller-supplied filter value back in an error, and filter values are kept out of the audit
+      // trail for exactly that reason (see `summarizeFilter`). Cloudflare's numeric codes identify
+      // the failure without carrying caller text. Our own messages are safe, so a timeout or
+      // transport failure is still logged in full.
+      //
+      // The discriminator is provenance, not `codes.length`: Cloudflare can return a message with
+      // no numeric code at all, and keying on the codes would have logged exactly the text this is
+      // meant to withhold. When a provider error carries no codes, the status is all that is left,
+      // and that is the fail-closed answer.
+      logger.warn("Workers Observability request failed", {
+        event: "observability.request.failed", path, status: error.status, attempt,
+        ...(error.codes.length > 0 ? { providerCodes: error.codes.join(",") } : {}),
+        ...(error.fromProvider ? {} : { error }),
+      });
+      if (attempt === attempts) throw error;
+      // A timeout or transport failure gets one fast retry; a provider status only retries when it
+      // is retryable and its own backoff hint fits the budget. Timeouts are checked first because a
+      // body-read timeout arrives with an already-successful status, which is not itself retryable.
+      const delay = timedOut || response === undefined
+        ? RETRY_DELAY_MS
+        : RETRYABLE_STATUSES.has(response.status) ? retryDelay(response) : null;
+      if (delay === null) throw error;
+      await wait(delay);
+    }
+  }
+  throw new Error("Unreachable Workers Observability retry state.");
+}
+
+/** The longest a telemetry query may look back: Cloudflare's retention window. */
+export const MAX_TELEMETRY_LOOKBACK_MS = MAX_TIMEFRAME_MS;
+
 export class CloudflareObservabilityApi {
   private readonly accountId: string;
 
@@ -309,70 +413,10 @@ export class CloudflareObservabilityApi {
     this.accountId = assertCloudflareAccountId(accountId);
   }
 
-  async #request(path: string, body: unknown): Promise<unknown> {
-    const token = await this.getToken();
-    if (!token) throw new CloudflareObservabilityApiError(401, "Cloudflare credentials have expired.");
-
-    const url = `${API_BASE}/accounts/${encodeURIComponent(this.accountId)}` +
-      `/workers/observability/telemetry/${path}`;
-    for (let attempt = 1; attempt <= 2; attempt++) {
-      let response: Response | undefined;
-      try {
-        response = await fetch(url, {
-          method: "POST",
-          headers: {
-            "Authorization": `Bearer ${token}`,
-            "Content-Type": "application/json",
-            "Accept": "application/json",
-          },
-          body: JSON.stringify(body),
-          signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
-        });
-        const data = await readJson(response);
-        if (!response.ok || !isRecord(data) || data.success !== true) {
-          throw providerError(data, response.status);
-        }
-        if (!("result" in data) || data.result === undefined || data.result === null) {
-          throw invalidResponse();
-        }
-        return data.result;
-      } catch (caught) {
-        const timedOut = isTimeout(caught);
-        // A connection reset or DNS failure is not an `AbortError` and not a typed provider error, so
-        // normalize it here rather than letting a raw TypeError reach callers that switch on status.
-        const error = timedOut
-          ? new CloudflareObservabilityApiError(504, "Cloudflare Workers Observability request timed out.")
-          : caught instanceof CloudflareObservabilityApiError
-            ? caught
-            : new CloudflareObservabilityApiError(
-              502, "Could not reach the Cloudflare Workers Observability API.");
-        // The provider's own message is deliberately absent here: Cloudflare can echo a
-        // caller-supplied filter value back in an error, and filter values are kept out of the audit
-        // trail for exactly that reason (see `summarizeFilter`). Cloudflare's numeric codes identify
-        // the failure without carrying caller text. Our own messages are safe, so a timeout or
-        // transport failure is still logged in full.
-        //
-        // The discriminator is provenance, not `codes.length`: Cloudflare can return a message with
-        // no numeric code at all, and keying on the codes would have logged exactly the text this is
-        // meant to withhold. When a provider error carries no codes, the status is all that is left,
-        // and that is the fail-closed answer.
-        logger.warn("Workers Observability request failed", {
-          event: "observability.request.failed", path, status: error.status, attempt,
-          ...(error.codes.length > 0 ? { providerCodes: error.codes.join(",") } : {}),
-          ...(error.fromProvider ? {} : { error }),
-        });
-        if (attempt === 2) throw error;
-        // A timeout or transport failure gets one fast retry; a provider status only retries when it
-        // is retryable and its own backoff hint fits the budget. Timeouts are checked first because a
-        // body-read timeout arrives with an already-successful status, which is not itself retryable.
-        const delay = timedOut || response === undefined
-          ? RETRY_DELAY_MS
-          : RETRYABLE_STATUSES.has(response.status) ? retryDelay(response) : null;
-        if (delay === null) throw error;
-        await wait(delay);
-      }
-    }
-    throw new Error("Unreachable Workers Observability retry state.");
+  #request(path: string, body: unknown): Promise<unknown> {
+    return requestCloudflareApi(this.getToken, this.accountId, {
+      method: "POST", path: `/workers/observability/telemetry/${path}`, body, label: path,
+    });
   }
 
   /**
@@ -656,4 +700,41 @@ export class CloudflareObservabilityApi {
       statistics: result.statistics,
     };
   }
+
+  /**
+   * How many invocations Worker version `versionId` served from `since` (ms since epoch) to now:
+   * the distinct `$metadata.requestId`s among its telemetry, which is how `listInvocations` groups
+   * events into invocations. An invocation that left no telemetry at all is not counted, and
+   * Cloudflare's distinct count may be approximate or sampled, so treat the answer as a traffic
+   * check rather than an exact total. `since` is clamped to the retention window.
+   *
+   * Only a Worker-scoped API can answer, since a version ID alone does not name a Worker; as with
+   * `calculate`, the aggregate rests on the injected `$metadata.service` filter.
+   */
+  async countInvocations(
+    versionId: string, since: number,
+  ): Promise<{ count: number; from: number; statistics: CloudflareObservabilityStatistics }> {
+    if (!this.workerName) throw new Error("Counting a version's invocations needs a Worker binding.");
+    if (!UUID_PATTERN.test(versionId)) throw new Error("Invalid Worker version ID.");
+    if (!Number.isFinite(since)) throw new Error("`since` must be a time in milliseconds since the epoch.");
+    const to = Date.now();
+    // A moment before `to`, so a `since` at or a little past now (clock skew against the
+    // deployment's own timestamp) asks about an empty instant rather than an invalid timeframe.
+    const from = Math.min(Math.max(since, to - MAX_TIMEFRAME_MS), to - 1);
+    const result = await this.calculate({
+      timeframe: { from: new Date(from), to: new Date(to) },
+      filter: {
+        kind: "filter", key: "$workers.scriptVersion.id", operation: "eq", type: "string",
+        value: versionId.toLowerCase(),
+      },
+      calculations: [{
+        operator: "uniq", key: "$metadata.requestId", keyType: "string", alias: "invocations",
+      }],
+      limit: 1,
+    });
+    const aggregate = result.calculations[0]?.aggregates[0];
+    return { count: aggregate?.value ?? 0, from, statistics: result.statistics };
+  }
 }
+
+const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;

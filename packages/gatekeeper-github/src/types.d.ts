@@ -60,6 +60,14 @@ export interface GitHubRepo {
   listCommits(options?: GitHubCommitFilter): Promise<Cursor<GitHubCommitSummary>>;
 
   /**
+   * Whether `ref`'s history contains `commit`: true when `commit` is `ref`'s own commit or
+   * one of its ancestors, e.g. to tell whether a deployed commit includes a merged pull request's
+   * `mergeCommit`. Both accept a full or unambiguously truncated commit id, a branch, or a tag;
+   * `ref` defaults to the default branch. Throws if either names no commit in this repository.
+   */
+  containsCommit(commit: string, ref?: string): Promise<boolean>;
+
+  /**
    * Pushes a commit to a branch, setting the branch's head to `commitId` -- the way commits made
    * in a worktree get to GitHub. The branch is created if it does not exist.
    *
@@ -280,6 +288,14 @@ export interface GitHubRepoContributor {
   listCommits(options?: GitHubCommitFilter): Promise<Cursor<GitHubCommitSummary>>;
 
   /**
+   * Whether `ref`'s history contains `commit`: true when `commit` is `ref`'s own commit or
+   * one of its ancestors, e.g. to tell whether a deployed commit includes a merged pull request's
+   * `mergeCommit`. Both accept a full or unambiguously truncated commit id, a branch, or a tag;
+   * `ref` defaults to the default branch. Throws if either names no commit in this repository.
+   */
+  containsCommit(commit: string, ref?: string): Promise<boolean>;
+
+  /**
    * Pushes a commit to a branch under the prefix, creating the branch if it does not exist.
    *
    * `commitId` must be a full 40-character commit id (e.g. a worktree `commit()` result). The
@@ -350,6 +366,11 @@ export type GitHubContributorPullRequest = {
   base: string;
   /** Commit id of the head branch, when known. */
   headCommit: string | null;
+  /**
+   * The commit the merge put on the base branch -- the merge commit, the squashed commit, or for
+   * a rebase merge the commit the base branch was updated to. Null until it is merged.
+   */
+  mergeCommit: string | null;
 }
 
 /** A single GitHub issue. */
@@ -827,6 +848,11 @@ export type GitHubPullRequestSummary = Omit<GitHubIssueSummary, "commentCount"> 
   commentCount?: number;
   draft: boolean;
   merged: boolean;
+  /**
+   * The commit the merge put on the base branch -- the merge commit, the squashed commit, or for
+   * a rebase merge the commit the base branch was updated to. Absent until it is merged.
+   */
+  mergeCommit?: string;
   head: GitHubPullRequestBranchRef;
   base: GitHubPullRequestBranchRef;
 }

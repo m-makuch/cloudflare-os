@@ -1,15 +1,24 @@
 # Cloudflare gatekeeper
 
-Cloudflare OAuth, serving three unrelated purposes from one connected account — sign-in
-(`AUTH_GATEKEEPERS`), AI Gateway billing, and **Workers Observability** read-only telemetry
-resources. Two resource granularities (whole account, or one Worker) both map to the single
-indivisible `workers-observability.read` scope, so the capability boundary is the *binding*, not the
-grant.
+Cloudflare OAuth, serving unrelated purposes from one connected account — sign-in
+(`AUTH_GATEKEEPERS`), AI Gateway billing, **Workers Observability** read-only telemetry resources,
+**Worker releases**, and Notifications. Two observability granularities (whole account, or one
+Worker) both map to the single indivisible `workers-observability.read` scope, so the capability
+boundary is the *binding*, not the grant.
 
-- Layering: `observability-api.ts` is the only place that talks HTTP; `observability-parse.ts`
-  validates every response (no blind casts); `observability-session.ts` is the agent-facing session,
-  where every read funnels through one `#observe` so no path returns data unaudited;
-  `observability-discovery.ts` derives field names/values from a sampled events query.
+- Layering: `observability-api.ts` owns the account-API request helper (`requestCloudflareApi`) and
+  the telemetry calls; `observability-parse.ts` validates every telemetry response (no blind casts);
+  `observability-session.ts` is the agent-facing session, where every read funnels through one
+  `#observe` so no path returns data unaudited; `observability-discovery.ts` derives field
+  names/values from a sampled events query.
+- Worker releases (`releases*.ts`) is a separate resource and DO class
+  (`CloudflareWorkerReleasesGatekeeper`), never a mode of the Worker observability binding, which an
+  investigating agent holds and which must stay read-only with no actions. It needs four scopes and
+  counts as granted only with all of them. Its one write, `resolveIssue`, is a kit action of kind
+  `resolve-worker-issue` (auto-approvable, simulated in `getIssue`, revertible). `releases-api.ts`
+  sends through `requestCloudflareApi` and narrows its responses itself. Its reads report
+  `account/<a>/workers-script/<worker>`, `account/<a>/workers-build/<uuid>` and `account/<a>`,
+  each probed with the observer's own token (`UserAccount.checkSubresourceAccess`).
 - Scopes fail closed to `BILLING_SCOPES`, and an omitted `resourceUrlPatterns` ("all resource types")
   is distinct from `[]` ("none"): a billing-only connection must not silently acquire telemetry
   access, and recording a wider grant than was made would make `ensureResources` short-circuit into a
@@ -38,7 +47,8 @@ grant.
 - A provider error message can quote a caller-supplied filter value back, so only its numeric `codes`
   are logged — filter *values* stay out of the audit trail (`summarizeFilter`), and the message
   travels to the caller who caused it.
-- Observers: every read, through either binding, reports one subresource, `account/<accountId>`.
+- Observers: every read, through either observability binding, reports one subresource,
+  `account/<accountId>`.
   `verifyObserverAccess` allows an observer only if their own connection's account-wide telemetry
   probe succeeds there; any other ID fails the whole call. Nothing checks an individual Worker, so a
   Worker binding's collaborators need the account's telemetry. The kernel asks on every read, so the

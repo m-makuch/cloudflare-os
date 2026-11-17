@@ -6,11 +6,12 @@
 // instantiates a gatekeeper in production.
 
 import { DurableObject, RpcStub, RpcTarget, WorkerEntrypoint } from "cloudflare:workers";
-import type { ApprovalQueue, ActionDescription, HookController, HookDescription, GatekeeperUserVerifier, GitCache, GitObjectType, GitOid, ObservationDescription }
+import type { ApprovalQueue, ActionDescription, ActionKind, HookController, HookDescription, GatekeeperUserVerifier, GitCache, GitObjectType, GitOid, ObservationDescription }
   from "@gadgets/workshop-shared/gatekeeper";
-import type { CloudflareNotificationSubscription } from "../src/types.js";
+import type { CloudflareNotificationSubscription, CloudflareWorkerDeployment, CloudflareWorkerIssue } from "../src/types.js";
 import { CloudflareNotificationsGatekeeper } from "../src/notifications.js";
-import type { CloudflareObservabilityGatekeeper } from "../src/cloudflare.js";
+import type { CloudflareObservabilityGatekeeper, GatekeeperUserImpl } from "../src/cloudflare.js";
+import type { CloudflareWorkerReleasesGatekeeper } from "../src/releases.js";
 
 export { default } from "../src/cloudflare.js";
 export * from "../src/cloudflare.js";
@@ -21,9 +22,14 @@ type GatekeeperProps = {
   workerName?: string;
 };
 
+type ReleasesProps = { userObjectId: string; accountId: string; workerName: string };
+
 export type TestExports = {
   CloudflareObservabilityGatekeeper(options: { props: GatekeeperProps }):
     DurableObjectClass<CloudflareObservabilityGatekeeper>;
+  CloudflareWorkerReleasesGatekeeper(options: { props: ReleasesProps }):
+    DurableObjectClass<CloudflareWorkerReleasesGatekeeper>;
+  GatekeeperUserImpl(options: { props: { userObjectId: string } }): Fetcher<GatekeeperUserImpl>;
   TestConnectCallback(options: { props: { label: string } }): Fetcher<TestConnectCallback>;
 };
 
@@ -71,6 +77,42 @@ class TestVerifier extends RpcTarget {
     if (typeof this.outcome === "string") throw new Error(this.outcome);
     return accountIds.map(() => this.outcome === true);
   }
+
+  async checkSubresourceAccess(subresources: string[]): Promise<boolean[]> {
+    this.asked.push(...subresources);
+    if (typeof this.outcome === "string") throw new Error(this.outcome);
+    return subresources.map(() => this.outcome === true);
+  }
+}
+
+/** What Worker releases gatekeepers submitted and observed through ReleasesTestQueue. */
+const releasesLog: { submitted: { id: number; description: ActionDescription }[]; observations: ObservationDescription[] } =
+  { submitted: [], observations: [] };
+
+/** Stands in for the overseer's queue: records submissions and observations, authorizing all. */
+class ReleasesTestQueue extends RpcTarget implements ApprovalQueue {
+  async getFetcher(): Promise<Fetcher> { throw new Error("Unexpected session fetcher"); }
+  async requireLive(): Promise<void> {}
+  async watchSession(): Promise<never> { throw new Error("Unexpected session watcher"); }
+  async getExecutionId(): Promise<undefined> { return undefined; }
+  async getGitCache(): Promise<GitCache> { throw new Error("Unexpected git cache"); }
+  async submitAction(id: number, description: ActionDescription): Promise<void> {
+    releasesLog.submitted.push({ id, description });
+  }
+  async authorizeObservation(description: ObservationDescription): Promise<void> {
+    releasesLog.observations.push(description);
+  }
+  async bindHook(): Promise<void> { throw new Error("Unexpected hook"); }
+}
+
+/** What a releases test call returned, or why it threw. */
+type ReleasesOutcome = {
+  result?: CloudflareWorkerIssue | CloudflareWorkerDeployment[] | number | { message?: string; canRetry?: boolean };
+  error?: string;
+};
+
+function message(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
 }
 
 /** The labels of the `TestConnectCallback`s notified of credential expiry, in arrival order. */
@@ -170,6 +212,114 @@ export class TestHooks extends DurableObject<Env> {
     return { url, title, suggestedBindingName };
   }
 
+  #releases(facetName: string, props: ReleasesProps) {
+    const exports = this.ctx.exports as unknown as TestExports;
+    return this.ctx.facets.get<CloudflareWorkerReleasesGatekeeper>(facetName, () => ({
+      class: exports.CloudflareWorkerReleasesGatekeeper({ props }),
+    }));
+  }
+
+  /** Clears what releasesLog() reports. */
+  resetReleasesLog(): void {
+    releasesLog.submitted.length = 0;
+    releasesLog.observations.length = 0;
+  }
+
+  releasesLog(): typeof releasesLog {
+    return structuredClone(releasesLog);
+  }
+
+  /** Runs one session call on a releases binding, returning its result or thrown message. */
+  async releasesSession(
+    facetName: string, props: ReleasesProps,
+    call: { method: "getIssue" | "resolveIssue"; issueId: string } |
+      { method: "listDeployments"; limit?: number } |
+      { method: "countInvocations"; versionId: string; since: number },
+  ): Promise<ReleasesOutcome> {
+    using session = await this.#releases(facetName, props).startSession(new ReleasesTestQueue());
+    try {
+      switch (call.method) {
+        case "getIssue": return { result: await session.getIssue(call.issueId) };
+        case "resolveIssue": await session.resolveIssue(call.issueId); return {};
+        case "listDeployments": return { result: await session.listDeployments({ limit: call.limit }) };
+        case "countInvocations": return { result: await session.countInvocations(call.versionId, call.since) };
+      }
+    } catch (error) {
+      return { error: message(error) };
+    }
+  }
+
+  /** Resolves an action on a releases binding the way the overseer does. */
+  async releasesDecide(
+    facetName: string, props: ReleasesProps, decision: "apply" | "reject" | "revert", actionId: number,
+  ): Promise<ReleasesOutcome> {
+    const gatekeeper = this.#releases(facetName, props);
+    try {
+      switch (decision) {
+        case "apply": await gatekeeper.applyAction(actionId, new RpcStub(new TestGitCache())); return {};
+        case "reject": await gatekeeper.rejectAction(actionId); return {};
+        case "revert": {
+          const outcome = await gatekeeper.revertAction(actionId);
+          return outcome ? { result: outcome } : {};
+        }
+      }
+    } catch (error) {
+      return { error: message(error) };
+    }
+  }
+
+  async releasesAutoApprovable(facetName: string, props: ReleasesProps): Promise<ActionKind[]> {
+    return await this.#releases(facetName, props).getAutoApprovableActions();
+  }
+
+  async observabilityAutoApprovable(facetName: string, props: GatekeeperProps): Promise<ActionKind[]> {
+    return await this.#gatekeeper(facetName, props).getAutoApprovableActions();
+  }
+
+  async describeReleases(facetName: string, props: ReleasesProps) {
+    const { url, title, suggestedBindingName, tsType } = await this.#releases(facetName, props).describe();
+    return { url, title, suggestedBindingName, tsType };
+  }
+
+  async releasesHistoricalSubresources(facetName: string, props: ReleasesProps): Promise<string[]> {
+    return await this.#releases(facetName, props).getHistoricalSubresources();
+  }
+
+  /** As verifyObserverAccess, on a releases binding. */
+  async verifyReleasesAccess(
+    facetName: string, props: ReleasesProps,
+    outcomes: Record<string, boolean | string>, subresources: string[],
+  ): Promise<{ result: string[] | string; asked: Record<string, string[]> }> {
+    const verifiers = Object.entries(outcomes).map(([id, outcome]) => ({ id, target: new TestVerifier(outcome) }));
+    const observers = verifiers.map(({ id, target }) => ({
+      id, verifier: new RpcStub(target) as unknown as Fetcher<GatekeeperUserVerifier>,
+    }));
+    let result: string[] | string;
+    try {
+      ({ allowedObserverIds: result } =
+        await this.#releases(facetName, props).verifyObserverAccess(observers, subresources));
+    } catch (error) {
+      result = message(error);
+    }
+    return { result, asked: Object.fromEntries(verifiers.map(({ id, target }) => [id, target.asked])) };
+  }
+
+  /** GatekeeperUser.ensureResources for an account, as the Workshop calls it. */
+  async ensureResources(userObjectId: string, patterns: string[]): Promise<{ url?: string }> {
+    const exports = this.ctx.exports as unknown as TestExports;
+    return await exports.GatekeeperUserImpl({ props: { userObjectId } }).ensureResources(patterns);
+  }
+
+  /** GatekeeperUser.getGatekeeperClassFor's resource, or its refusal. */
+  async resourceFor(userObjectId: string, url: string): Promise<string> {
+    const exports = this.ctx.exports as unknown as TestExports;
+    try {
+      return (await exports.GatekeeperUserImpl({ props: { userObjectId } }).getGatekeeperClassFor(url)).resource.urlPattern;
+    } catch (error) {
+      return message(error);
+    }
+  }
+
   /** Confirms the read-only resource refuses every mutating gatekeeper operation. */
   async applyActionMessage(facetName: string, props: GatekeeperProps): Promise<string> {
     try {
@@ -183,7 +333,8 @@ export class TestHooks extends DurableObject<Env> {
     }
   }
 }
-// Export notification classes directly so the Workers test runner can discover them for ctx.exports.
+// Export classes directly so the Workers test runner can discover them for ctx.exports.
+export { GatekeeperUserImpl } from "../src/cloudflare.js";
 export { CloudflareNotificationReceiver, CloudflareNotificationsGatekeeper,
   CloudflareNotificationHookController } from "../src/notifications.js";
 

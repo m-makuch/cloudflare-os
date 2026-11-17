@@ -167,3 +167,71 @@ describe("UserAccount.checkTelemetryAccess", () => {
     expect(asked).toHaveLength(2);
   });
 });
+
+describe("UserAccount.checkSubresourceAccess", () => {
+  const BUILD = "dddddddd-0000-4000-8000-000000000004";
+  const RELEASES_SCOPES = [...TELEMETRY_SCOPES, "workers-scripts.read", "workers-ci.read"];
+  const SCRIPT = `account/${ACCOUNT_ID}/workers-script/api%20worker`;
+  const BUILD_ID = `account/${ACCOUNT_ID}/workers-build/${BUILD}`;
+
+  /** Stubs Cloudflare, answering each probe path with `statusFor(path)`; returns the paths probed. */
+  function probes(statusFor: (path: string) => number): string[] {
+    const asked: string[] = [];
+    vi.stubGlobal("fetch", vi.fn(async (url: string) => {
+      const path = new URL(url).pathname.replace(`/client/v4/accounts/${ACCOUNT_ID}`, "");
+      asked.push(path);
+      const status = statusFor(path);
+      return status === 200
+        ? Response.json({ success: true, result: path.endsWith("/keys") ? [] : { deployments: [] } })
+        : Response.json({ success: false, errors: [{ code: 10000, message: "refused" }] }, { status });
+    }));
+    return asked;
+  }
+
+  it("probes each kind with the observer's own credentials, and reuses the answers", async () => {
+    vi.useFakeTimers({ toFake: ["Date"], now: START });
+    const asked = probes(path => path.startsWith("/builds/") ? 403 : 200);
+
+    await inAccount(async (account, { storage }) => {
+      storage.kv.put("grantedScopes", RELEASES_SCOPES);
+      const ids = [`account/${ACCOUNT_ID}`, SCRIPT, BUILD_ID];
+      expect(await account.checkSubresourceAccess(ids)).toEqual([true, true, false]);
+      expect(await account.checkSubresourceAccess(ids)).toEqual([true, true, false]);
+    });
+    expect(asked).toEqual([
+      "/workers/observability/telemetry/keys",
+      "/workers/scripts/api%20worker/deployments",
+      `/builds/builds/${BUILD}`,
+    ]);
+  });
+
+  it("denies a kind whose scope the grant lacks without asking", async () => {
+    vi.useFakeTimers({ toFake: ["Date"], now: START });
+    const asked = probes(() => 200);
+
+    await inAccount(async account => {
+      // TELEMETRY_SCOPES: no Workers Scripts or Workers CI read.
+      expect(await account.checkSubresourceAccess([SCRIPT, BUILD_ID])).toEqual([false, false]);
+    });
+    expect(asked).toEqual([]);
+  });
+
+  it("refuses an ID it does not know before asking anything", async () => {
+    const asked = probes(() => 200);
+
+    await inAccount(async account => {
+      await expect(account.checkSubresourceAccess([`account/${ACCOUNT_ID}/worker/x`])).rejects.toThrow();
+    });
+    expect(asked).toEqual([]);
+  });
+
+  it("fails rather than denies when Cloudflare can't answer", async () => {
+    vi.useFakeTimers({ toFake: ["Date"], now: START });
+    probes(() => 500);
+
+    await inAccount(async (account, { storage }) => {
+      storage.kv.put("grantedScopes", RELEASES_SCOPES);
+      await expect(account.checkSubresourceAccess([SCRIPT])).rejects.toThrow();
+    });
+  });
+});

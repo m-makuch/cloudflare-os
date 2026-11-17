@@ -10,10 +10,13 @@
 import { describe, expect, it } from "vitest";
 import accountConfigurator from "../src/configurator/cloudflare-account-configurator-ui.js";
 import workerConfigurator from "../src/configurator/cloudflare-worker-configurator-ui.js";
+import releasesConfigurator from "../src/configurator/cloudflare-worker-releases-configurator-ui.js";
 import {
   accountObservabilityUrl,
   parseObservabilityResourceUrl,
+  parseWorkerReleasesResourceUrl,
   workerObservabilityUrl,
+  workerReleasesUrl,
 } from "../src/resources.js";
 
 const ACCOUNT_ID = "0123456789abcdef0123456789abcdef";
@@ -54,6 +57,20 @@ describe("configurator resource URLs", () => {
 
     expect(url).toBe(workerObservabilityUrl(ACCOUNT_ID, workerName));
     expect(parseObservabilityResourceUrl(url)).toEqual({ accountId: ACCOUNT_ID, workerName });
+  });
+
+  it("builds the same Worker releases URL the server-side builder does", () => {
+    const workerName = "my worker/production?x=1";
+
+    const url = releasesConfigurator.resourceUrl!({
+      values: { accountId: ACCOUNT_ID, workerName },
+      ui: noUi,
+    }) as string;
+
+    expect(url).toBe(workerReleasesUrl(ACCOUNT_ID, workerName));
+    expect(parseWorkerReleasesResourceUrl(url)).toEqual({ accountId: ACCOUNT_ID, workerName });
+    expect(releasesConfigurator.isReady!({ values: { accountId: ACCOUNT_ID, workerName: null } }))
+      .toBe(false);
   });
 
   it("reports readiness only once the URL it would build is parseable", () => {

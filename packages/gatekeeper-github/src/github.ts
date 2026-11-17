@@ -1003,6 +1003,8 @@ function normalizePullSummary(response: GitHubPullRequestResponse): GitHubPullRe
     ...summary,
     draft: response.draft,
     merged: !!response.merged_at,
+    // Only once merged: before then GitHub reports a throwaway test merge commit.
+    ...(response.merged_at && response.merge_commit_sha ? { mergeCommit: response.merge_commit_sha } : {}),
     head: normalizePullBranchRef(summary.repo.owner, summary.repo.name, response.head),
     base: normalizePullBranchRef(summary.repo.owner, summary.repo.name, response.base),
   };
@@ -3231,7 +3233,7 @@ export class GitHubGatekeeperImpl extends DurableObject<Env, GitHubGatekeeperImp
 
   async #getRemotePullRequestDetails(realId: string, ttlMs = ENTITY_CACHE_TTL_MS): Promise<GitHubPullRequestDetails> {
     // v2: the details gained `mergeState`, and etag revalidation can keep an old-shaped entry alive.
-    const key = this.#cacheKey("pull-v2", realId);
+    const key = this.#cacheKey("pull-v3", realId);
     const details = await this.#loadCachedWithEtag<GitHubPullRequestDetails>(
       key,
       ttlMs,
@@ -3592,7 +3594,7 @@ export class GitHubGatekeeperImpl extends DurableObject<Env, GitHubGatekeeperImp
     return new StreamingCursor<GitHubPullRequestSummary>({
       fetchPage: async (page, perPage) => {
         // "-v2": the previous entries held pages with touched rows filtered out.
-        const cacheKey = this.#cacheKey("list-pulls-v2", stableKey(filter ?? {}), `p${page}`);
+        const cacheKey = this.#cacheKey("list-pulls-v3", stableKey(filter ?? {}), `p${page}`);
         return await this.#loadCachedWithEtag<GitHubPullRequestSummary[]>(cacheKey, LIST_CACHE_TTL_MS, async etag => {
           const raw = await this.#withApi(api => api.listPullRequestsConditional(owner, repo, {
             state: filter?.state,
@@ -3647,7 +3649,7 @@ export class GitHubGatekeeperImpl extends DurableObject<Env, GitHubGatekeeperImp
     // their body for the text match; keyed by state alone, so every search shares the pages.
     return new StreamingCursor<GitHubPullRequestSummary, PullSearchRow>({
       fetchPage: async (page, perPage) => {
-        const cacheKey = this.#cacheKey("search-pulls-v2", state, `p${page}`);
+        const cacheKey = this.#cacheKey("search-pulls-v3", state, `p${page}`);
         return await this.#loadCachedWithEtag<PullSearchRow[]>(cacheKey, LIST_CACHE_TTL_MS, async etag => {
           const raw = await this.#withApi(api => api.listPullRequestsConditional(owner, repo, {
             state,
@@ -5591,6 +5593,19 @@ export class GitHubGatekeeperImpl extends DurableObject<Env, GitHubGatekeeperImp
     }
   }
 
+  /**
+   * Whether `ref` (the default branch when undefined) has `commit` in its history, both resolved
+   * on GitHub: a commit only queued for push is not on the remote, so it is never "contained". A
+   * commit is an ancestor of another exactly when it is their merge base.
+   */
+  async containsCommit(commit: string, refOrDefault: string | undefined)
+      : Promise<{ commitId: GitOid; refId: GitOid; contains: boolean }> {
+    const ref = refOrDefault ?? (await this.#getRepoMetadata()).defaultBranch;
+    const [commitId, refId] = await Promise.all([this.#resolveRemoteRef(commit), this.#resolveRemoteRef(ref)]);
+    const contains = commitId === refId || await this.#getMergeBaseCached(commitId, refId) === commitId;
+    return { commitId, refId, contains };
+  }
+
   async #resolveRemoteRef(ref: string): Promise<GitOid> {
     // Like #getRemoteCommitDetails: the resolution of a branch or tag name is mutable, hence the
     // short TTL.
@@ -6997,6 +7012,18 @@ export class GitHubRepoSessionImpl extends RpcTarget implements GitHubRepoSessio
     }, { gitCache: this.#gitCache, commitIds: commitIdsOfSummary });
   }
 
+  async containsCommit(commit: string, ref?: string): Promise<boolean> {
+    const { commitId, refId, contains } = await this.#gatekeeper.containsCommit(commit, ref);
+    await this.#gatekeeper.authorizeRead(this.#approvalQueue, {
+      title: `Check whether ${ref ?? "the default branch"} contains ${commitId.slice(0, 12)}`,
+      description: `Check whether commit ${refId}`
+        + `${ref === undefined ? " (head of the default branch)" : ref === refId ? "" : ` (resolved from "${ref}")`}`
+        + ` contains commit ${commitId} in the GitHub repository.`,
+    });
+    await this.#gitCache.advertise([commitId, refId]);
+    return contains;
+  }
+
   async getChecks(ref?: string): Promise<GitHubCommitChecks> {
     const { checks, fromCache } = await this.#gatekeeper.repoChecks(ref, await this.#gitCache.stub());
     await this.#gatekeeper.authorizeRead(this.#approvalQueue, {
@@ -7098,6 +7125,10 @@ export class GitHubRepoContributorImpl extends RpcTarget implements GitHubRepoCo
     return await this.#repo.listCommits(options);
   }
 
+  async containsCommit(commit: string, ref?: string): Promise<boolean> {
+    return await this.#repo.containsCommit(commit, ref);
+  }
+
   async push(branch: string, commitId: string): Promise<void> {
     this.#requireBranch(branch);
     await this.#repo.push(branch, commitId, { force: false });
@@ -7117,6 +7148,7 @@ export class GitHubRepoContributorImpl extends RpcTarget implements GitHubRepoCo
     return {
       id: action.provisionalId, url: null, title: options.title, state: "open", merged: false,
       draft: options.draft ?? false, head: options.head, base: defaultBranch, headCommit: null,
+      mergeCommit: null,
     };
   }
 
@@ -7133,6 +7165,7 @@ function contributorPullRequest(pull: GitHubPullRequestSummary): GitHubContribut
   return {
     id: pull.id, url: pull.id.startsWith("~") ? null : pull.url, title: pull.title, state: pull.state,
     merged: pull.merged, draft: pull.draft, head: pull.head.ref, base: pull.base.ref, headCommit: pull.head.sha || null,
+    mergeCommit: pull.merged ? pull.mergeCommit ?? null : null,
   };
 }
 
