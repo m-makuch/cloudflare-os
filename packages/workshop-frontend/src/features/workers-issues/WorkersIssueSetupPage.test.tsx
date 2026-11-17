@@ -4,10 +4,19 @@ import { act } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type { AccountsSubscriberAdapter } from "../../accountsSubscriber";
-import type { AuthenticatedApi } from "@gadgets/workshop-shared/api";
-import type { WorkerIssueInbox } from "../../../../bundled-blueprints/blueprints/workers-issues/files/protocol";
+import type {
+  AgentSpawnerConfig,
+  AuthenticatedApi,
+  GatekeeperClient,
+} from "@gadgets/workshop-shared/api";
+import type { WorkerIssueInbox } from "../../../../bundled-blueprints/blueprints/workers-issues/files/lib/protocol";
 import { WorkersIssueSetupPage } from "./WorkersIssueSetupPage";
-import { NOTIFICATIONS_PATTERN, RELEASES_PATTERN, WORKER_PATTERN } from "./useWorkersIssueConnections";
+import {
+  NOTIFICATIONS_PATTERN,
+  ACCOUNT_OBSERVABILITY_PATTERN,
+  RELEASES_PATTERN,
+  WORKER_PATTERN,
+} from "./useWorkersIssueConnections";
 
 let api: object;
 vi.mock("../../AuthContext", () => ({ useAuthenticatedApi: () => ({ authenticatedApi: api }) }));
@@ -44,10 +53,15 @@ const render = async (
     wrongAccount?: number;
     configuratorError?: string;
     existingInvestigator?: boolean;
+    configuredModelId?: string;
+    configuredDurationMs?: number;
+    configuredTelemetryScope?: "worker" | "account";
+    autoResolve?: boolean;
     investigationsEnabled?: boolean;
     bindFailure?: boolean;
     spawnerFailure?: boolean;
     remediation?: { allowPublic: boolean; repositoryUrl?: string };
+    repositoryUrl?: string;
     publicRepository?: boolean;
     restricted?: boolean;
     /** Opened from the inbox: no dashboard origin, optionally for one stored notification. */
@@ -80,8 +94,15 @@ const render = async (
       investigatorReady: Boolean(options.existingInvestigator),
       releasesReady: false,
       backgroundChecks: false,
+      autoResolve: options.autoResolve ?? true,
       ...(options.fixesEnabled
-        ? { fixes: { provider: "github", repository: "acme/checkout", branchPrefix: "cloudflare-os/" } }
+        ? {
+            fixes: {
+              provider: "github",
+              repository: "acme/checkout",
+              branchPrefix: "cloudflare-os/",
+            },
+          }
         : {}),
     }),
     enableInvestigations: vi
@@ -94,6 +115,9 @@ const render = async (
       .fn<WorkerIssueInbox["investigateNotification"]>()
       .mockResolvedValue(undefined),
     disableFixes: vi.fn<WorkerIssueInbox["disableFixes"]>().mockResolvedValue(undefined),
+    setAutomaticResolution: vi
+      .fn<WorkerIssueInbox["setAutomaticResolution"]>()
+      .mockResolvedValue(undefined),
     enableBackgroundChecks: vi
       .fn<WorkerIssueInbox["enableBackgroundChecks"]>()
       .mockResolvedValue(undefined),
@@ -156,16 +180,42 @@ const render = async (
     schedulerProvisioned = true;
   });
   const workspace = {
+    getGatekeeperById: vi.fn<
+      () => Promise<Pick<GatekeeperClient<never>, "getCreationSpec"> & Disposable>
+    >(async () => ({
+      getCreationSpec: async () => ({
+        type: "agentSpawner",
+        config: {
+          displayName: "Worker issue investigator",
+          modelId: options.configuredModelId ?? "model-2",
+          maxDurationMs: options.configuredDurationMs,
+        },
+      }),
+      getBinding: async () => ({
+        getCreationSpec: async () => ({
+          type: "gatekeeper",
+          vendorId: "cloudflare",
+          typeUrlPattern:
+            options.configuredTelemetryScope === "account"
+              ? ACCOUNT_OBSERVABILITY_PATTERN
+              : WORKER_PATTERN,
+          resourceUrl:
+            options.configuredTelemetryScope === "account"
+              ? `https://dash.cloudflare.com/${request.accountId}/workers-and-pages/observability`
+              : `https://dash.cloudflare.com/${request.accountId}/workers/services/view/${request.workerName}/production/observability`,
+        }),
+        [Symbol.dispose]() {},
+      }),
+      [Symbol.dispose]() {},
+    })),
     getAmbientGatekeeper: vi.fn<(vendorId: string) => Promise<object | null>>(async (vendorId) =>
       vendorId === "scheduler" && schedulerProvisioned ? scheduler : null,
     ),
-    getMetadata: vi
-      .fn<() => Promise<object>>()
-      .mockResolvedValue({
-        id: workspaceId,
-        defaultGadgetId: 0,
-        containsRestrictedData: options.restricted ?? false,
-      }),
+    getMetadata: vi.fn<() => Promise<object>>().mockResolvedValue({
+      id: workspaceId,
+      defaultGadgetId: 0,
+      containsRestrictedData: options.restricted ?? false,
+    }),
     setTitle: vi.fn<(title: string) => void>(),
     getGadget: vi.fn<() => Promise<typeof gadget>>().mockResolvedValue(gadget),
     newGatekeeper: vi.fn<(accountId: number, url: string) => Promise<object>>(
@@ -202,14 +252,12 @@ const render = async (
       .fn<(id: number, kind: object) => Promise<void>>()
       .mockResolvedValue(undefined),
     newAgentSpawnerGatekeeper: vi
-      .fn<() => Promise<typeof investigator>>()
+      .fn<(config: AgentSpawnerConfig) => Promise<typeof investigator>>()
       .mockResolvedValue(investigator),
-    listHooks: vi
-      .fn<() => Promise<object[]>>()
-      .mockResolvedValue([
-        { id: 2, gadgetId: 0, gatekeeperId: 11, enabled: false },
-        { id: 1, gadgetId: 0, gatekeeperId: 3, enabled: false },
-      ]),
+    listHooks: vi.fn<() => Promise<object[]>>().mockResolvedValue([
+      { id: 2, gadgetId: 0, gatekeeperId: 11, enabled: false },
+      { id: 1, gadgetId: 0, gatekeeperId: 3, enabled: false },
+    ]),
     enableHook: options.failEnable
       ? vi.fn<() => Promise<void>>().mockRejectedValue(new Error("Provider unavailable"))
       : vi.fn<() => Promise<void>>().mockResolvedValue(undefined),
@@ -307,17 +355,13 @@ const render = async (
         ...(options.remediation ? { remediation: options.remediation } : {}),
         ...(options.fromInbox?.runKey ? { runKey: options.fromInbox.runKey } : {}),
       }
-    : request;
+    : { ...request, repositoryUrl: options.repositoryUrl };
   await act(async () => root!.render(<WorkersIssueSetupPage request={setupRequest} />));
   const submit = () =>
-    [...container!.querySelectorAll("button")].find(
-      (button) =>
-        button.textContent ===
-        (options.remediation
-          ? "Enable fixes"
-          : options.investigation
-            ? "Enable investigations"
-            : "Connect destination"),
+    [...container!.querySelectorAll("button")].find((button) =>
+      ["Enable fixes", "Enable investigations", "Connect destination"].includes(
+        button.textContent ?? "",
+      ),
     )!;
   const completion = () => {
     const postMessage = vi.fn<Window["postMessage"]>();
@@ -350,7 +394,111 @@ const render = async (
   };
 };
 
+const selectOption = async (name: string, label: string) => {
+  const control = [...container!.querySelectorAll<HTMLElement>('[role="combobox"]')].find(
+    (element) =>
+      element.getAttribute("aria-label") === name ||
+      element
+        .getAttribute("aria-labelledby")
+        ?.split(" ")
+        .some((id) => document.getElementById(id)?.textContent?.includes(name)),
+  )!;
+  await act(async () => control.click());
+  const option = [...document.querySelectorAll<HTMLElement>('[role="option"]')].find(
+    (element) => element.textContent === label,
+  )!;
+  await act(async () => {
+    option.dispatchEvent(new MouseEvent("pointerdown", { bubbles: true }));
+    option.click();
+  });
+};
+const selectTelemetry = (label: string) => selectOption("Telemetry access", label);
+
 describe("Destination-first Worker issue onboarding", () => {
+  it("configures the model, scope, deadline, automatic runs and fixes during the initial connection", async () => {
+    const fixture = await render({ repositoryUrl: "https://github.com/acme/checkout" });
+    await act(async () => switchLabelled("Enable AI investigations").click());
+    await act(async () =>
+      [...container!.querySelectorAll("button")]
+        .find((button) => button.textContent === "Change")!
+        .click(),
+    );
+    await selectOption("Investigation model", "Other model");
+    await selectOption("Time limit per investigation", "No time limit");
+    await selectTelemetry("All Workers in this account");
+    await act(async () => switchLabelled("Investigate new notifications automatically").click());
+    await act(async () => switchLabelled("Propose fixes as pull or merge requests").click());
+    expect(
+      container!.querySelector<HTMLInputElement>(
+        'input[placeholder="https://github.com/owner/repo"]',
+      )?.value,
+    ).toBe("https://github.com/acme/checkout");
+    expect(switchLabelled("Allow public repositories").getAttribute("aria-checked")).toBe("false");
+    await act(async () =>
+      switchLabelled("Mark issue as resolved after the fix is deployed automatically").click(),
+    );
+    await act(async () => fixture.submit().click());
+    expect(container!.querySelector("[role=alert]")).toBeNull();
+    expect(fixture.create).toHaveBeenCalledTimes(1);
+    expect(fixture.ensure).toHaveBeenCalledWith(1, [
+      NOTIFICATIONS_PATTERN,
+      ACCOUNT_OBSERVABILITY_PATTERN,
+      RELEASES_PATTERN,
+    ]);
+    expect(fixture.inbox.initialize).toHaveBeenCalledWith({
+      accountId: request.accountId,
+      workerName: request.workerName,
+    });
+    expect(fixture.workspace.newAgentSpawnerGatekeeper).toHaveBeenCalledWith({
+      displayName: "Worker issue fixer",
+      modelId: "model-1",
+      env: { WORKER_OBSERVABILITY: 5, REPOSITORY: 8 },
+    });
+    expect(fixture.workspace.newGatekeeper).toHaveBeenCalledWith(
+      1,
+      `https://dash.cloudflare.com/${request.accountId}/workers-and-pages/observability`,
+    );
+    expect(fixture.inbox.disableInvestigations).toHaveBeenCalled();
+    expect(fixture.inbox.enableFixes).toHaveBeenCalled();
+    expect(fixture.inbox.setAutomaticResolution).toHaveBeenCalledWith(false);
+    expect(fixture.completion()).toHaveBeenCalledWith(
+      expect.objectContaining({ fixesEnabled: true, investigationsEnabled: false }),
+      { targetOrigin: request.dashboardOrigin },
+    );
+    expect(container!.textContent).toContain("Return to the dashboard to save your automation");
+  });
+
+  it("connects only notifications after opting back out of AI, even with models already loaded", async () => {
+    const fixture = await render({ repositoryUrl: "https://github.com/acme/checkout" });
+    await act(async () => switchLabelled("Enable AI investigations").click());
+    await act(async () => switchLabelled("Propose fixes as pull or merge requests").click());
+    await act(async () => switchLabelled("Enable AI investigations").click());
+    await act(async () => fixture.submit().click());
+    expect(fixture.ensure).toHaveBeenLastCalledWith(1, [NOTIFICATIONS_PATTERN]);
+    expect(fixture.workspace.newGatekeeper).not.toHaveBeenCalled();
+    expect(fixture.workspace.newAgentSpawnerGatekeeper).not.toHaveBeenCalled();
+    expect(fixture.completion()).toHaveBeenCalledWith(
+      expect.objectContaining({ investigationsEnabled: false }),
+      { targetOrigin: request.dashboardOrigin },
+    );
+  });
+
+  it("reuses the initial destination when AI configuration fails and setup is retried", async () => {
+    const fixture = await render({ spawnerFailure: true });
+    await act(async () => switchLabelled("Enable AI investigations").click());
+    await act(async () => fixture.submit().click());
+    expect(container!.querySelector("[role=alert]")?.textContent).toContain("Spawner failed");
+    expect(fixture.completion()).not.toHaveBeenCalled();
+    fixture.workspace.newAgentSpawnerGatekeeper.mockResolvedValue(fixture.investigator);
+    await act(async () => fixture.submit().click());
+    expect(fixture.create).toHaveBeenCalledTimes(1);
+    expect(fixture.inbox.enableInvestigations).toHaveBeenCalled();
+    expect(fixture.completion()).toHaveBeenCalledWith(
+      expect.objectContaining({ investigationsEnabled: true }),
+      { targetOrigin: request.dashboardOrigin },
+    );
+  });
+
   it("identifies missing installation configuration instead of suggesting an account-access retry", async () => {
     const fixture = await render({
       configuratorError: "The Cloudflare Gatekeeper is not configured.",
@@ -463,6 +611,7 @@ describe("Destination-first Worker issue onboarding", () => {
     expect(fixture.workspace.newAgentSpawnerGatekeeper).toHaveBeenCalledWith({
       displayName: "Worker issue investigator",
       modelId: "model-2",
+      maxDurationMs: 900_000,
       env: { WORKER_OBSERVABILITY: 5 },
     });
     expect(fixture.gadget.bind).toHaveBeenCalledWith("INVESTIGATOR", 6);
@@ -483,6 +632,79 @@ describe("Destination-first Worker issue onboarding", () => {
     expect(container!.querySelector("[role=alert]")?.textContent).toContain("does not match");
   });
 
+  it("grants account-wide read-only telemetry only when selected", async () => {
+    const fixture = await render({ investigation: true });
+    expect(container!.textContent).toContain("checkout-test only");
+    await selectTelemetry("All Workers in this account");
+    await act(async () => fixture.submit().click());
+    expect(fixture.ensure).toHaveBeenCalledWith(1, [ACCOUNT_OBSERVABILITY_PATTERN]);
+    expect(fixture.workspace.newGatekeeper.mock.calls).toEqual([
+      [1, `https://dash.cloudflare.com/${request.accountId}/workers-and-pages/observability`],
+    ]);
+    expect(fixture.workspace.newAgentSpawnerGatekeeper).toHaveBeenCalledWith(
+      expect.objectContaining({ env: { WORKER_OBSERVABILITY: 5 } }),
+    );
+    expect(fixture.workspace.setAutoApprovedActionKind).not.toHaveBeenCalled();
+  });
+
+  it("retains account-wide telemetry from the existing investigator's binding", async () => {
+    const fixture = await render({
+      investigation: true,
+      existingInvestigator: true,
+      configuredTelemetryScope: "account",
+    });
+    expect(container!.textContent).toContain("All Workers in this account");
+    await act(async () => fixture.submit().click());
+    expect(fixture.ensure).toHaveBeenCalledWith(1, [ACCOUNT_OBSERVABILITY_PATTERN]);
+    expect(fixture.workspace.newGatekeeper).toHaveBeenCalledWith(
+      1,
+      `https://dash.cloudflare.com/${request.accountId}/workers-and-pages/observability`,
+    );
+  });
+
+  it("replaces account-wide telemetry with an exact Worker binding when narrowed", async () => {
+    const fixture = await render({
+      investigation: true,
+      existingInvestigator: true,
+      configuredTelemetryScope: "account",
+    });
+    await selectTelemetry("checkout-test only");
+    await act(async () => fixture.submit().click());
+    expect(fixture.ensure).toHaveBeenCalledWith(1, [WORKER_PATTERN]);
+    expect(fixture.workspace.newGatekeeper.mock.calls).toEqual([
+      [
+        1,
+        `https://dash.cloudflare.com/${request.accountId}/workers/services/view/checkout-test/production/observability`,
+      ],
+    ]);
+    expect(fixture.gadget.unbind).toHaveBeenCalledWith("INVESTIGATOR");
+    expect(fixture.gadget.bind).toHaveBeenCalledWith("INVESTIGATOR", 6);
+  });
+
+  it("keeps release and repository permissions narrow with account-wide telemetry", async () => {
+    const fixture = await render({
+      investigation: true,
+      existingInvestigator: true,
+      configuredTelemetryScope: "account",
+      remediation: { allowPublic: false, repositoryUrl: "https://github.com/acme/checkout" },
+    });
+    await act(async () => fixture.submit().click());
+    expect(fixture.ensure).toHaveBeenCalledWith(1, [
+      ACCOUNT_OBSERVABILITY_PATTERN,
+      RELEASES_PATTERN,
+    ]);
+    expect(fixture.workspace.newGatekeeper).toHaveBeenCalledWith(
+      1,
+      `https://dash.cloudflare.com/${request.accountId}/workers/services/view/checkout-test/production/deployments`,
+    );
+    expect(fixture.workspace.newAgentSpawnerGatekeeper).toHaveBeenCalledWith(
+      expect.objectContaining({ env: { WORKER_OBSERVABILITY: 5, REPOSITORY: 8 } }),
+    );
+    expect(fixture.workspace.setAutoApprovedActionKind.mock.calls.map(([id]) => id)).not.toContain(
+      5,
+    );
+  });
+
   it("replaces an existing investigator even when investigations are already enabled", async () => {
     const fixture = await render({
       investigation: true,
@@ -497,6 +719,62 @@ describe("Destination-first Worker issue onboarding", () => {
     expect(fixture.gadget.bind).toHaveBeenCalledWith("INVESTIGATOR", 6);
     expect(fixture.investigator.remove).not.toHaveBeenCalled();
   });
+
+  it("shows and retains the inbox's configured model instead of the preferred model", async () => {
+    const fixture = await render({
+      investigation: true,
+      fromInbox: {},
+      existingInvestigator: true,
+      configuredModelId: "model-1",
+    });
+    expect(container!.textContent).toContain("Model: Other model");
+    await act(async () =>
+      [...container!.querySelectorAll("button")]
+        .find((button) => button.textContent === "Change")!
+        .click(),
+    );
+    expect(container!.querySelector('[role="combobox"]')?.textContent).toContain("Other model");
+    await act(async () => fixture.submit().click());
+    expect(fixture.workspace.newAgentSpawnerGatekeeper).toHaveBeenCalledWith(
+      expect.objectContaining({ modelId: "model-1" }),
+    );
+  });
+
+  it("requires a new model choice when the previously configured model is unavailable", async () => {
+    const fixture = await render({
+      investigation: true,
+      fromInbox: {},
+      existingInvestigator: true,
+      configuredModelId: "removed-model",
+    });
+    expect(fixture.submit().disabled).toBe(true);
+    expect(container!.textContent).not.toContain("Model: Preferred model");
+    expect(fixture.workspace.newAgentSpawnerGatekeeper).not.toHaveBeenCalled();
+  });
+
+  it.each([300_000, 420_000, undefined])(
+    "retains the configured investigation limit (%s)",
+    async (configuredDurationMs) => {
+      const fixture = await render({
+        investigation: true,
+        existingInvestigator: true,
+        configuredDurationMs,
+      });
+      expect(container!.querySelector('[role="combobox"]')?.textContent).toContain(
+        configuredDurationMs === undefined
+          ? "No time limit"
+          : `${configuredDurationMs / 60_000} minutes`,
+      );
+      await act(async () => fixture.submit().click());
+      const config = fixture.workspace.newAgentSpawnerGatekeeper.mock.calls[0]?.[0];
+      expect(config).toEqual({
+        displayName: "Worker issue investigator",
+        modelId: "model-2",
+        env: { WORKER_OBSERVABILITY: 5 },
+        ...(configuredDurationMs === undefined ? {} : { maxDurationMs: configuredDurationMs }),
+      });
+    },
+  );
 
   it("removes new workpieces and restores the previous investigator when binding fails", async () => {
     const fixture = await render({
@@ -541,7 +819,11 @@ describe("Worker issue fixes", () => {
   it("connects a contributor repository for the fixer and inbox, approving its pushes and requests at setup", async () => {
     const fixture = await render({ investigation: true, investigationsEnabled: true, remediation });
     expect(container!.textContent).toContain("Enable AI fixes");
-    expect(container!.textContent).toContain("GitHub · acme/checkout");
+    expect(
+      container!.querySelector<HTMLInputElement>(
+        'input[placeholder="https://github.com/owner/repo"]',
+      )?.value,
+    ).toBe(remediation.repositoryUrl);
     await act(async () => fixture.submit().click());
 
     expect(fixture.ensure).toHaveBeenCalledWith(1, [WORKER_PATTERN, RELEASES_PATTERN]);
@@ -553,12 +835,14 @@ describe("Worker issue fixes", () => {
     expect(fixture.workspace.newAgentSpawnerGatekeeper).toHaveBeenCalledWith({
       displayName: "Worker issue fixer",
       modelId: "model-2",
+      maxDurationMs: 900_000,
       env: { WORKER_OBSERVABILITY: 5, REPOSITORY: 8 },
     });
     expect(fixture.gadget.bind).toHaveBeenCalledWith("INVESTIGATOR", 6);
     expect(fixture.gadget.bind).toHaveBeenCalledWith("REPOSITORY", 8);
     expect(fixture.inbox.enableInvestigations).toHaveBeenCalled();
     expect(fixture.inbox.enableFixes).toHaveBeenCalled();
+    expect(fixture.inbox.setAutomaticResolution).toHaveBeenCalledWith(true);
     // Only the repository binding's push and request kinds, and resolving the Worker's issues.
     expect(fixture.workspace.setAutoApprovedActionKind.mock.calls).toEqual([
       [10, { tag: "resolve-worker-issue", label: "Resolve Worker issues" }],
@@ -604,6 +888,58 @@ describe("Worker issue fixes", () => {
     expect(fixture.provisionAmbientAccount).toHaveBeenCalledWith("scheduler");
     expect(fixture.gadget.bind).toHaveBeenCalledWith("SCHEDULER", 11);
     expect(fixture.inbox.enableBackgroundChecks).toHaveBeenCalledTimes(1);
+  });
+
+  it("can propose fixes and follow deployments without approving automatic resolution", async () => {
+    const fixture = await render({ investigation: true, remediation });
+    expect(container!.textContent).not.toContain("Once you merge, the inbox follows");
+    await act(async () =>
+      switchLabelled("Mark issue as resolved after the fix is deployed automatically").click(),
+    );
+    await act(async () => fixture.submit().click());
+    expect(fixture.inbox.setAutomaticResolution).toHaveBeenCalledWith(false);
+    expect(fixture.inbox.enableFixes).toHaveBeenCalled();
+    expect(fixture.inbox.enableBackgroundChecks).toHaveBeenCalled();
+    expect(fixture.workspace.setAutoApprovedActionKind.mock.calls).toEqual([
+      [8, { tag: "github.push", label: "Push commits" }],
+      [8, { tag: "github.createPullRequest", label: "Create pull requests" }],
+    ]);
+  });
+
+  it("preserves automatic resolution being off when reopening and saving AI setup", async () => {
+    const fixture = await render({
+      investigation: true,
+      fromInbox: {},
+      remediation,
+      fixesEnabled: true,
+      autoResolve: false,
+    });
+    expect(
+      switchLabelled("Mark issue as resolved after the fix is deployed automatically").getAttribute(
+        "aria-checked",
+      ),
+    ).toBe("false");
+    await act(async () => fixture.submit().click());
+    expect(fixture.inbox.setAutomaticResolution).toHaveBeenCalledWith(false);
+    expect(fixture.inbox.enableFixes).toHaveBeenCalled();
+  });
+
+  it("keeps older inboxes configurable, but requires a blueprint update before turning resolution off", async () => {
+    const fixture = await render({ investigation: true, remediation });
+    const status = await fixture.inbox.getSetupStatus();
+    fixture.inbox.getSetupStatus.mockResolvedValue({ ...status, autoResolve: undefined });
+    await act(async () =>
+      switchLabelled("Mark issue as resolved after the fix is deployed automatically").click(),
+    );
+    await act(async () => fixture.submit().click());
+    expect(container!.querySelector("[role=alert]")?.textContent).toContain("Update this inbox");
+    expect(fixture.workspace.newGatekeeper).not.toHaveBeenCalled();
+    await act(async () =>
+      switchLabelled("Mark issue as resolved after the fix is deployed automatically").click(),
+    );
+    await act(async () => fixture.submit().click());
+    expect(fixture.inbox.enableFixes).toHaveBeenCalled();
+    expect(fixture.inbox.setAutomaticResolution).not.toHaveBeenCalled();
   });
 
   it("keeps fixes enabled when background checks are unavailable", async () => {
@@ -710,11 +1046,46 @@ describe("Worker issue fixes", () => {
 describe("Worker issue setup opened from the inbox", () => {
   const runKey = `${request.accountId}:run-1`;
 
+  it.each([false, true])(
+    "preserves saved automatic investigations (%s) when updating setup",
+    async (enabled) => {
+      const fixture = await render({
+        investigation: true,
+        existingInvestigator: true,
+        investigationsEnabled: enabled,
+        fromInbox: {},
+      });
+      expect(
+        switchLabelled("Investigate new notifications automatically").getAttribute("aria-checked"),
+      ).toBe(String(enabled));
+      await act(async () => fixture.submit().click());
+      expect(
+        enabled ? fixture.inbox.enableInvestigations : fixture.inbox.disableInvestigations,
+      ).toHaveBeenCalledTimes(1);
+      expect(
+        enabled ? fixture.inbox.disableInvestigations : fixture.inbox.enableInvestigations,
+      ).not.toHaveBeenCalled();
+    },
+  );
+
+  it("can change the saved automatic investigations choice", async () => {
+    const fixture = await render({
+      investigation: true,
+      existingInvestigator: true,
+      investigationsEnabled: true,
+      fromInbox: {},
+    });
+    await act(async () => switchLabelled("Investigate new notifications automatically").click());
+    await act(async () => fixture.submit().click());
+    expect(fixture.inbox.disableInvestigations).toHaveBeenCalledTimes(1);
+    expect(fixture.inbox.enableInvestigations).not.toHaveBeenCalled();
+  });
+
   it("binds an investigator for one notification without investigating every later one", async () => {
     const fixture = await render({ investigation: true, fromInbox: { runKey } });
-    expect(switchLabelled("Investigate new notifications automatically").getAttribute("aria-checked")).toBe(
-      "false",
-    );
+    expect(
+      switchLabelled("Investigate new notifications automatically").getAttribute("aria-checked"),
+    ).toBe("false");
     // Fixes are offered, but off until the user asks.
     expect(switchLabelled("Propose fixes").getAttribute("aria-checked")).toBe("false");
     await act(async () => fixture.submit().click());
@@ -737,9 +1108,9 @@ describe("Worker issue setup opened from the inbox", () => {
 
   it("investigates every new notification when opened to enable investigations", async () => {
     const fixture = await render({ investigation: true, fromInbox: {} });
-    expect(switchLabelled("Investigate new notifications automatically").getAttribute("aria-checked")).toBe(
-      "true",
-    );
+    expect(
+      switchLabelled("Investigate new notifications automatically").getAttribute("aria-checked"),
+    ).toBe("true");
     await act(async () => fixture.submit().click());
     expect(fixture.inbox.enableInvestigations).toHaveBeenCalledTimes(1);
     expect(fixture.inbox.investigateNotification).not.toHaveBeenCalled();
@@ -754,7 +1125,11 @@ describe("Worker issue setup opened from the inbox", () => {
       remediation: { allowPublic: false, repositoryUrl: "https://github.com/acme/checkout" },
     });
     expect(switchLabelled("Propose fixes").getAttribute("aria-checked")).toBe("true");
-    expect(container!.textContent).toContain("GitHub · acme/checkout");
+    expect(
+      container!.querySelector<HTMLInputElement>(
+        'input[placeholder="https://github.com/owner/repo"]',
+      )?.value,
+    ).toBe("https://github.com/acme/checkout");
     await act(async () => fixture.submit().click());
     expect(fixture.inbox.enableFixes).toHaveBeenCalledTimes(1);
     expect(fixture.inbox.disableFixes).not.toHaveBeenCalled();

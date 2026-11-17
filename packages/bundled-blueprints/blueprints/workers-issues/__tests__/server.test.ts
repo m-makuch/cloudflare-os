@@ -115,6 +115,9 @@ const setup = (
   const investigate = vi.fn().mockResolvedValue(undefined);
   const fix = vi.fn().mockResolvedValue(undefined);
   const spawnCallable = vi.fn().mockResolvedValue({ investigate, fix, [Symbol.dispose]() {} });
+  const getConfiguration = vi.fn().mockResolvedValue({
+    modelId: "configured-model", modelName: "Configured model", maxDurationMs: null,
+  });
   const subscribe = vi.fn().mockResolvedValue(undefined);
   let gadget: InstanceType<typeof Gadget>;
   const background: Promise<unknown>[] = [];
@@ -145,7 +148,7 @@ const setup = (
       }),
   };
   const env = {
-    ...(options.investigator === false ? {} : { INVESTIGATOR: { spawnCallable } }),
+    ...(options.investigator === false ? {} : { INVESTIGATOR: { spawnCallable, getConfiguration } }),
     CLOUDFLARE_NOTIFICATIONS: { subscribe, getStatus: vi.fn() },
     ...(options.repository ? { REPOSITORY: options.repository.binding } : {}),
     ...(options.releases ? { WORKER_RELEASES: options.releases.binding } : {}),
@@ -155,7 +158,7 @@ const setup = (
     gadget = new Gadget(context as unknown as DurableObjectState, env);
     return gadget;
   };
-  return { gadget: restart(), restart, settle, spawnCallable, investigate, fix, subscribe, storage, context, database };
+  return { gadget: restart(), restart, settle, spawnCallable, getConfiguration, investigate, fix, subscribe, storage, context, database };
 };
 
 type Task = {
@@ -327,6 +330,27 @@ describe("Worker issue investigation inbox", () => {
     await expect(fixture.gadget.investigateNotification("unknown")).rejects.toThrow(
       "not been investigated",
     );
+  });
+
+  it("reads the bound investigator's current model and time limit without spawning a run", async () => {
+    const fixture = setup();
+    await fixture.gadget.initialize(scope);
+    expect((await fixture.gadget.getSetupStatus()).investigator).toEqual({
+      modelId: "configured-model", modelName: "Configured model", maxDurationMs: null,
+    });
+    fixture.getConfiguration.mockResolvedValue({ modelId: "new-model", modelName: "New model", maxDurationMs: 900_000 });
+    expect((await fixture.gadget.getSetupStatus()).investigator).toEqual({
+      modelId: "new-model", modelName: "New model", maxDurationMs: 900_000,
+    });
+    expect(fixture.spawnCallable).not.toHaveBeenCalled();
+  });
+
+  it("keeps setup status available when investigator settings cannot be read", async () => {
+    const fixture = setup();
+    await fixture.gadget.initialize(scope);
+    fixture.getConfiguration.mockRejectedValue(new Error("Unavailable"));
+    expect(await fixture.gadget.getSetupStatus()).toMatchObject({ investigatorReady: true, ...scope });
+    expect(await fixture.gadget.getSetupStatus()).not.toHaveProperty("investigator");
   });
 
   it("stops starting runs on arrival once automatic investigations are turned off", async () => {
@@ -691,6 +715,28 @@ describe("following a fix to production", () => {
     expect(await latestRun(fixture)).toMatchObject({ status: "released", release_note: null });
   });
 
+  it("persists automatic resolution being off across restarts, and resumes when enabled", async () => {
+    const fixture = await merged();
+    expect((await fixture.gadget.getSetupStatus()).autoResolve).toBe(true);
+    await fixture.gadget.setAutomaticResolution(false);
+    const restarted = fixture.restart();
+    expect((await restarted.getSetupStatus()).autoResolve).toBe(false);
+    fixture.repo.contained.add(`${MERGE} in ${DEPLOYED}`);
+    fixture.workerReleases.state.deployments = [deployment(0, { commit: DEPLOYED })];
+    fixture.workerReleases.state.invocations = 100;
+    await restarted.reconcileChanges();
+    expect((await latestRun({ gadget: restarted })).status).toBe("released");
+    at(65);
+    await restarted.reconcileChanges();
+    expect(fixture.workerReleases.binding.resolveIssue).not.toHaveBeenCalled();
+    expect((await latestRun({ gadget: restarted })).status).toBe("released");
+    await restarted.setAutomaticResolution(true);
+    at(70);
+    await restarted.reconcileChanges();
+    expect(fixture.workerReleases.binding.resolveIssue).toHaveBeenCalledWith("issue-1");
+    expect((await latestRun({ gadget: restarted })).status).toBe("resolved");
+  });
+
   it("waits while any version serving traffic lacks the fix, as in a gradual rollout", async () => {
     const fixture = await merged();
     fixture.repo.contained.add(`${MERGE} in ${DEPLOYED}`);
@@ -705,8 +751,9 @@ describe("following a fix to production", () => {
     expect((await latestRun(fixture)).status).toBe("change_merged");
   });
 
-  it("marks a fix whose issue occurs after the release as recurring, and leaves the issue open", async () => {
+  it.each([true, false])("marks recurrence and leaves the issue open with automatic resolution %s", async (autoResolve) => {
     const fixture = await merged();
+    await fixture.gadget.setAutomaticResolution(autoResolve);
     fixture.repo.contained.add(`${MERGE} in ${DEPLOYED}`);
     fixture.workerReleases.state.deployments = [deployment(0, { commit: DEPLOYED })];
     await fixture.gadget.reconcileChanges();
@@ -812,4 +859,3 @@ describe("background checks", () => {
     expect(fixture.spawnCallable).toHaveBeenCalledTimes(1);
   });
 });
-

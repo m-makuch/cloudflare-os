@@ -3,6 +3,7 @@ import { isRecord, issueIdentity } from "./lib/issueIdentity.ts";
 import type {
   ChangeState,
   FixSetup,
+  InboxSetupStatus,
   Investigation,
   InvestigationSummary,
   ReleaseNote,
@@ -80,6 +81,7 @@ interface GadgetEnv {
     getStatus(): ReturnType<WorkerIssueInbox["getNotificationStatus"]>;
   };
   INVESTIGATOR?: {
+    getConfiguration(): Promise<NonNullable<InboxSetupStatus["investigator"]>>;
     spawnCallable(
       title: string,
       options: { types: string; mainType: string },
@@ -410,13 +412,19 @@ export class Gadget extends DurableObject<GadgetEnv, unknown> implements WorkerI
   async getSetupStatus() {
     const fixes = await this.ctx.storage.get<FixSetup>("fixes");
     const scope = await this.ctx.storage.get<WorkerScope>("scope");
+    // Display the bound spawner's settings, not a copy that can drift when its bindings change.
+    const investigator = scope && this.env.INVESTIGATOR
+      ? await this.env.INVESTIGATOR.getConfiguration().catch(() => undefined)
+      : undefined;
     return {
       ...scope,
       investigationsEnabled: Boolean(await this.ctx.storage.get("investigationsEnabled")),
       investigatorReady: Boolean(scope && this.env.INVESTIGATOR),
+      ...(investigator ? { investigator } : {}),
       ...(fixes ? { fixes } : {}),
       releasesReady: Boolean(this.env.WORKER_RELEASES),
       backgroundChecks: Boolean(this.env.SCHEDULER && (await this.ctx.storage.get("scheduleId"))),
+      autoResolve: (await this.ctx.storage.get<boolean>("autoResolve")) ?? true,
     };
   }
 
@@ -495,6 +503,10 @@ export class Gadget extends DurableObject<GadgetEnv, unknown> implements WorkerI
 
   async disableFixes(): Promise<void> {
     await this.ctx.storage.delete("fixes");
+  }
+
+  async setAutomaticResolution(enabled: boolean): Promise<void> {
+    await this.ctx.storage.put("autoResolve", enabled);
   }
 
   async onNotification(notification: unknown): Promise<void> {
@@ -752,7 +764,10 @@ export class Gadget extends DurableObject<GadgetEnv, unknown> implements WorkerI
       return;
     }
     // A person's "ignored" stands; only an active issue is resolved upstream.
-    if (issue.status === "active") await releases.resolveIssue(run.issue_id);
+    if (issue.status === "active") {
+      if ((await this.ctx.storage.get<boolean>("autoResolve")) === false) return;
+      await releases.resolveIssue(run.issue_id);
+    }
     this.ctx.storage.sql.exec(
       `UPDATE investigations SET status = 'resolved', resolved_at = ?, release_note = NULL
        WHERE run_key = ? AND status = 'released'`,

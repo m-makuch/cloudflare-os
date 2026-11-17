@@ -72,9 +72,10 @@ p { margin: 0; }
 .actions { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; }
 .setup { margin-top: 20px; padding: 16px; border-radius: 8px; background: var(--elevated); box-shadow: 0 0 0 1px var(--hairline); }
 .setup .actions { margin-top: 14px; }
-.setup .description { margin-top: 10px; }
-.mode { display: flex; flex-wrap: wrap; align-items: center; gap: 6px 10px; }
-.mode-description { color: var(--text); }
+.configuration { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; list-style: none; margin: 12px 0 0; padding: 0; }
+.configuration-details { display: grid; grid-template-columns: max-content minmax(0, 1fr); gap: 6px 16px; margin: 16px 0 0; font-size: 13px; }
+.configuration-details dt { color: var(--subtle); }
+.configuration-details dd { margin: 0; overflow-wrap: anywhere; }
 .badge { display: inline-flex; align-items: center; gap: 6px; flex-shrink: 0; padding: 2px 8px; border-radius: 999px; font-size: 12px; font-weight: 500; line-height: 16px; white-space: nowrap; background: var(--fill); color: var(--neutral-text); }
 .badge::before { content: ""; width: 7px; height: 7px; border-radius: 50%; background: currentColor; }
 .badge[data-tone="info"] { background: var(--info-tint); color: var(--info); }
@@ -103,6 +104,8 @@ p { margin: 0; }
   .inbox { padding: 18px 14px; }
   .header { flex-wrap: wrap; }
   .entry, .setup { padding: 14px; }
+  .configuration-details { grid-template-columns: 1fr; gap: 2px; }
+  .configuration-details dd + dt { margin-top: 6px; }
 }
 @media (pointer: coarse) { .btn { min-height: 44px; } }
 `,
@@ -111,11 +114,20 @@ document.head.append(style);
 
 const scope = el("p", { class: "scope", text: "Loading Worker scope…" });
 const refresh = el("button", { class: "btn", type: "button", text: "Refresh inbox" });
-const mode = el("span", { class: "badge", text: "Loading setup…" });
-const modeDescription = el("span", { class: "mode-description" });
-const setupLink = el("a", { class: "btn", target: "_blank", rel: "noopener noreferrer", hidden: true });
-const automaticToggle = el("button", { class: "btn", type: "button", hidden: true });
-const description = el("p", { class: "description" });
+const mode = el("p", { text: "Loading setup…" });
+const automaticStatus = el("li", { class: "badge" });
+const fixesStatus = el("li", { class: "badge" });
+const resolutionStatus = el("li", { class: "badge" });
+const configuration = el("ul", { class: "configuration", "aria-label": "Current AI configuration", hidden: true }, [
+  automaticStatus, fixesStatus, resolutionStatus,
+]);
+const investigationModel = el("dd");
+const investigationTimeLimit = el("dd");
+const configurationDetails = el("dl", { class: "configuration-details", hidden: true }, [
+  el("dt", { text: "Investigation model" }), investigationModel,
+  el("dt", { text: "Time limit" }), investigationTimeLimit,
+]);
+const setupLink = el("a", { class: "btn primary", target: "_blank", rel: "noopener noreferrer", hidden: true });
 const summary = el("p", { role: "status", text: "Loading inbox…" });
 const updated = el("time", { class: "updated" });
 const error = el("p", { class: "notice", role: "alert", hidden: true });
@@ -131,9 +143,10 @@ document.body.replaceChildren(
       refresh,
     ]),
     el("section", { class: "setup", "aria-label": "AI setup" }, [
-      el("div", { class: "mode" }, [mode, modeDescription]),
-      description,
-      el("div", { class: "actions" }, [setupLink, automaticToggle]),
+      mode,
+      configuration,
+      configurationDetails,
+      el("div", { class: "actions" }, [setupLink]),
     ]),
     error,
     el("div", { class: "summary" }, [summary, updated]),
@@ -191,6 +204,14 @@ const VERIFY_WINDOW_MINUTES = 60;
 /** What the git host calls a proposed change. */
 function changeNoun(fixes: FixSetup | undefined): string {
   return fixes?.provider === "github" ? "pull request" : "merge request";
+}
+
+function formatTimeLimit(durationMs: number | null): string {
+  if (durationMs === null) return "No time limit";
+  const [value, unit] = durationMs >= 60_000
+    ? [durationMs / 60_000, "minute"] as const
+    : durationMs >= 1000 ? [durationMs / 1000, "second"] as const : [durationMs, "millisecond"] as const;
+  return `${new Intl.NumberFormat(undefined, { maximumFractionDigits: 2 }).format(value)} ${unit}${value === 1 ? "" : "s"} per investigation`;
 }
 
 let fixSetup: FixSetup | undefined;
@@ -318,6 +339,8 @@ function releaseText(run: InvestigationSummary): string | undefined {
       }
       return "Merged. Waiting for a deployment that contains it to go live.";
     case "released":
+      if (setupStatus?.autoResolve === false)
+        return `Live${since}. Automatic resolution is off; mark the issue resolved in Workers Observability after verifying the fix.`;
       if (run.release_note === "no_traffic") {
         return `Live${since}, but it has not served enough traffic to tell whether the issue is fixed. Verification continues as requests arrive.`;
       }
@@ -498,35 +521,26 @@ async function render(): Promise<void> {
     const ready = setup.investigatorReady;
     const automatic = setup.investigationsEnabled && ready;
     const fixes = ready ? setup.fixes : undefined;
-    setText(
-      mode,
-      !ready
-        ? "Notifications only"
-        : `${fixes ? "AI fixes" : "AI investigations"} ${automatic ? "on" : "on request"}`,
-    );
-    const run = fixes ? `propose a fix as a ${changeNoun(fixes)} in ${fixes.repository}` : "start an investigation";
-    setText(
-      modeDescription,
-      !ready
-        ? "Notifications are stored without running a model."
-        : automatic
-          ? `New issue notifications ${fixes ? "can " : ""}${run}.`
-          : `Notifications are stored. Investigate any of them to ${run}.`,
-    );
-    mode.dataset.tone = !ready ? "neutral" : automatic ? "success" : "info";
+    setText(mode, "Your setup is currently configured to:");
+    for (const [pill, label, enabled] of [
+      [automaticStatus, "Investigate automatically", automatic],
+      [fixesStatus, fixes?.provider === "gitlab" ? "Create merge requests" : "Create pull requests", Boolean(fixes)],
+      [resolutionStatus, "Mark as resolved automatically", Boolean(fixes) && setup.releasesReady && setup.autoResolve !== false],
+    ] as const) {
+      setText(pill, `${label}: ${enabled ? "On" : "Off"}`);
+      pill.dataset.tone = enabled ? "success" : "neutral";
+    }
+    configuration.hidden = false;
+    const investigator = setup.investigator;
+    setText(investigationModel, investigator
+      ? investigator.modelName ?? investigator.modelId ?? "Not configured"
+      : ready ? "Unavailable" : "Not configured");
+    setText(investigationTimeLimit, investigator
+      ? formatTimeLimit(investigator.maxDurationMs)
+      : ready ? "Unavailable" : "Not configured");
+    configurationDetails.hidden = false;
     setLink(setupLink, setupUrl());
     setText(setupLink, ready ? "Change AI setup" : "Set up AI investigations");
-    // Setting up is the inbox's one next step until an investigator is bound; then it is secondary.
-    setupLink.classList.toggle("primary", !ready);
-    setupLink.classList.toggle("ghost", ready);
-    automaticToggle.hidden = !ready;
-    setText(automaticToggle, automatic ? "Stop automatic investigations" : "Investigate new notifications automatically");
-    setText(
-      description,
-      fixes
-        ? `The fixer can push only to branches starting with "${fixes.branchPrefix}" and open ${changeNoun(fixes)}s into the default branch. It cannot merge or deploy: you review and merge, and your CI deploys. A workspace editor can change its bindings.`
-        : "AI setup provisions read-only telemetry for this Worker. A workspace editor can change the investigator's bindings. Repository access, project tests, code changes, and deployments require separate capabilities.",
-    );
     setText(
       summary,
       runs.length
@@ -558,7 +572,6 @@ async function render(): Promise<void> {
       empty.hidden = true;
       setText(scope, "Worker scope unavailable");
       setText(mode, "Setup unavailable");
-      mode.dataset.tone = "danger";
       setText(summary, "Inbox unavailable.");
     }
   } finally {
@@ -569,20 +582,6 @@ async function render(): Promise<void> {
 
 refresh.addEventListener("click", () => {
   void render();
-});
-automaticToggle.addEventListener("click", async () => {
-  automaticToggle.disabled = true;
-  try {
-    // Only an inbox with a bound investigator shows this; binding one is OS setup's.
-    if (setupStatus?.investigationsEnabled) await gadget.disableInvestigations();
-    else await gadget.enableInvestigations();
-    await render();
-  } catch {
-    setText(error, "Could not change automatic investigations. Refresh and try again.");
-    error.hidden = false;
-  } finally {
-    automaticToggle.disabled = false;
-  }
 });
 const timer = setInterval(() => {
   void render();

@@ -98,12 +98,21 @@ export interface InboxSetupStatus extends Partial<WorkerScope> {
    * on request. Binding one is the OS setup page's: it needs the user's consent and a model.
    */
   investigatorReady: boolean;
+  /** Current binding settings; absent if unbound or the settings could not be read. */
+  investigator?: {
+    modelId: string | null;
+    modelName: string | null;
+    /** Null explicitly means no time limit. */
+    maxDurationMs: number | null;
+  };
   /** Present once fixes are enabled. */
   fixes?: FixSetup;
   /** Whether a Worker releases binding is bound, so a merged fix is followed to its release. */
   releasesReady: boolean;
   /** Whether a schedule checks the inbox while no one has it open. */
   backgroundChecks: boolean;
+  /** Whether verified fixes resolve issues automatically; absent on older inboxes (enabled). */
+  autoResolve?: boolean;
 }
 
 /** The inbox RPC contract shared by its browser, server, and OS setup frontend. */
@@ -135,6 +144,8 @@ export interface WorkerIssueInbox {
   enableFixes(): Promise<FixSetup>;
   /** New runs only investigate again; runs already dispatched are unaffected. */
   disableFixes(): Promise<void>;
+  /** Persist whether verified releases may mark active issues resolved in Workers Observability. */
+  setAutomaticResolution(enabled: boolean): Promise<void>;
   listInvestigations(): Promise<InvestigationSummary[]>;
   getInvestigationReport(runKey: string): Promise<string | null>;
   /**

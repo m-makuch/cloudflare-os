@@ -5,8 +5,10 @@ import type {
   GatekeeperClient,
   Overseer,
 } from "@gadgets/workshop-shared/api";
-import type { WorkerIssueInbox } from "../../../../bundled-blueprints/blueprints/workers-issues/files/protocol";
+import type { WorkerIssueInbox } from "../../../../bundled-blueprints/blueprints/workers-issues/files/lib/protocol";
 import type { WorkersIssueSetupRequest } from "./workersIssueSetup";
+
+export type WorkersIssueTelemetryScope = "worker" | "account";
 
 /**
  * What fixes need: the repository's contributor binding. Enabling fixes is the user's approval of
@@ -18,6 +20,8 @@ export type WorkersIssueFixSetup = {
   /** The contributor binding URL (see `resolveContributorRepository`). */
   resourceUrl: string;
   allowPublic: boolean;
+  /** Resolve verified fixes in Workers Observability without asking again. */
+  autoResolve: boolean;
 };
 
 /** A binding change whose outcome could not be read back: neither target may be removed. */
@@ -96,7 +100,17 @@ export const provisionWorkersIssueInbox = async (
   fix?: WorkersIssueFixSetup,
   /** Whether every new notification starts a run, or only those the user picks in the inbox. */
   automatic = true,
-) => {
+  /** Wall-clock budget for each spawned investigation; omitted means no limit. */
+  maxDurationMs?: number,
+  telemetryScope: WorkersIssueTelemetryScope = "worker",
+): Promise<{
+  workspaceId: string;
+  destinationId: string;
+  investigationsEnabled: boolean;
+  fixesEnabled?: boolean;
+  backgroundChecks?: boolean;
+  investigated?: boolean;
+}> => {
   using workspace = workspaceId
     ? await api.openWorkspace(workspaceId)
     : await api.newWorkspaceFromBlueprint("automation.workers-issues", {
@@ -127,6 +141,10 @@ export const provisionWorkersIssueInbox = async (
       throw new Error("This inbox does not match the requested Worker and destination.");
     }
     if (!modelId) throw new Error("Choose a language model before enabling investigations.");
+    if (fix && !fix.autoResolve && scope.autoResolve === undefined)
+      throw new Error(
+        "Update this inbox from the Worker issues blueprint before turning automatic resolution off.",
+      );
     if (fix && metadata.containsRestrictedData) {
       // A workspace that has read restricted data refuses every push, so a fix could never land.
       throw new Error(
@@ -144,7 +162,9 @@ export const provisionWorkersIssueInbox = async (
     try {
       using telemetry = await workspace.newGatekeeper(
         accountId,
-        `https://dash.cloudflare.com/${request.accountId}/workers/services/view/${encodeURIComponent(request.workerName)}/production/observability`,
+        telemetryScope === "account"
+          ? `https://dash.cloudflare.com/${request.accountId}/workers-and-pages/observability`
+          : `https://dash.cloudflare.com/${request.accountId}/workers/services/view/${encodeURIComponent(request.workerName)}/production/observability`,
       );
       if (!telemetry) throw new Error("Worker telemetry could not be connected.");
       created.push(telemetry);
@@ -175,6 +195,7 @@ export const provisionWorkersIssueInbox = async (
       using investigator = await workspace.newAgentSpawnerGatekeeper({
         displayName: fix ? "Worker issue fixer" : "Worker issue investigator",
         modelId,
+        ...(maxDurationMs === undefined ? {} : { maxDurationMs }),
         env: {
           WORKER_OBSERVABILITY: await telemetry.getId(),
           ...(repositoryId === undefined ? {} : { REPOSITORY: repositoryId }),
@@ -189,7 +210,8 @@ export const provisionWorkersIssueInbox = async (
       uncertain = error instanceof UncertainBindingError;
       throw uncertain ? (error as UncertainBindingError).cause : error;
     } finally {
-      if (!committed && !uncertain) for (const target of created.toReversed()) await target.remove();
+      if (!committed && !uncertain)
+        for (const target of created.toReversed()) await target.remove();
     }
     // Binding changes create a new gadget facet; never enable through the old, unbound one.
     using configuredInbox = (await gadget.connectToGadget()) as RpcStub<WorkerIssueInbox>;
@@ -199,22 +221,33 @@ export const provisionWorkersIssueInbox = async (
     let backgroundChecks: boolean | undefined;
     if (fix && repositoryId !== undefined && releasesId !== undefined) {
       const offers = await workspace.listPreApprovableActions();
-      // Marking a verified fix's issue resolved is the inbox's to do without asking; the
-      // binding offers no other write.
-      const resolving = offers.find(
-        (offered) => offered.gatekeeperId === releasesId && offered.actionKind.tag === RESOLVE_WORKER_ISSUE,
-      );
-      if (!resolving) throw new Error("Resolving this Worker's issues could not be approved.");
-      if (!resolving.alreadyEnabled) await workspace.setAutoApprovedActionKind(releasesId, resolving.actionKind);
+      // Only opt-in approves resolving verified fixes; the binding offers no other write.
+      if (fix.autoResolve) {
+        const resolving = offers.find(
+          (offered) =>
+            offered.gatekeeperId === releasesId && offered.actionKind.tag === RESOLVE_WORKER_ISSUE,
+        );
+        if (!resolving) throw new Error("Resolving this Worker's issues could not be approved.");
+        if (!resolving.alreadyEnabled)
+          await workspace.setAutoApprovedActionKind(releasesId, resolving.actionKind);
+      }
       // Only the kinds the repository binding offers: pushing (never force, only to its prefix)
       // and opening a merge or pull request. Merging is never auto-approvable; it stays a person's.
       for (const offered of offers) {
         if (offered.gatekeeperId === repositoryId && !offered.alreadyEnabled)
           await workspace.setAutoApprovedActionKind(repositoryId, offered.actionKind);
       }
+      // Older inboxes always resolve automatically and do not expose the setting yet.
+      if (scope.autoResolve !== undefined)
+        await configuredInbox.setAutomaticResolution(fix.autoResolve);
       await configuredInbox.enableFixes();
       // Without them the inbox still follows releases whenever it is opened, so fixes stand.
-      backgroundChecks = await enableBackgroundChecks(api, workspace, gadget, metadata.defaultGadgetId ?? 0).then(
+      backgroundChecks = await enableBackgroundChecks(
+        api,
+        workspace,
+        gadget,
+        metadata.defaultGadgetId ?? 0,
+      ).then(
         () => true,
         () => false,
       );
@@ -246,7 +279,8 @@ export const provisionWorkersIssueInbox = async (
   )?.target;
   const hook = (await workspace.listHooks()).find(
     (candidate) =>
-      candidate.gadgetId === (metadata.defaultGadgetId ?? 0) && candidate.gatekeeperId === notifications,
+      candidate.gadgetId === (metadata.defaultGadgetId ?? 0) &&
+      candidate.gatekeeperId === notifications,
   );
   if (!hook) throw new Error("The notification subscription was not registered.");
   if (!hook.enabled) await workspace.enableHook(hook.id);
@@ -259,6 +293,24 @@ export const provisionWorkersIssueInbox = async (
     );
   if (!status.installed || !status.webhookId || status.suspended)
     throw new Error("Notification destination is not ready.");
+  if (modelId) {
+    // Initial setup uses the same verified-inbox configuration path as later AI setup.
+    return provisionWorkersIssueInbox(
+      api,
+      {
+        ...request,
+        investigation: { workspaceId: metadata.id, destinationId: status.webhookId },
+      },
+      accountId,
+      metadata.id,
+      modelId,
+      onWorkspace,
+      fix,
+      automatic,
+      maxDurationMs,
+      telemetryScope,
+    );
+  }
   return {
     workspaceId: metadata.id,
     destinationId: status.webhookId,

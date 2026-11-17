@@ -59,7 +59,7 @@ const observers = privateObservers(
 );
 const RETENTION_MS = 15 * 24 * 60 * 60 * 1000;
 const MAX_RETAINED_DELIVERIES = 10_000;
-const MAX_HOOKS = 100;
+const MAX_HOOKS = 1000;
 const POLICY_CLEANUP_RETRY_MS = 60_000;
 const MAX_POLICY_CLEANUP_RETRY_MS = 60 * 60_000;
 const DELIVERY_RETRY_MS = 60_000;

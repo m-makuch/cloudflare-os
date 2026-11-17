@@ -23,9 +23,11 @@ After saving the automation, the dashboard offers AI investigation setup for thi
 inbox page links to the same OS setup (`/setup/workers-issues` with no dashboard origin, naming its
 workspace and destination), so investigations can be set up later from the workspace. Either way
 OS reuses an available preferred language model, or asks the user to choose one, and authorizes
-read-only telemetry for the configured Worker. Setup adds an `INVESTIGATOR` spawner whose
-`WORKER_OBSERVABILITY` binding is restricted to that Worker, replacing any existing investigator
-binding and applying the selected model. Dashboard setup then enables automatic investigations;
+read-only telemetry for the configured Worker by default. The user can instead select all Workers
+in the same Cloudflare account, allowing cross-service investigation. Setup adds an `INVESTIGATOR`
+spawner whose `WORKER_OBSERVABILITY` binding uses the selected scope, replacing any existing
+investigator binding and applying the selected model. Reopening setup reads the scope from the
+spawner's current telemetry binding. Dashboard setup then enables automatic investigations;
 setup from the inbox lets the user choose them or investigate on request only. Workspace editors
 can change its bindings later; the gadget cannot independently attest their scope.
 The investigator also receives a task reporting capability. It has no repository, project-test

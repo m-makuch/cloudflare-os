@@ -725,12 +725,13 @@ const REPO_RESOURCE: SupportedResource = {
 // `parseContributionScope`). The repository pattern also matches these URLs, so this type is
 // listed first.
 const CONTRIBUTOR_RESOURCE: SupportedResource = {
+  id: "repository-contributor",
   urlPattern: "https://github.com/:owner/:repo\\?branchPrefix=*",
   title: "GitHub Repository (pull requests only)",
   description:
     "Read a GitHub repository's code and history, push commits to branches under one prefix, and " +
     "open pull requests from them into the default branch. Cannot merge, approve, or push elsewhere.",
-  groupedWith: REPO_RESOURCE.urlPattern,
+  groupedWith: REPO_RESOURCE.id,
 };
 
 const ISSUE_RESOURCE: SupportedResource = {

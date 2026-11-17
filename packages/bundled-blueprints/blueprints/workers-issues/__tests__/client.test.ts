@@ -113,7 +113,7 @@ describe("Worker issue inbox", () => {
     expect(getInvestigationReport).not.toHaveBeenCalled();
     await openReport();
 
-    expect(document.body.textContent).toContain("Notifications only");
+    expect(document.body.textContent).toContain("Investigate automatically: Off");
     expect(document.body.textContent).toContain("checkout-test");
     expect(document.body.textContent).toContain("Report ready");
     expect(document.querySelector("button")?.textContent).toBe("Refresh inbox");
@@ -207,7 +207,7 @@ describe("Worker issue inbox", () => {
     await load();
 
     expect(document.querySelector<HTMLElement>(".empty")!.hidden).toBe(false);
-    expect(document.body.textContent).toContain("AI investigations on");
+    expect(document.body.textContent).toContain("Investigate automatically: On");
     expect(document.body.textContent).toContain("Waiting for an issue notification");
     window.dispatchEvent(new Event("pagehide"));
     await vi.advanceTimersByTimeAsync(10_000);
@@ -256,9 +256,7 @@ describe("Worker issue inbox", () => {
     ]);
     await load();
     expect(reconcileChanges).toHaveBeenCalled();
-    expect(document.body.textContent).toContain("AI fixes on");
-    expect(document.body.textContent).toContain('branches starting with "cloudflare-os/"');
-    expect(document.body.textContent).toContain("cannot merge or deploy");
+    expect(document.body.textContent).toContain("Create merge requests: On");
     const [opened, pending, unknown] = document.querySelectorAll<HTMLElement>("article");
     const link = opened!.querySelector<HTMLAnchorElement>("a.change")!;
     expect(link.href).toBe(url);
@@ -311,9 +309,25 @@ describe("Worker issue inbox", () => {
     expect(document.querySelector<HTMLElement>("[role=alert]")!.hidden).toBe(true);
   });
 
+  it("shows that released fixes require manual resolution when automatic resolution is off", async () => {
+    getSetupStatus.mockResolvedValue({
+      accountId: "a".repeat(32),
+      workerName: "checkout-test",
+      investigatorReady: true,
+      investigationsEnabled: true,
+      releasesReady: true,
+      backgroundChecks: true,
+      autoResolve: false,
+    });
+    listInvestigations.mockResolvedValue([entry({ status: "released", mode: "fix" })]);
+    await load();
+    expect(release(document.querySelector("article")!).textContent).toContain("Automatic resolution is off");
+    expect(release(document.querySelector("article")!).textContent).not.toContain("60 minutes of traffic");
+  });
+
   it("links to OS setup for this inbox, and for one stored notification, before an investigator is bound", async () => {
     await load();
-    expect(document.body.textContent).toContain("Notifications only");
+    expect(document.body.textContent).toContain("Investigate automatically: Off");
     const setup = linkNamed("Set up AI investigations")!;
     expect(setup.hidden).toBe(false);
     expect(setupRequest(setup)).toEqual({
@@ -327,7 +341,7 @@ describe("Worker issue inbox", () => {
     expect(setupRequest(linkNamed("Set up and investigate", article)!)).toMatchObject({
       runKey: "account:run-1",
     });
-    expect(buttonNamed("Investigate new notifications automatically")!.hidden).toBe(true);
+    expect(buttonNamed("Investigate new notifications automatically")).toBeUndefined();
   });
 
   it("asks for fixes again when changing the setup of an inbox that proposes them", async () => {
@@ -354,7 +368,7 @@ describe("Worker issue inbox", () => {
     expect(linkNamed("Set up and investigate")!.hidden).toBe(true);
   });
 
-  it("investigates a stored notification on request, and turns automatic runs on and off", async () => {
+  it("investigates a stored notification on request and refreshes configuration without inline toggles", async () => {
     getSetupStatus.mockResolvedValue({
       accountId: "a".repeat(32),
       workerName: "checkout-test",
@@ -364,7 +378,7 @@ describe("Worker issue inbox", () => {
     backgroundChecks: false,
     });
     await load();
-    expect(document.body.textContent).toContain("AI investigations on request");
+    expect(document.body.textContent).toContain("Investigate automatically: Off");
     expect(linkNamed("Change AI setup")!.hidden).toBe(false);
     const article = document.querySelector("article")!;
     expect(linkNamed("Set up and investigate", article)!.hidden).toBe(true);
@@ -372,9 +386,6 @@ describe("Worker issue inbox", () => {
     await vi.advanceTimersByTimeAsync(0);
     expect(investigateNotification).toHaveBeenCalledWith("account:run-1");
 
-    buttonNamed("Investigate new notifications automatically")!.click();
-    await vi.advanceTimersByTimeAsync(0);
-    expect(enableInvestigations).toHaveBeenCalledTimes(1);
     getSetupStatus.mockResolvedValue({
       accountId: "a".repeat(32),
       workerName: "checkout-test",
@@ -384,9 +395,62 @@ describe("Worker issue inbox", () => {
     backgroundChecks: false,
     });
     await vi.advanceTimersByTimeAsync(5000);
-    expect(document.body.textContent).toContain("AI investigations on");
-    buttonNamed("Stop automatic investigations")!.click();
-    await vi.advanceTimersByTimeAsync(0);
-    expect(disableInvestigations).toHaveBeenCalledTimes(1);
+    expect(document.body.textContent).toContain("Investigate automatically: On");
+    expect(buttonNamed("Investigate new notifications automatically")).toBeUndefined();
+    expect(buttonNamed("Stop automatic investigations")).toBeUndefined();
+    expect(enableInvestigations).not.toHaveBeenCalled();
+    expect(disableInvestigations).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    [false, false, false], [false, false, true],
+    [false, true, false], [false, true, true],
+    [true, false, false], [true, false, true],
+    [true, true, false], [true, true, true],
+  ])("shows configuration for automatic=%s, fixes=%s, resolution=%s", async (automatic, fixes, autoResolve) => {
+    getSetupStatus.mockResolvedValue({
+      accountId: "a".repeat(32), workerName: "checkout-test",
+      investigatorReady: true, investigationsEnabled: automatic,
+      releasesReady: true, backgroundChecks: true, autoResolve,
+      ...(fixes ? { fixes: { provider: "github", repository: "acme/checkout", branchPrefix: "cloudflare-os/" } as const } : {}),
+    });
+    await load();
+    const pills = [...document.querySelectorAll('[aria-label="Current AI configuration"] li')];
+    expect(pills.map(pill => pill.textContent)).toEqual([
+      `Investigate automatically: ${automatic ? "On" : "Off"}`,
+      `Create pull requests: ${fixes ? "On" : "Off"}`,
+      `Mark as resolved automatically: ${fixes && autoResolve ? "On" : "Off"}`,
+    ]);
+    expect(pills.map(pill => pill.getAttribute("data-tone"))).toEqual([
+      automatic ? "success" : "neutral",
+      fixes ? "success" : "neutral",
+      fixes && autoResolve ? "success" : "neutral",
+    ]);
+    expect(document.body.textContent).toContain("Your setup is currently configured to:");
+    expect(linkNamed("Change AI setup")!.classList.contains("primary")).toBe(true);
+  });
+
+  it.each([
+    [900_000, "15 minutes per investigation"],
+    [null, "No time limit"],
+    [60_000, "1 minute per investigation"],
+    [90_000, "1.5 minutes per investigation"],
+  ] as const)("shows the saved model and time limit (%s)", async (maxDurationMs, label) => {
+    getSetupStatus.mockResolvedValue({
+      investigatorReady: true, investigationsEnabled: false, releasesReady: false, backgroundChecks: false,
+      investigator: { modelId: "bound-model", modelName: "GLM 5.3 (Workers AI)", maxDurationMs },
+    });
+    await load();
+    const details = document.querySelector(".configuration-details")!;
+    expect([...details.querySelectorAll("dt")].map(element => element.textContent)).toEqual(["Investigation model", "Time limit"]);
+    expect([...details.querySelectorAll("dd")].map(element => element.textContent)).toEqual(["GLM 5.3 (Workers AI)", label]);
+  });
+
+  it("does not claim an unlimited budget when settings cannot be read", async () => {
+    getSetupStatus.mockResolvedValue({
+      investigatorReady: true, investigationsEnabled: false, releasesReady: false, backgroundChecks: false,
+    });
+    await load();
+    expect([...document.querySelectorAll(".configuration-details dd")].map(element => element.textContent)).toEqual(["Unavailable", "Unavailable"]);
   });
 });

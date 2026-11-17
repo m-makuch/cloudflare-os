@@ -8,6 +8,8 @@ import { openConnectWindow } from "../../connectHandoff";
 export const NOTIFICATIONS_PATTERN = "https://dash.cloudflare.com/:accountId/notifications";
 export const WORKER_PATTERN =
   "https://dash.cloudflare.com/:accountId/workers/services/view/:workerName/production/observability";
+export const ACCOUNT_OBSERVABILITY_PATTERN =
+  "https://dash.cloudflare.com/:accountId/workers-and-pages/observability";
 /** A Worker's deployments and builds, and resolving its issues: how fixes are followed to production. */
 export const RELEASES_PATTERN =
   "https://dash.cloudflare.com/:accountId/workers/services/view/:workerName/production/deployments";

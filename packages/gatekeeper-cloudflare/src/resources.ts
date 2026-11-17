@@ -37,6 +37,7 @@ export const OBSERVABILITY_RESOURCES = [
  * that one can never resolve an issue.
  */
 export const WORKER_RELEASES_RESOURCE: SupportedResource = {
+  id: "worker-releases",
   urlPattern:
     `${DASHBOARD_ORIGIN}/:accountId/workers/services/view/:workerName/production/deployments`,
   title: "Cloudflare Worker releases",

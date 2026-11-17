@@ -1,5 +1,15 @@
 export const WORKERS_ISSUE_SETUP_PARAM = "workers_issue_setup";
 
+const isRepositoryHint = (value: unknown): value is string => {
+  if (typeof value !== "string" || value.length > 300) return false;
+  try {
+    const url = new URL(value);
+    return url.protocol === "https:" && !url.username && !url.password && !url.search && !url.hash;
+  } catch {
+    return false;
+  }
+};
+
 /**
  * What the dashboard asks for when the user opted into fixes: whether public repositories are
  * allowed, and the repository Workers Builds deploys from, to prefill. The OS page shows each
@@ -16,6 +26,8 @@ export type WorkersIssueSetupRequest = {
   accountId: string;
   workerName: string;
   issueId?: string;
+  /** Editable repository hint from Workers Builds; does not enable AI fixes or repository access. */
+  repositoryUrl?: string;
   /**
    * The dashboard that opened setup and awaits its result. Absent when the inbox opened it: the
    * result is then shown here, and nothing is handed back.
@@ -54,8 +66,8 @@ const parseRemediation = (value: unknown): WorkersIssueRemediationRequest | null
 export const extraDashboardOrigins = (value: string | undefined): string[] =>
   (value ?? "")
     .split(",")
-    .map(origin => origin.trim())
-    .filter(origin => {
+    .map((origin) => origin.trim())
+    .filter((origin) => {
       try {
         const url = new URL(origin);
         return url.protocol === "https:" && url.origin === origin;
@@ -109,6 +121,7 @@ export const parseWorkersIssueSetupValue = (value: unknown): WorkersIssueSetupRe
       accountId,
       workerName,
       issueId,
+      repositoryUrl,
       dashboardOrigin,
       investigation,
       remediation,
@@ -123,6 +136,7 @@ export const parseWorkersIssueSetupValue = (value: unknown): WorkersIssueSetupRe
       !/^[a-z\d_-]{1,63}$/i.test(workerName) ||
       (issueId !== undefined &&
         (typeof issueId !== "string" || !/^[a-z\d-]{1,128}$/i.test(issueId))) ||
+      (repositoryUrl !== undefined && !isRepositoryHint(repositoryUrl)) ||
       (dashboardOrigin !== undefined &&
         (typeof dashboardOrigin !== "string" || !isDashboardOrigin(dashboardOrigin)))
     )
@@ -157,6 +171,7 @@ export const parseWorkersIssueSetupValue = (value: unknown): WorkersIssueSetupRe
       accountId,
       workerName,
       issueId,
+      ...(repositoryUrl === undefined ? {} : { repositoryUrl }),
       ...(dashboardOrigin === undefined ? {} : { dashboardOrigin }),
       ...(investigation
         ? { investigation: investigation as WorkersIssueSetupRequest["investigation"] }
@@ -199,6 +214,7 @@ export const respondToWorkersIssueSetup = (
 ): (() => void) => {
   const { dashboardOrigin } = request;
   if (!dashboardOrigin) return () => undefined;
+  let dashboard: MessageEventSource | undefined;
   const receive = (event: MessageEvent<unknown>) => {
     if (
       event.origin !== dashboardOrigin ||
@@ -206,11 +222,19 @@ export const respondToWorkersIssueSetup = (
       typeof event.data !== "object" ||
       event.data === null ||
       !("type" in event.data) ||
-      event.data.type !== "cloudflare-os:workers-issues:status" ||
       !("state" in event.data) ||
       event.data.state !== request.state
     )
       return;
+    if (event.data.type === "cloudflare-os:workers-issues:accepted") {
+      if (event.source !== dashboard) return;
+      window.removeEventListener("message", receive);
+      // The dashboard disowns this window before navigating, so only we can close it.
+      window.close();
+      return;
+    }
+    if (event.data.type !== "cloudflare-os:workers-issues:status") return;
+    dashboard = event.source;
     event.source.postMessage(
       {
         type: "cloudflare-os:workers-issues:ready",

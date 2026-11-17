@@ -20,6 +20,25 @@ const search = (value: unknown) =>
 afterEach(() => vi.unstubAllEnvs());
 
 describe("dashboard issue setup context", () => {
+  it.each(["https://github.com/acme/checkout", "https://gitlab.com/acme/team/checkout"])(
+    "preserves the editable repository hint through sign-in without opting into fixes: %s",
+    (repositoryUrl) => {
+      const value = { ...request, repositoryUrl };
+      expect(workersIssueSetupSearch(search(value))).toEqual({ workers_issue_setup: value });
+      expect(parseWorkersIssueSetup(search(value))).not.toHaveProperty("remediation");
+    },
+  );
+  it.each([
+    "javascript:alert(1)",
+    "http://github.com/acme/checkout",
+    "https://user:secret@github.com/acme/checkout",
+    "https://github.com/acme/checkout?token=secret",
+    "https://github.com/acme/checkout#secret",
+    `https://example.test/${"a".repeat(300)}`,
+    42,
+  ])("rejects unsafe repository hints: %s", (repositoryUrl) =>
+    expect(parseWorkersIssueSetup(search({ ...request, repositoryUrl }))).toBeNull(),
+  );
   it.each(["http://localhost:3000", "https://127.0.0.1:7443", "http://[::1]:3000"])(
     "allows %s only in development builds",
     (dashboardOrigin) => {
@@ -55,7 +74,9 @@ describe("dashboard issue setup context", () => {
     expect(parseWorkersIssueSetup(search(value))).toEqual(value);
     // An older dashboard's per-change approval choice no longer applies.
     expect(
-      parseWorkersIssueSetup(search({ ...value, remediation: { ...remediation, approval: "ask" } })),
+      parseWorkersIssueSetup(
+        search({ ...value, remediation: { ...remediation, approval: "ask" } }),
+      ),
     ).toEqual(value);
     expect(parseWorkersIssueSetup(search({ ...request, remediation }))).toBeNull();
     for (const bad of [
@@ -63,7 +84,9 @@ describe("dashboard issue setup context", () => {
       { ...remediation, repositoryUrl: "javascript:alert(1)" },
       { ...remediation, repositoryUrl: "http://github.com/acme/checkout" },
     ]) {
-      expect(parseWorkersIssueSetup(search({ ...request, investigation, remediation: bad }))).toBeNull();
+      expect(
+        parseWorkersIssueSetup(search({ ...request, investigation, remediation: bad })),
+      ).toBeNull();
     }
   });
 
@@ -143,6 +166,44 @@ describe("dashboard issue setup context", () => {
     cleanup();
     poll(request.dashboardOrigin);
     expect(postMessage).toHaveBeenCalledTimes(1);
+  });
+
+  it("closes only after acceptance from the matching dashboard that polled for completion", () => {
+    const close = vi.spyOn(window, "close").mockImplementation(() => undefined);
+    const dashboard = { postMessage: vi.fn<Window["postMessage"]>() } as unknown as Window;
+    const other = { postMessage: vi.fn<Window["postMessage"]>() } as unknown as Window;
+    const cleanup = respondToWorkersIssueSetup(request, {
+      destinationId: "destination-1",
+      workspaceId: "b".repeat(64),
+    });
+    const send = (
+      type: string,
+      source = dashboard,
+      origin = request.dashboardOrigin,
+      state = request.state,
+    ) =>
+      window.dispatchEvent(
+        new MessageEvent("message", {
+          origin,
+          source,
+          data: { type: `cloudflare-os:workers-issues:${type}`, state },
+        }),
+      );
+    try {
+      send("accepted");
+      expect(close).not.toHaveBeenCalled();
+      send("status");
+      send("accepted", other);
+      send("accepted", dashboard, "https://evil.example");
+      send("accepted", dashboard, request.dashboardOrigin, "wrong-state");
+      expect(close).not.toHaveBeenCalled();
+      send("accepted");
+      send("accepted");
+      expect(close).toHaveBeenCalledTimes(1);
+    } finally {
+      cleanup();
+      close.mockRestore();
+    }
   });
 });
 
