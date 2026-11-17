@@ -1073,6 +1073,63 @@ it("durably retries a disconnected account's transient provider cleanup failure"
   });
 });
 
+it("finishes disconnect after a lost webhook deletion response and receiver restart", async () => {
+  const account = env.USER_ACCOUNT.getByName("lost-webhook-deletion-response");
+  const owner = { userObjectId: account.id.toString(), accountId };
+  const name = notificationReceiverName(owner.userObjectId, accountId);
+  const stub = env.NOTIFICATION_RECEIVER.getByName(name);
+  const webhookUrl = `https://hooks.example/notifications/webhooks/${owner.userObjectId}/${accountId}`;
+  await runInDurableObject(account, (_instance, state) => {
+    state.storage.kv.put("refreshToken", "test-refresh");
+    state.storage.kv.put("accessToken", { token: "test-access", expires: Date.now() + 86400_000 });
+    state.storage.kv.put("grantedScopes", ["notifications.write"]);
+  });
+  await runInDurableObject(stub, (_instance, state) => {
+    state.storage.kv.put("owner", owner);
+    state.storage.kv.put("installation", { ...owner, webhookId: "d".repeat(32) });
+    state.storage.kv.put("webhookUrl", webhookUrl);
+    state.storage.kv.put("setupComplete", true);
+  });
+  await account.registerNotificationAccount(accountId);
+  let deleted = false;
+  const fetch = mockProvider(async (_url, init) => {
+    if (init.method === "DELETE") {
+      deleted = true;
+      return Response.json({ success: false, errors: [{ code: 15000 }] }, { status: 500 });
+    }
+    return Response.json({
+      success: true,
+      result: deleted
+        ? []
+        : [
+            {
+              id: "d".repeat(32),
+              url: webhookUrl,
+            },
+          ],
+    });
+  });
+  const error = await account.revoke().then(
+    () => undefined,
+    (caught: Error) => caught,
+  );
+  expect(error?.message).toContain("HTTP 500");
+  expect(await account.hasNotificationGrant()).toBe(false);
+  expect(await sendAlert(stub)).toBe(410);
+  await abortAllDurableObjects();
+  const restarted = env.USER_ACCOUNT.getByName("lost-webhook-deletion-response");
+  await runDurableObjectAlarm(restarted);
+  expect(fetch.mock.calls.filter(([, init]) => init.method === "DELETE")).toHaveLength(1);
+  expect(
+    await runInDurableObject(restarted, (_instance, state) => [...state.storage.kv.list()]),
+  ).toEqual([]);
+  expect(await env.NOTIFICATION_RECEIVER.getByName(name).getStatus()).toMatchObject({
+    installed: false,
+    suspended: true,
+    subscribers: 0,
+  });
+});
+
 it("bounds a hanging handoff without blocking disable or losing its durable retry", async () => {
   const stub = await setup("handoff-timeout", "test_alert", "hook-1", false, false);
   await env.NOTIFICATION_TEST_HOOKS.blockCallback();

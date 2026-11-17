@@ -202,11 +202,14 @@ export async function removeNotificationConnection(
   known?: NotificationInstallation,
 ): Promise<void> {
   const root = `/accounts/${assertCloudflareAccountId(accountId)}/alerting/v3`;
-  const webhooks = (await list(token, `${root}/destinations/webhooks`)).filter(
-    (item) => item.url === webhookUrl,
-  );
+  const destinations = await list(token, `${root}/destinations/webhooks`);
+  const webhooks = destinations.filter((item) => item.url === webhookUrl);
   const webhookIds = new Set(webhooks.map((item) => id(item.id)));
-  if (known) webhookIds.add(id(known.webhookId));
+  // The complete list also confirms when a previous DELETE succeeded but its response was lost.
+  // Cloudflare can return HTTP 500 (not 404) when deleting an already-absent destination.
+  // Still remove a known destination whose URL was edited, if it remains in the account.
+  if (known && destinations.some((item) => item.id === known.webhookId))
+    webhookIds.add(id(known.webhookId));
   for (const webhookId of webhookIds)
     await request(token, `${root}/destinations/webhooks/${webhookId}`, "DELETE");
 }

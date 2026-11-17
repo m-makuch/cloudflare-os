@@ -138,12 +138,37 @@ it("refuses ambiguous destinations and malformed responses", async () => {
   );
 });
 
-it("tolerates an already-deleted destination during disconnect", async () => {
-  const calls = mock([[], new Response(null, { status: 404 })]);
+it("tolerates a destination deleted between listing and disconnect", async () => {
+  const calls = mock([[{ id: webhook, url }], new Response(null, { status: 404 })]);
 
   await removeNotificationConnection("token", account, url, { webhookId: webhook });
   expect(calls.map((call) => call.init.method)).toEqual(["GET", "DELETE"]);
   expect(calls[1]!.url).toContain(`/webhooks/${webhook}`);
+});
+
+it("does not delete an absent known destination when Cloudflare would return HTTP 500", async () => {
+  const calls = mock([
+    [{ id: otherWebhook, url: "https://other.example/webhook" }],
+    Response.json({ success: false, errors: [{ code: 15000 }] }, { status: 500 }),
+  ]);
+
+  await removeNotificationConnection("token", account, url, { webhookId: webhook });
+  expect(calls.map((call) => call.init.method)).toEqual(["GET"]);
+});
+
+it("removes a known destination whose URL was edited without deleting another connection", async () => {
+  const calls = mock([
+    [
+      { id: webhook, url: "https://edited.example/webhook" },
+      { id: otherWebhook, url: "https://other.example/webhook" },
+    ],
+    {},
+  ]);
+
+  await removeNotificationConnection("token", account, url, { webhookId: webhook });
+  expect(calls.filter((call) => call.init.method === "DELETE").map((call) => call.url)).toEqual([
+    `https://api.cloudflare.com/client/v4/accounts/${account}/alerting/v3/destinations/webhooks/${webhook}`,
+  ]);
 });
 
 it("recovers cleanup after a lost creation response without touching another connection", async () => {

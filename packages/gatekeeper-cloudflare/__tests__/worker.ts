@@ -91,6 +91,9 @@ const releasesLog: { submitted: { id: number; description: ActionDescription }[]
 
 /** Stands in for the overseer's queue: records submissions and observations, authorizing all. */
 class ReleasesTestQueue extends RpcTarget implements ApprovalQueue {
+  async requireLive(): Promise<void> {}
+  async watchSession(): Promise<never> { throw new Error("Unexpected session watcher"); }
+  async getExecutionId(): Promise<undefined> { return undefined; }
   async getGitCache(): Promise<GitCache> { throw new Error("Unexpected git cache"); }
   async submitAction(id: number, description: ActionDescription): Promise<void> {
     releasesLog.submitted.push({ id, description });
@@ -122,6 +125,9 @@ export class TestConnectCallback extends WorkerEntrypoint<Env, { label: string }
 }
 
 class SubscriptionTestQueue extends RpcTarget implements ApprovalQueue {
+  async requireLive(): Promise<void> {}
+  async watchSession(): Promise<never> { throw new Error("Unexpected session watcher"); }
+  async getExecutionId(): Promise<undefined> { return undefined; }
   descriptions: HookDescription[] = [];
   async getGitCache(): Promise<GitCache> { throw new Error("Unexpected git cache"); }
   async submitAction(_action: number, _description: ActionDescription): Promise<void> { throw new Error("Unexpected action"); }
