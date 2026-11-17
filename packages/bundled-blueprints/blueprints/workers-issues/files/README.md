@@ -1,0 +1,108 @@
+# Worker issue inbox
+
+## Source and interface
+
+The TypeScript sources (`client.ts`, `server.ts`, and `lib/`) build into the self-contained
+`client.js` and `server.js` the gadget runs. The browser, server, and OS setup frontend share the
+`lib/protocol.ts` contract through `protocol.d.ts`.
+
+The inbox displays each logical notification separately, including repeated occurrences of the same
+issue. Refresh updates entries in place so unchanged reports keep their text selection. Notification
+receipt and optional AI enablement are displayed separately. Polls fetch summaries, full reports load
+when opened, and polling pauses while the tab is hidden. The UI restates the OS theme's Kumo tokens,
+including its orange brand and link colours (the sandboxed frame cannot load Kumo), and follows the viewer's light or dark scheme.
+
+This inbox accepts authenticated Real-Time Issues notifications only for its configured account
+and Worker. Connect it from the dashboard's Cloudflare OS destination setup and enable its
+notification hook. The only required binding is `CLOUDFLARE_NOTIFICATIONS`; receiving notifications
+does not require a language model or telemetry access. The dashboard owns automation policy creation.
+
+## Optional AI investigations
+
+After saving the automation, the dashboard offers AI investigation setup for this same inbox. The
+inbox page links to the same OS setup (`/setup/workers-issues` with no dashboard origin, naming its
+workspace and destination), so investigations can be set up later from the workspace. Either way
+OS reuses an available preferred language model, or asks the user to choose one, and authorizes
+read-only telemetry for the configured Worker by default. The user can instead select all Workers
+in the same Cloudflare account, allowing cross-service investigation. Setup adds an `INVESTIGATOR`
+spawner whose `WORKER_OBSERVABILITY` binding uses the selected scope, replacing any existing
+investigator binding and applying the selected model. Reopening setup reads the scope from the
+spawner's current telemetry binding. Dashboard setup then enables automatic investigations;
+setup from the inbox lets the user choose them or investigate on request only. Workspace editors
+can change its bindings later; the gadget cannot independently attest their scope.
+The investigator also receives a task reporting capability. It has no repository, project-test
+runner, or deployment capability. Notification and log text are untrusted evidence.
+
+The inbox has three modes: notifications only (no investigator bound), on request (an investigator
+is bound, `investigationsEnabled` is off), and automatic (every new notification starts a run).
+Notifications received before automatic runs remain `received` inbox entries; enabling them does
+not replay anything. Any `received` entry can be investigated once on request
+(`investigateNotification`) with the bound investigator, a fix run when fixes are on. Without an
+investigator, its inbox link opens setup and investigates that entry once bound. From the inbox page
+a user can also turn automatic runs on or off; binding an investigator is only setup's, since it
+needs consent and a model. Investigating the issue the user came from in the dashboard is a separate,
+unchecked-by-default option, dispatched by the dashboard only after the automation is saved and AI
+setup is verified.
+
+Each logical notification run is accepted durably as `pending`; allocation and dispatch run after
+the notification callback returns, through `ctx.waitUntil()`. A gadget is a Durable Object facet,
+and facets cannot set alarms, so a run a restart leaves `pending` starts the next time the inbox is
+read or another run starts. Replayed webhook envelopes do not start another investigation.
+Failures before dispatch become `failed` and offer explicit retry. Ambiguous dispatches remain
+`delivery_unknown` for inspection rather than being resent automatically. Conflicting issue IDs for
+the same run increment a durable diagnostic counter without triggering provider retries.
+
+## Optional AI fixes
+
+With an investigator bound, setup can also connect a repository and enable fixes. Replacing the
+investigator without a repository turns fixes off. The
+`REPOSITORY` binding must be a contributor binding (GitLab `GITLAB_PROJECT_CONTRIBUTOR` or GitHub
+`GITHUB_REPO_CONTRIBUTOR`): the gatekeeper lets it push only to branches under its prefix (by default
+`cloudflare-os/`), never force, never to the default or a protected branch, and open requests only
+into the default branch; it refuses public repositories unless the user allowed them, checked again
+when each write applies. `enableFixes()` refuses a binding that reports no branch prefix. Setup gives
+the `INVESTIGATOR` spawner the same `REPOSITORY` binding as the inbox.
+
+A run dispatched while fixes are enabled is a fix run for life, and an investigation stays an
+investigation. Its branch, `<prefix>fix/<issue>-<hash of the run>`, is chosen before dispatch and
+reused on retry, so the git host's one-open-request-per-branch rule bounds duplicates. The fixer
+reports the request it opened (`push_pending` while its push and creation wait for approval,
+`change_opened` once it exists); the page asks the inbox to re-read pending requests, at most once a
+minute per run. An ambiguous fix dispatch is `fix_unknown`, and retrying it first lists the requests
+from its branch: one found there is shown instead of attempted again.
+
+The fixer's instructions require scrubbing personal and secret data from code, tests, commit
+messages, and descriptions before committing. Nothing is merged or deployed by the inbox or the
+fixer: a person merges, and the project's CI deploys. Enabling fixes at setup is the approval of
+every later push and request, so setup auto-approves the repository binding's push and request
+kinds, and the request itself is the review. A push still waits (`push_pending`) if a workspace
+editor removes those rules, or once the workspace has read restricted data, when no rule fires.
+
+## Following a fix to production
+
+With a `WORKER_RELEASES` binding (the Cloudflare "Worker releases" resource for the same Worker),
+the inbox follows a merged request until the fix is live. Merging records the request's merge commit
+(`change_merged`). The run is `released` once every version serving traffic in the latest
+production deployment contains that commit, checked with the repository binding's
+`containsCommit`. A version's commit is its Workers Builds commit, or otherwise a `workers/tag`
+holding a hex commit SHA (`wrangler versions upload --tag $(git rev-parse HEAD)`) for other CI.
+Without either, the run stays merged with the note `unmapped`; a rollback to versions without the
+commit is noted `rolled_back`.
+
+A released run is verified after 60 minutes, and at least 20 invocations, of released traffic with no
+new occurrence of the issue. It then becomes `resolved`, and the inbox marks the Workers
+Observability issue resolved if it is still active. That write is the binding's
+`resolve-worker-issue` action, which setup auto-approves. An occurrence after the release (beyond a
+five-minute grace) makes the run `recurring` instead, and a notification for a resolved issue makes
+its run `regressed`. Without traffic the run waits with the note `no_traffic`.
+
+The inbox re-checks when it is read, at most every two minutes per run. Setup can also bind the
+Scheduled Tasks gatekeeper as `SCHEDULER` and call `enableBackgroundChecks()`, which registers a
+15-minute hook that also starts runs left `pending`; the hook runs only once enabled.
+
+## Deployment
+
+Release the OS setup frontend and blueprint together. Updating the blueprint never enables fixes. Dashboard and inbox setup use `/setup/workers-issues`;
+home-page setup links redirect there, and unrelated routes never interpret the setup query. Only
+development builds accept localhost dashboard origins. Updating a blueprint never opts an inbox
+into AI: investigations require explicit enablement.

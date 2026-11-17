@@ -1,0 +1,602 @@
+import { el } from "@gadgets/bundled-blueprints/libraries/ui/client";
+import type {
+  FixSetup,
+  InboxSetupStatus,
+  InvestigationSummary,
+  InvestigationStatus,
+  WorkerIssueInbox,
+} from "./lib/protocol.ts";
+
+// The Workshop iframe bootstrap supplies the RPC stub before this module runs.
+declare const gadget: WorkerIssueInbox;
+
+// The look follows Cloudflare's Kumo design system, which the dashboard and the Workshop use. The
+// sandboxed frame cannot load Kumo, so its tokens (theme-kumo.css) and the Button, Badge and
+// Banner variants are restated here; light-dark() follows the viewer's colour scheme.
+const style = el("style", {
+  text: `
+:root {
+  color-scheme: light dark;
+  --base: light-dark(#fff, oklch(17% 0 0));
+  --elevated: light-dark(oklch(98% 0 0), oklch(12% 0 0));
+  --tint: light-dark(oklch(97% 0 0), oklch(26.9% 0 0));
+  --fill: light-dark(oklch(92.2% 0 0), oklch(26.9% 0 0));
+  --line: light-dark(oklch(14.5% 0 0 / .1), oklch(32% 0 0));
+  --hairline: light-dark(oklch(93.5% 0 0), oklch(26.9% 0 0));
+  --text: light-dark(oklch(21% .006 285.885), oklch(97% 0 0));
+  --strong: light-dark(oklch(14.5% 0 0), oklch(98.5% 0 0));
+  --subtle: light-dark(oklch(55.6% 0 0), oklch(70.8% 0 0));
+  --link: light-dark(#ff4801, #ff8a5c);
+  --focus: light-dark(oklch(15% 0 0), oklch(93.5% 0 0));
+  --brand: light-dark(#ff4801, #b84e00);
+  --neutral-text: light-dark(oklch(26.9% 0 0), oklch(92.2% 0 0));
+  --info: light-dark(oklch(42.4% .199 265.638), oklch(70.7% .165 254.624));
+  --info-tint: light-dark(oklch(93.2% .032 255.6 / .45), oklch(38% .145 265.5 / .22));
+  --success: light-dark(oklch(43.2% .095 166.913), oklch(90.5% .093 164.15));
+  --success-tint: light-dark(oklch(96.2% .043 156.7 / .57), oklch(39.3% .096 152.3 / .2));
+  --warning: light-dark(oklch(59.7% .144 57.5), oklch(75% .183 55.934));
+  --warning-tint: light-dark(oklch(93.1% .107 94.6 / .2), oklch(35.3% .079 65 / .37));
+  --danger: light-dark(oklch(50.5% .213 27.518), oklch(70.4% .191 22.216));
+  --danger-tint: light-dark(oklch(93.6% .032 17.7 / .42), oklch(42.9% .176 28.7 / .17));
+  --shadow-xs: 0 1px 2px 0 rgb(0 0 0 / .05);
+}
+* { box-sizing: border-box; }
+html, body { margin: 0; min-height: 100%; background: var(--base); color: var(--text); }
+body { font: 14px/1.5 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", "Noto Sans", Arial, sans-serif; -webkit-font-smoothing: antialiased; }
+button { font: inherit; }
+:focus-visible { outline: 2px solid var(--brand); outline-offset: 2px; }
+.inbox { max-width: 1000px; margin: 0 auto; padding: 28px; }
+.header, .entry-header, .summary { display: flex; align-items: center; justify-content: space-between; gap: 16px; }
+.header { align-items: flex-start; }
+h1 { margin: 0; font-size: 20px; font-weight: 600; color: var(--strong); }
+h2 { margin: 0; font-size: 14px; font-weight: 600; color: var(--strong); font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace; overflow-wrap: anywhere; }
+p { margin: 0; }
+.scope, .metadata, .updated, .description { color: var(--subtle); }
+.scope { margin-top: 2px; font-size: 13px; overflow-wrap: anywhere; }
+.btn {
+  display: inline-flex; align-items: center; justify-content: center; flex-shrink: 0; height: 36px; padding: 0 12px 2px;
+  border: 0; border-radius: 8px; font-size: 14px; font-weight: 500; line-height: 1; text-decoration: none; white-space: nowrap; cursor: pointer;
+  background: var(--base); color: var(--text); box-shadow: 0 0 0 1px var(--line), var(--shadow-xs);
+}
+.btn:hover:not(:disabled) { background: var(--tint); }
+.btn:disabled { cursor: not-allowed; opacity: .7; }
+.btn.primary {
+  --ring: color-mix(in oklch, var(--brand), black 10%); --top: color-mix(in oklch, var(--brand), white 30%);
+  color: #fff; background: linear-gradient(to bottom, color-mix(in oklch, var(--brand), white 15%), var(--brand));
+  box-shadow: 0 0 0 1px var(--ring), inset 0 1px 0 0 var(--top), var(--shadow-xs);
+}
+.btn.primary:hover:not(:disabled) { background: linear-gradient(to bottom, var(--top), var(--brand)); }
+.btn.primary:disabled { opacity: .5; }
+.btn.ghost { background: transparent; box-shadow: none; }
+.btn.ghost:hover:not(:disabled) { background: var(--tint); }
+.actions { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; }
+.setup { margin-top: 20px; padding: 16px; border-radius: 8px; background: var(--elevated); box-shadow: 0 0 0 1px var(--hairline); }
+.setup .actions { margin-top: 14px; }
+.configuration { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; list-style: none; margin: 12px 0 0; padding: 0; }
+.configuration-details { display: grid; grid-template-columns: max-content minmax(0, 1fr); gap: 6px 16px; margin: 16px 0 0; font-size: 13px; }
+.configuration-details dt { color: var(--subtle); }
+.configuration-details dd { margin: 0; overflow-wrap: anywhere; }
+.badge { display: inline-flex; align-items: center; gap: 6px; flex-shrink: 0; padding: 2px 8px; border-radius: 999px; font-size: 12px; font-weight: 500; line-height: 16px; white-space: nowrap; background: var(--fill); color: var(--neutral-text); }
+.badge::before { content: ""; width: 7px; height: 7px; border-radius: 50%; background: currentColor; }
+.badge[data-tone="info"] { background: var(--info-tint); color: var(--info); }
+.badge[data-tone="success"] { background: var(--success-tint); color: var(--success); }
+.badge[data-tone="warning"] { background: var(--warning-tint); color: var(--warning); }
+.badge[data-tone="danger"] { background: var(--danger-tint); color: var(--danger); }
+.change { display: inline-block; margin-top: 10px; color: var(--link); font-weight: 500; overflow-wrap: anywhere; }
+.release { max-width: 80ch; margin: 10px 0 0; font-size: 13px; color: var(--text); }
+.description { max-width: 80ch; font-size: 13px; }
+.summary { margin: 24px 0 12px; flex-wrap: wrap; font-size: 13px; color: var(--subtle); }
+.updated { font-variant-numeric: tabular-nums; }
+.notice { padding: 12px 14px; margin-top: 16px; border-radius: 8px; background: var(--danger-tint); color: var(--danger); box-shadow: 0 0 0 1px color-mix(in oklch, var(--danger), transparent 75%); }
+[hidden] { display: none !important; }
+.entries { display: grid; gap: 12px; }
+.entry { min-width: 0; padding: 16px; border-radius: 8px; background: var(--base); box-shadow: 0 0 0 1px var(--line), var(--shadow-xs); }
+.entry-header { align-items: flex-start; flex-wrap: wrap; gap: 8px 16px; }
+.metadata { display: block; margin-top: 2px; font-size: 13px; }
+.entry .actions { margin-top: 14px; }
+.actions:not(:has(> :not([hidden]))) { display: none; }
+.report { margin: 14px 0 0; padding-top: 14px; border-top: 1px solid var(--hairline); font: inherit; line-height: 1.6; white-space: pre-wrap; overflow-wrap: anywhere; }
+.report.placeholder { color: var(--subtle); font-size: 13px; }
+.empty { padding: 40px 20px; border-radius: 8px; background: var(--elevated); box-shadow: 0 0 0 1px var(--hairline); text-align: center; }
+.empty h2 { font-family: inherit; }
+.empty p { max-width: 55ch; margin: 6px auto 0; color: var(--subtle); font-size: 13px; }
+@media (max-width: 580px) {
+  .inbox { padding: 18px 14px; }
+  .header { flex-wrap: wrap; }
+  .entry, .setup { padding: 14px; }
+  .configuration-details { grid-template-columns: 1fr; gap: 2px; }
+  .configuration-details dd + dt { margin-top: 6px; }
+}
+@media (pointer: coarse) { .btn { min-height: 44px; } }
+`,
+});
+document.head.append(style);
+
+const scope = el("p", { class: "scope", text: "Loading Worker scope…" });
+const refresh = el("button", { class: "btn", type: "button", text: "Refresh inbox" });
+const mode = el("p", { text: "Loading setup…" });
+const automaticStatus = el("li", { class: "badge" });
+const fixesStatus = el("li", { class: "badge" });
+const resolutionStatus = el("li", { class: "badge" });
+const configuration = el("ul", { class: "configuration", "aria-label": "Current AI configuration", hidden: true }, [
+  automaticStatus, fixesStatus, resolutionStatus,
+]);
+const investigationModel = el("dd");
+const investigationTimeLimit = el("dd");
+const configurationDetails = el("dl", { class: "configuration-details", hidden: true }, [
+  el("dt", { text: "Investigation model" }), investigationModel,
+  el("dt", { text: "Time limit" }), investigationTimeLimit,
+]);
+const setupLink = el("a", { class: "btn primary", target: "_blank", rel: "noopener noreferrer", hidden: true });
+const summary = el("p", { role: "status", text: "Loading inbox…" });
+const updated = el("time", { class: "updated" });
+const error = el("p", { class: "notice", role: "alert", hidden: true });
+const emptyTitle = el("h2", { text: "Loading notifications…" });
+const emptyDescription = el("p");
+const empty = el("div", { class: "empty" }, [emptyTitle, emptyDescription]);
+const entries = el("section", { class: "entries", "aria-label": "Issue notifications" });
+
+document.body.replaceChildren(
+  el("main", { class: "inbox" }, [
+    el("header", { class: "header" }, [
+      el("div", {}, [el("h1", { text: "Worker issue inbox" }), scope]),
+      refresh,
+    ]),
+    el("section", { class: "setup", "aria-label": "AI setup" }, [
+      mode,
+      configuration,
+      configurationDetails,
+      el("div", { class: "actions" }, [setupLink]),
+    ]),
+    error,
+    el("div", { class: "summary" }, [summary, updated]),
+    empty,
+    entries,
+  ]),
+);
+
+const STATUS_LABELS: Record<InvestigationStatus, string> = {
+  received: "Notification received",
+  pending: "Waiting to start",
+  failed: "Could not start investigator",
+  allocating: "Starting investigator",
+  dispatching: "Sending to investigator",
+  queued: "Investigation queued",
+  delivery_unknown: "Delivery unconfirmed",
+  completed: "Report ready",
+  fixing: "Fix in progress",
+  push_pending: "Waiting for your approval",
+  change_opened: "Change proposed",
+  fix_unknown: "Fix delivery unconfirmed",
+  change_merged: "Merged, waiting for release",
+  released: "Released, verifying",
+  recurring: "Still occurring after release",
+  resolved: "Resolved",
+  regressed: "Regressed",
+};
+
+type Tone = "neutral" | "info" | "success" | "warning" | "danger";
+
+/** The Kumo badge variant for each status: work in progress, done, waiting on you, failed. */
+const STATUS_TONES: Record<InvestigationStatus, Tone> = {
+  received: "neutral",
+  pending: "info",
+  failed: "danger",
+  allocating: "info",
+  dispatching: "info",
+  queued: "info",
+  delivery_unknown: "warning",
+  completed: "success",
+  fixing: "info",
+  push_pending: "warning",
+  change_opened: "success",
+  fix_unknown: "warning",
+  change_merged: "info",
+  released: "info",
+  recurring: "danger",
+  resolved: "success",
+  regressed: "danger",
+};
+
+/** How long a release serves traffic without the issue before it is resolved (server.ts). */
+const VERIFY_WINDOW_MINUTES = 60;
+
+/** What the git host calls a proposed change. */
+function changeNoun(fixes: FixSetup | undefined): string {
+  return fixes?.provider === "github" ? "pull request" : "merge request";
+}
+
+function formatTimeLimit(durationMs: number | null): string {
+  if (durationMs === null) return "No time limit";
+  const [value, unit] = durationMs >= 60_000
+    ? [durationMs / 60_000, "minute"] as const
+    : durationMs >= 1000 ? [durationMs / 1000, "second"] as const : [durationMs, "millisecond"] as const;
+  return `${new Intl.NumberFormat(undefined, { maximumFractionDigits: 2 }).format(value)} ${unit}${value === 1 ? "" : "s"} per investigation`;
+}
+
+let fixSetup: FixSetup | undefined;
+let setupStatus: InboxSetupStatus | undefined;
+/** The notification destination, read once: OS setup checks it matches before binding anything. */
+let destinationId: string | undefined;
+let destinationRead = false;
+
+/**
+ * This inbox's workspace. The frame is an opaque-origin srcdoc document, whose base URL is the
+ * Workshop page that hosts it, so relative links open the Workshop and its path names the
+ * workspace. Elsewhere (a gadget-only view) no setup link is offered.
+ */
+const workspaceId = (() => {
+  try {
+    return /^\/workspace\/([a-f\d]{64})(?:\/|$)/.exec(new URL(document.baseURI).pathname)?.[1];
+  } catch {
+    return undefined;
+  }
+})();
+
+/**
+ * The OS page that binds a Worker-scoped investigator to this inbox, which needs the user's
+ * consent and a model, so the inbox cannot do it itself. With a run key, it then investigates
+ * that notification. With fixes on, it asks for them again, so changing the setup keeps them.
+ * Only a GitHub repository's URL is known here: GitLab's host is the deployment's.
+ */
+function setupUrl(runKey?: string): string | undefined {
+  const scope = setupStatus;
+  const fixes = scope?.fixes;
+  if (!workspaceId || !destinationId || !scope?.accountId || !scope.workerName) return undefined;
+  const url = new URL("/setup/workers-issues", document.baseURI);
+  url.searchParams.set(
+    "workers_issue_setup",
+    JSON.stringify({
+      state: crypto.randomUUID(),
+      accountId: scope.accountId,
+      workerName: scope.workerName,
+      investigation: { workspaceId, destinationId },
+      ...(fixes
+        ? {
+            remediation: {
+              allowPublic: false,
+              ...(fixes.provider === "github" ? { repositoryUrl: `https://github.com/${fixes.repository}` } : {}),
+            },
+          }
+        : {}),
+      ...(runKey ? { runKey } : {}),
+    }),
+  );
+  return url.href;
+}
+
+function setLink(link: HTMLAnchorElement, href: string | undefined): void {
+  link.hidden = !href;
+  // A fresh setup state per render would rewrite the link under the pointer; keep the first.
+  if (href && !link.dataset.ready) {
+    link.href = href;
+    link.dataset.ready = "1";
+  }
+}
+
+const dateFormat = new Intl.DateTimeFormat(undefined, { dateStyle: "medium", timeStyle: "short" });
+const clockFormat = new Intl.DateTimeFormat(undefined, { timeStyle: "short" });
+
+type EntryView = {
+  element: HTMLElement;
+  title: HTMLHeadingElement;
+  time: HTMLTimeElement;
+  badge: HTMLSpanElement;
+  report: HTMLPreElement;
+  readReport: HTMLButtonElement;
+  retry: HTMLButtonElement;
+  investigate: HTMLButtonElement;
+  investigateLink: HTMLAnchorElement;
+  change: HTMLAnchorElement;
+  release: HTMLParagraphElement;
+  reportLoaded: boolean;
+};
+const views = new Map<string, EntryView>();
+let loading = false;
+let loaded = false;
+let disposed = false;
+
+function setText(element: HTMLElement, text: string): void {
+  // Polling unchanged reports must not replace text nodes and destroy a reader's selection.
+  if (element.textContent !== text) element.textContent = text;
+}
+
+function reportText(run: InvestigationSummary): string {
+  if (run.has_report) return "";
+  if (run.status === "failed")
+    return "The investigator could not be started. Check the model and bindings, then retry.";
+  if (run.status === "received") {
+    return setupStatus?.investigatorReady
+      ? "Notification stored without running a model. Investigate it to start a run."
+      : "Notification stored without running a model. Set up AI investigations to investigate it.";
+  }
+  if (run.status === "delivery_unknown") {
+    return "Delivery could not be confirmed. Check the workspace conversations before sending again.";
+  }
+  if (run.status === "fix_unknown") {
+    return `Delivery could not be confirmed. Retrying first checks the repository for a ${changeNoun(fixSetup)} from ${run.fix_branch ?? "its branch"}.`;
+  }
+  if (run.status === "push_pending") {
+    return `The fixer proposed a ${changeNoun(fixSetup)}. Approve its push and creation in the workspace; nothing reaches the repository until you do.`;
+  }
+  if (run.mode === "fix") return "The fixer has not submitted a report yet.";
+  return "The investigator has not submitted a report yet.";
+}
+
+/** Where a merged fix is on its way to production, shown in place of a report until one exists. */
+function releaseText(run: InvestigationSummary): string | undefined {
+  const since = run.released_at ? ` since ${clockFormat.format(run.released_at)}` : "";
+  switch (run.status) {
+    case "change_merged":
+      if (!setupStatus?.releasesReady) {
+        return "Merged. Set up AI fixes again to follow it to its release and resolve the issue once it is fixed.";
+      }
+      if (run.release_note === "unmapped") {
+        return "Merged. The live deployment does not say which commit it runs, so the release cannot be matched. Deploy with Workers Builds, or tag each version with its commit (wrangler versions upload --tag <commit>).";
+      }
+      if (run.release_note === "rolled_back") {
+        return "Merged, but the live deployment no longer contains the fix. Waiting for a release that does.";
+      }
+      return "Merged. Waiting for a deployment that contains it to go live.";
+    case "released":
+      if (setupStatus?.autoResolve === false)
+        return `Live${since}. Automatic resolution is off; mark the issue resolved in Workers Observability after verifying the fix.`;
+      if (run.release_note === "no_traffic") {
+        return `Live${since}, but it has not served enough traffic to tell whether the issue is fixed. Verification continues as requests arrive.`;
+      }
+      return `Live${since}. The issue is resolved after ${VERIFY_WINDOW_MINUTES} minutes of traffic without it.`;
+    case "recurring":
+      return `The issue occurred again after the release went live${since}, so this fix did not resolve it. The issue stays open in Workers Observability.`;
+    case "resolved":
+      return `Released${since} and verified: no new occurrences. The issue is resolved in Workers Observability.`;
+    case "regressed":
+      return "This issue was resolved, then occurred again. Workers Observability has reopened it; see the newer notification.";
+    default:
+      return undefined;
+  }
+}
+
+function renderEntries(runs: InvestigationSummary[]): void {
+  const visibleKeys = new Set(runs.map((run) => run.run_key));
+  for (const [key, view] of views) {
+    if (!visibleKeys.has(key)) {
+      view.element.remove();
+      views.delete(key);
+    }
+  }
+
+  runs.forEach((run, index) => {
+    let view = views.get(run.run_key);
+    if (!view) {
+      const title = el("h2");
+      const time = el("time", { class: "metadata" });
+      const badge = el("span", { class: "badge" });
+      const report = el("pre", { class: "report" });
+      const readReport = el("button", { class: "btn", type: "button", text: "Read report" });
+      const retry = el("button", { class: "btn", type: "button", text: "Retry investigation" });
+      const investigate = el("button", { class: "btn primary", type: "button", text: "Investigate" });
+      const investigateLink = el("a", {
+        class: "btn primary",
+        target: "_blank",
+        rel: "noopener noreferrer",
+        text: "Set up and investigate",
+      });
+      const change = el("a", { class: "change", target: "_blank", rel: "noopener noreferrer" });
+      const release = el("p", { class: "release" });
+      const element = el("article", { class: "entry" }, [
+        el("div", { class: "entry-header" }, [el("div", {}, [title, time]), badge]),
+        change,
+        release,
+        report,
+        el("div", { class: "actions" }, [readReport, retry, investigate, investigateLink]),
+      ]);
+      const created = {
+        element,
+        title,
+        time,
+        badge,
+        report,
+        readReport,
+        retry,
+        investigate,
+        investigateLink,
+        change,
+        release,
+        reportLoaded: false,
+      };
+      readReport.addEventListener("click", async () => {
+        readReport.disabled = true;
+        try {
+          if (!created.reportLoaded) {
+            setText(
+              report,
+              (await gadget.getInvestigationReport(run.run_key)) ?? "Report is unavailable.",
+            );
+            created.reportLoaded = true;
+            report.hidden = false;
+          } else {
+            report.hidden = !report.hidden;
+          }
+          readReport.textContent = report.hidden ? "Read report" : "Hide report";
+        } catch {
+          setText(error, "Could not load the report. Try opening it again.");
+          error.hidden = false;
+        } finally {
+          readReport.disabled = false;
+        }
+      });
+      retry.addEventListener("click", async () => {
+        retry.disabled = true;
+        try {
+          await gadget.retryInvestigation(run.run_key);
+          await render();
+        } catch {
+          setText(
+            error,
+            "Could not retry this investigation. Check its current status and try again.",
+          );
+          error.hidden = false;
+        } finally {
+          retry.disabled = false;
+        }
+      });
+      investigate.addEventListener("click", async () => {
+        investigate.disabled = true;
+        try {
+          await gadget.investigateNotification(run.run_key);
+          await render();
+        } catch {
+          setText(error, "Could not start this investigation. Check its current status and try again.");
+          error.hidden = false;
+        } finally {
+          investigate.disabled = false;
+        }
+      });
+      view = created;
+      views.set(run.run_key, view);
+    }
+    setText(view.title, run.issue_id);
+    setText(view.time, dateFormat.format(run.created_at));
+    view.time.dateTime = new Date(run.created_at).toISOString();
+    setText(view.badge, STATUS_LABELS[run.status] ?? "Unknown status");
+    view.badge.dataset.status = run.status;
+    view.badge.dataset.tone = STATUS_TONES[run.status] ?? "neutral";
+    if (!view.reportLoaded) {
+      setText(view.report, reportText(run));
+      view.report.hidden = run.has_report;
+    }
+    view.report.classList.toggle("placeholder", !run.has_report);
+    view.readReport.hidden = !run.has_report;
+    view.retry.hidden = run.status !== "failed" && run.status !== "fix_unknown";
+    setText(view.retry, run.mode === "fix" ? "Retry fix" : "Retry investigation");
+    const stored = run.status === "received";
+    view.investigate.hidden = !stored || !setupStatus?.investigatorReady;
+    setText(view.investigate, fixSetup ? "Investigate and propose a fix" : "Investigate");
+    setLink(view.investigateLink, stored && !setupStatus?.investigatorReady ? setupUrl(run.run_key) : undefined);
+    // Only an https link the server validated is shown; it opens on the git host.
+    const url = run.change_url;
+    view.change.hidden = !url;
+    if (url && view.change.href !== url) view.change.href = url;
+    const state = run.change_state && run.change_state !== "opened" ? ` (${run.change_state})` : "";
+    setText(view.change, url ? `View ${changeNoun(fixSetup)} ${run.change_id ? `#${run.change_id}` : ""}${state}` : "");
+
+    const release = releaseText(run) ?? "";
+    setText(view.release, release);
+    view.release.hidden = !release;
+
+    // Insert new entries in order without detaching the existing report nodes.
+    if (entries.children[index] !== view.element) {
+      entries.insertBefore(view.element, entries.children[index] ?? null);
+    }
+  });
+}
+
+async function render(): Promise<void> {
+  if (loading || disposed || document.hidden) return;
+  loading = true;
+  refresh.disabled = true;
+  try {
+    // Pending requests are read from the git host at most once a minute per run, server-side.
+    await gadget.reconcileChanges().catch(() => undefined);
+    const [runs, setup] = await Promise.all([gadget.listInvestigations(), gadget.getSetupStatus()]);
+    if (!destinationRead) {
+      // A failed read is retried on the next poll; an answer is kept for the page's life.
+      await gadget.getNotificationStatus().then(
+        (status) => {
+          destinationRead = true;
+          destinationId = status.installed && !status.suspended ? status.webhookId : undefined;
+        },
+        () => undefined,
+      );
+    }
+    if (disposed) return;
+    fixSetup = setup.fixes;
+    setupStatus = setup;
+    setText(
+      scope,
+      setup.workerName
+        ? [setup.workerName, setup.accountId].filter(Boolean).join(" · ")
+        : "This inbox has not been connected to a Worker yet.",
+    );
+    const ready = setup.investigatorReady;
+    const automatic = setup.investigationsEnabled && ready;
+    const fixes = ready ? setup.fixes : undefined;
+    setText(mode, "Your setup is currently configured to:");
+    for (const [pill, label, enabled] of [
+      [automaticStatus, "Investigate automatically", automatic],
+      [fixesStatus, fixes?.provider === "gitlab" ? "Create merge requests" : "Create pull requests", Boolean(fixes)],
+      [resolutionStatus, "Mark as resolved automatically", Boolean(fixes) && setup.releasesReady && setup.autoResolve !== false],
+    ] as const) {
+      setText(pill, `${label}: ${enabled ? "On" : "Off"}`);
+      pill.dataset.tone = enabled ? "success" : "neutral";
+    }
+    configuration.hidden = false;
+    const investigator = setup.investigator;
+    setText(investigationModel, investigator
+      ? investigator.modelName ?? investigator.modelId ?? "Not configured"
+      : ready ? "Unavailable" : "Not configured");
+    setText(investigationTimeLimit, investigator
+      ? formatTimeLimit(investigator.maxDurationMs)
+      : ready ? "Unavailable" : "Not configured");
+    configurationDetails.hidden = false;
+    setLink(setupLink, setupUrl());
+    setText(setupLink, ready ? "Change AI setup" : "Set up AI investigations");
+    setText(
+      summary,
+      runs.length
+        ? `Showing ${runs.length} recent notification${runs.length === 1 ? "" : "s"} (up to 100).`
+        : "No notifications received yet.",
+    );
+    renderEntries(runs);
+    empty.hidden = runs.length > 0;
+    setText(emptyTitle, "Waiting for an issue notification");
+    setText(
+      emptyDescription,
+      "Save your automation in the Cloudflare dashboard with this inbox as its notification destination. New issue notifications will appear here.",
+    );
+    error.hidden = true;
+    const now = new Date();
+    setText(updated, `Updated ${clockFormat.format(now)}`);
+    updated.dateTime = now.toISOString();
+    loaded = true;
+  } catch {
+    if (disposed) return;
+    setText(
+      error,
+      loaded
+        ? "Could not refresh the inbox. Showing the last loaded notifications. Refresh to try again."
+        : "Could not load the inbox. Refresh to try again.",
+    );
+    error.hidden = false;
+    if (!loaded) {
+      empty.hidden = true;
+      setText(scope, "Worker scope unavailable");
+      setText(mode, "Setup unavailable");
+      setText(summary, "Inbox unavailable.");
+    }
+  } finally {
+    loading = false;
+    refresh.disabled = false;
+  }
+}
+
+refresh.addEventListener("click", () => {
+  void render();
+});
+const timer = setInterval(() => {
+  void render();
+}, 5000);
+const resume = () => {
+  if (!document.hidden) void render();
+};
+document.addEventListener("visibilitychange", resume);
+window.addEventListener(
+  "pagehide",
+  () => {
+    disposed = true;
+    clearInterval(timer);
+    document.removeEventListener("visibilitychange", resume);
+  },
+  { once: true },
+);
+void render();
