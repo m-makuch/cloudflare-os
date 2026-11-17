@@ -11,6 +11,7 @@ import { useConnectionLost } from './RpcContext'
 import OAuthButtons from './components/auth/OAuthButtons'
 import SiteLogo from './components/SiteLogo'
 import { deviceSessionSearch } from './features/native-app/DeviceSessionHandoff'
+import { workersIssueSetupSearch } from './features/workers-issues/workersIssueSetup'
 
 
 interface LoginPageProps {
@@ -156,7 +157,7 @@ export default function LoginPage({ rpcStub, onLoginSuccess }: LoginPageProps) {
               Don't have an account?{' '}
               <Link
                 to="/signup"
-                search={deviceSessionSearch(window.location.search)}
+                search={{ ...deviceSessionSearch(window.location.search), ...workersIssueSetupSearch(window.location.search) }}
                 className="text-kumo-brand hover:underline font-medium"
               >
                 Create one

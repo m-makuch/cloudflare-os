@@ -8,6 +8,10 @@ interface ImportMetaEnv {
   // In this mode, password-based login/signup is disabled and the app authenticates
   // via the CF Access JWT that Access injects into requests before they reach the server.
   readonly VITE_CF_ACCESS_MODE?: string;
+
+  // Comma-separated exact HTTPS origins also accepted as the dashboard in Worker issue setup, for a
+  // test deployment driven by a local dashboard. Unset in releases.
+  readonly VITE_WORKERS_ISSUE_EXTRA_DASHBOARD_ORIGINS?: string;
 }
 
 interface ImportMeta {

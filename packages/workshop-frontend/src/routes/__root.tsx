@@ -1,6 +1,6 @@
 import { logRpcFailure } from '../rpcErrors'
 import { useState, useEffect } from 'react'
-import { createRootRoute, Outlet, useMatch, useRouterState } from '@tanstack/react-router'
+import { createRootRoute, Navigate, Outlet, useMatch, useRouterState } from '@tanstack/react-router'
 import { TooltipProvider, Toasty } from '@cloudflare/kumo'
 import { RpcStub } from 'capnweb'
 import { AuthenticatedApi } from '@gadgets/workshop-shared/api'
@@ -23,6 +23,7 @@ import {
 } from '../features/native-app/DeviceSessionHandoff'
 import { NativeAppBridge } from '../features/native-app/NativeAppBridge'
 import { PageUpdateNotice } from '../features/stale-session/PageUpdateNotice'
+import { workersIssueSetupSearch } from '../features/workers-issues/workersIssueSetup'
 
 export const Route = createRootRoute({
   component: RootComponent,
@@ -34,6 +35,7 @@ function RootComponent() {
   const { isAuthenticated, authenticatedApi, isLoading, error, logout, login } = useAuth(rpcStub)
   const pathname = useRouterState({ select: (s) => s.location.pathname })
   const workspace = useMatch({ from: '/workspace/$id', shouldThrow: false })
+  const search = useRouterState({ select: (s) => s.location.searchStr })
 
   // Routes that don't require auth (public routes)
   const isSignup = pathname === '/signup'
@@ -120,6 +122,11 @@ function RootComponent() {
   // authenticatedApi is guaranteed non-null here: isLoading, error, and
   // !isAuthenticated branches all return early above.
   if (!authenticatedApi) return null
+  // Dashboard links and signup returns may still land on Home. Other routes never interpret this query.
+  const workersIssueSetup = pathname === '/' ? workersIssueSetupSearch(search) : {}
+  if (workersIssueSetup.workers_issue_setup) {
+    return <Navigate to="/setup/workers-issues" search={workersIssueSetup} replace />
+  }
   // The native handoff is a dedicated destination: never render the Workshop home page
   // behind it while the browser is returning credentials to the app.
   if (hasDeviceSessionParameters(window.location.search)) {
@@ -139,6 +146,7 @@ function RootComponent() {
               <AuthenticatedShell
                 authenticatedApi={authenticatedApi}
                 isWorkspaceEditor={isWorkspaceEditor}
+                isWorkersIssueSetup={pathname === '/setup/workers-issues'}
               />
             </UnreadStateBridge>
           </Toasty>
@@ -156,9 +164,11 @@ function RootComponent() {
 function AuthenticatedShell({
   authenticatedApi,
   isWorkspaceEditor,
+  isWorkersIssueSetup,
 }: {
   authenticatedApi: RpcStub<AuthenticatedApi>
   isWorkspaceEditor: boolean
+  isWorkersIssueSetup: boolean
 }) {
   // null = still checking, true = needs onboarding, false = onboarding done
   const [onboardingNeeded, setOnboardingNeeded] = useState<boolean | null>(null)
@@ -192,7 +202,7 @@ function AuthenticatedShell({
   // Normal app shell. The workspace editor is rendered fullscreen (no chrome); everything else
   // gets the persistent left-rail AppShell. Connection loss is surfaced by a chip in whichever of
   // those two top bars is showing, never by a banner that reflows the page (see ReconnectingChip).
-  const fullscreen = isWorkspaceEditor
+  const fullscreen = isWorkspaceEditor || isWorkersIssueSetup
   return (
     <>
       <AccountSelectionModal />
