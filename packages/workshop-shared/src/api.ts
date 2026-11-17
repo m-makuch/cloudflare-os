@@ -3256,6 +3256,15 @@ export type AgentSpawnerConfig = {
   modelId: string | null,
 
   /**
+   * Optional wall-clock budget in milliseconds, an integer from 1 through 86,400,000 (24 hours).
+   * Starts with the spawned chat's first turn and includes pauses, retries and restarts. Expiry
+   * stops model/tool execution using the same cancellation mechanism as Stop; external actions
+   * already submitted may finish. Later turns in the same chat do not reset the deadline.
+   * Omit for no time limit.
+   */
+  maxDurationMs?: number,
+
+  /**
    * The bindings available to agents spawned by this spawner: binding name (as it appears as
    * `env.NAME` in the spawned agent's executeCode environment) -> target workpiece. This is the
    * spawner's initial set: afterwards the chat agent may add more with `setGadgetBinding`, each
@@ -6561,6 +6570,12 @@ export interface GatekeeperClient<Session extends RpcCompatible<Session>> extend
 
   /** Get the creation spec describing how this gatekeeper was originally created. */
   getCreationSpec(): Promise<GatekeeperCreationSpec>;
+
+  /**
+   * Get the gatekeeper connected under `name`, for example an agent spawner's environment entry.
+   * Returns null for absent or unaccepted edges, deleted targets, and targets that are gadgets.
+   */
+  getBinding(name: string): Promise<GatekeeperClient<any> | null>;
 
   // TODO: Get/set permissions.
 }
