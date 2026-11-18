@@ -109,14 +109,13 @@ it("rejects redirects without following them with the account token", async () =
   expect(calls[0]!.init.redirect).toBe("manual");
 });
 
-it("recovers an interrupted creation by reusing the destination and replacing its secret", async () => {
-  const calls = mock([[{ id: webhook, url }], { id: webhook }]);
+it("recovers an interrupted creation without updating the destination's immutable secret", async () => {
+  const calls = mock([[{ id: webhook, url }]]);
 
-  expect(await provisionNotificationInstallation("token", account, url, "new-secret")).toEqual({
+  expect(await provisionNotificationInstallation("token", account, url, "original-secret")).toEqual({
     webhookId: webhook,
   });
-  expect(calls.map((call) => call.init.method)).toEqual(["GET", "PUT"]);
-  expect(JSON.parse(calls[1]!.init.body as string)).toMatchObject({ url, secret: "new-secret" });
+  expect(calls.map((call) => call.init.method)).toEqual(["GET"]);
 });
 
 it("refuses ambiguous destinations and malformed responses", async () => {
@@ -236,12 +235,11 @@ it("finds a managed destination on a later provider page", async () => {
       result: [{ id: webhook, url }],
       result_info: { page: 2, per_page: 1, total_count: 2 },
     }),
-    { id: webhook },
   ]);
   expect(await provisionNotificationInstallation("token", account, url, "secret")).toEqual({
     webhookId: webhook,
   });
-  expect(calls.map((call) => call.init.method)).toEqual(["GET", "GET", "PUT"]);
+  expect(calls.map((call) => call.init.method)).toEqual(["GET", "GET"]);
   expect(calls[1]!.url).toContain("?page=2");
 });
 

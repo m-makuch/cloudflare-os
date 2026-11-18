@@ -343,7 +343,10 @@ export class CloudflareNotificationReceiver extends DurableObject<NotificationEn
     await this.#account(props.userObjectId).registerNotificationAccount(props.accountId);
     const webhookUrl = `${base}/webhooks/${props.userObjectId}/${props.accountId}`;
     this.ctx.storage.kv.put("webhookUrl", webhookUrl);
-    const apiKey = generateWebhookApiKey();
+    // ANS cannot change an existing destination's secret. Keep the original across an uncertain
+    // POST outcome, including a receiver restart, until its verifier is durably installed.
+    const apiKey = this.ctx.storage.kv.get<string>("pendingApiKey") ?? generateWebhookApiKey();
+    this.ctx.storage.kv.put("pendingApiKey", apiKey);
     const authHash = await hashWebhookApiKey(apiKey);
     this.ctx.storage.kv.put("pendingAuthHash", authHash);
     this.ctx.storage.kv.put("owner", props);
@@ -360,6 +363,7 @@ export class CloudflareNotificationReceiver extends DurableObject<NotificationEn
         authHash,
       });
       this.ctx.storage.kv.put("setupComplete", true);
+      this.ctx.storage.kv.delete("pendingApiKey");
     } finally {
       this.ctx.storage.kv.delete("pendingAuthHash");
     }
@@ -574,6 +578,7 @@ export class CloudflareNotificationReceiver extends DurableObject<NotificationEn
     // Fence late callback completions without waiting on an unresponsive subscriber.
     await this.#mutations.run(async () => {
       await this.#provisioning?.catch(() => undefined);
+      this.ctx.storage.kv.delete("pendingApiKey");
       await this.ctx.storage.deleteAlarm();
     });
   }
