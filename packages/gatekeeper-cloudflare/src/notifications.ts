@@ -19,7 +19,7 @@ import { obsContext } from "./observability.js";
 import {
   provisionNotificationInstallation,
   getNotificationDestinationUrl,
-  updateNotificationDestination,
+  removeUnusedNotificationDestination,
   provisionNotificationPolicy,
   removeNotificationConnection,
   removeNotificationPolicy,
@@ -82,7 +82,13 @@ type HookProps = NotificationsProps & {
 };
 type StoredHook = { props: HookProps; initiator: Fetcher<HookInitiator<HookTarget>> };
 type Installation = NotificationInstallation & NotificationsProps & { authHash: string };
-type AddressMigration = { apiKey: string; authHash: string; webhookUrl: string };
+type AddressMigration = {
+  apiKey?: string;
+  authHash: string;
+  webhookUrl: string;
+  webhookId?: string;
+};
+type RetiredDestination = Installation & { webhookUrl: string };
 type PolicyIntent = Partial<NotificationPolicy> & {
   alertType: string;
   policy?: CloudflareNotificationPolicySettings;
@@ -283,6 +289,9 @@ export class CloudflareNotificationReceiver extends DurableObject<NotificationEn
   #policies(): [string, PolicyIntent][] {
     return [...this.ctx.storage.kv.list<PolicyIntent>({ prefix: "policy:" })];
   }
+  #retiredDestinations(): [string, RetiredDestination][] {
+    return [...this.ctx.storage.kv.list<RetiredDestination>({ prefix: "retiredDestination:" })];
+  }
   #unusedPolicies(): [string, PolicyIntent][] {
     const hooks = this.#hooks();
     const used = new Set(
@@ -369,51 +378,107 @@ export class CloudflareNotificationReceiver extends DurableObject<NotificationEn
     }
   }
 
-  /** Move the existing destination in place, retaining its ID and policies across retries. */
+  /** Replace immutable destinations, moving only owned policies before committing the new verifier. */
   async #reconcileAddress(props: NotificationsProps, installation: Installation): Promise<void> {
     const webhookUrl = `${notificationWebhookBaseUrl(configuredNotificationBaseUrl(this.env))}/webhooks/${props.userObjectId}/${props.accountId}`;
+    const token = await this.#token(props);
     const providerUrl = await getNotificationDestinationUrl(
-      await this.#token(props),
+      token,
       props.accountId,
       installation.webhookId,
     );
-    if (providerUrl === null) {
-      // Provider deletion invalidates the persisted setup marker. Reuse provisioning's exact-URL
-      // recovery so a lost creation response cannot create duplicate destinations on retry.
-      this.ctx.storage.kv.delete("setupComplete");
-      this.ctx.storage.kv.delete("addressMigration");
-      for (const [key, policy] of this.#policies())
-        this.ctx.storage.kv.put<PolicyIntent>(key, { ...policy, needsReconcile: true });
-      await this.#provision(props);
-      Object.assign(installation, this.ctx.storage.kv.get<Installation>("installation")!);
+    let migration = this.ctx.storage.kv.get<AddressMigration>("addressMigration");
+    if (providerUrl === webhookUrl && !migration) {
+      // Repair an older installation's missing local URL without rotating a working secret.
+      this.ctx.storage.kv.put("webhookUrl", webhookUrl);
+      this.ctx.storage.kv.put("setupComplete", true);
       return;
     }
-    // Older installations may not have recorded their URL. Their known destination ID is authoritative.
-    if (
-      providerUrl === webhookUrl &&
-      this.ctx.storage.kv.get("webhookUrl") === webhookUrl &&
-      !this.ctx.storage.kv.get("addressMigration")
-    )
-      return;
-    let migration = this.ctx.storage.kv.get<AddressMigration>("addressMigration");
     if (!migration) {
-      const apiKey = generateWebhookApiKey();
-      migration = { apiKey, authHash: await hashWebhookApiKey(apiKey), webhookUrl };
-      // Retain the pending secret only until success so a lost PUT response can be retried exactly.
+      const retired = this.#retiredDestinations().find(
+        ([, item]) => item.webhookUrl === webhookUrl,
+      )?.[1];
+      if (retired)
+        migration = { webhookUrl, webhookId: retired.webhookId, authHash: retired.authHash };
+      else {
+        const apiKey = generateWebhookApiKey();
+        migration = { apiKey, authHash: await hashWebhookApiKey(apiKey), webhookUrl };
+      }
+      // Keep the pending creation secret through lost POST/PUT responses and receiver restarts.
       this.ctx.storage.kv.put("addressMigration", migration);
     }
-    await updateNotificationDestination(
-      await this.#token(props),
-      props.accountId,
-      installation.webhookId,
-      migration.webhookUrl,
-      migration.apiKey,
-    );
-    installation.authHash = migration.authHash;
+    if (providerUrl === null) this.ctx.storage.kv.delete("setupComplete");
+    if (
+      !migration.apiKey &&
+      (await getNotificationDestinationUrl(token, props.accountId, migration.webhookId!)) === null
+    ) {
+      const apiKey = generateWebhookApiKey();
+      migration = {
+        webhookUrl: migration.webhookUrl,
+        apiKey,
+        authHash: await hashWebhookApiKey(apiKey),
+      };
+      this.ctx.storage.kv.put("addressMigration", migration);
+    }
+    const replacement = migration.apiKey
+      ? await provisionNotificationInstallation(
+          token,
+          props.accountId,
+          migration.webhookUrl,
+          migration.apiKey,
+        )
+      : { webhookId: migration.webhookId! };
+    migration.webhookId = replacement.webhookId;
+    this.ctx.storage.kv.put("addressMigration", migration);
+    if (
+      replacement.webhookId === installation.webhookId ||
+      (await getNotificationDestinationUrl(token, props.accountId, replacement.webhookId)) !==
+        migration.webhookUrl
+    )
+      throw new Error(
+        "The replacement notification destination does not match its expected address.",
+      );
+    for (const [key, intent] of this.#policies()) {
+      const policy = await provisionNotificationPolicy(
+        token,
+        props.accountId,
+        replacement.webhookId,
+        intent.alertType,
+        props.userObjectId,
+        intent.policy,
+        { previousWebhookId: installation.webhookId, policyId: intent.policyId },
+      );
+      this.ctx.storage.kv.put<PolicyIntent>(key, {
+        alertType: intent.alertType,
+        policy: intent.policy,
+        ...policy,
+      });
+    }
+    if (providerUrl !== null)
+      this.ctx.storage.kv.put<RetiredDestination>(`retiredDestination:${installation.webhookId}`, {
+        ...installation,
+        webhookUrl: providerUrl,
+      });
+    this.ctx.storage.kv.delete(`retiredDestination:${replacement.webhookId}`);
+    Object.assign(installation, replacement, { authHash: migration.authHash });
     this.ctx.storage.kv.put("installation", installation);
     this.ctx.storage.kv.put("webhookUrl", migration.webhookUrl);
+    this.ctx.storage.kv.put("setupComplete", true);
     this.ctx.storage.kv.delete("addressMigration");
     if (migration.webhookUrl !== webhookUrl) await this.#reconcileAddress(props, installation);
+  }
+
+  async #removeRetiredDestinations(props: NotificationsProps): Promise<void> {
+    for (const [key, destination] of this.#retiredDestinations()) {
+      if (
+        await removeUnusedNotificationDestination(
+          await this.#token(props),
+          props.accountId,
+          destination.webhookId,
+        )
+      )
+        this.ctx.storage.kv.delete(key);
+    }
   }
 
   async enable(props: HookProps, initiator: Fetcher<HookInitiator<HookTarget>>): Promise<void> {
@@ -437,7 +502,7 @@ export class CloudflareNotificationReceiver extends DurableObject<NotificationEn
       disposeHook(existing);
       if (!alreadyEnabled && this.#hookCount() >= MAX_HOOKS)
         throw new Error("This notification connection has reached its subscriber limit.");
-      const needsProvisioning = !this.ctx.storage.kv.get("setupComplete");
+      const needsProvisioning = !this.ctx.storage.kv.get("installation");
       if (needsProvisioning) {
         this.#provisioning = this.#provision(props).finally(() => {
           this.#provisioning = undefined;
@@ -449,6 +514,7 @@ export class CloudflareNotificationReceiver extends DurableObject<NotificationEn
       const installation = this.ctx.storage.kv.get<Installation>("installation");
       if (!installation) throw new Error("Notification destination setup is incomplete.");
       if (!needsProvisioning) await this.#reconcileAddress(props, installation);
+      await this.#removeRetiredDestinations(props);
       this.#ensureReceipts();
       const policyKey = await notificationPolicyKey(props.alertType, props.policy);
       props = { ...props, policyKey };
@@ -579,6 +645,11 @@ export class CloudflareNotificationReceiver extends DurableObject<NotificationEn
     await this.#mutations.run(async () => {
       await this.#provisioning?.catch(() => undefined);
       this.ctx.storage.kv.delete("pendingApiKey");
+      const migration = this.ctx.storage.kv.get<AddressMigration>("addressMigration");
+      if (migration) {
+        delete migration.apiKey;
+        this.ctx.storage.kv.put("addressMigration", migration);
+      }
       await this.ctx.storage.deleteAlarm();
     });
   }
@@ -620,21 +691,48 @@ export class CloudflareNotificationReceiver extends DurableObject<NotificationEn
   async #removeProviderResources(token: string, owner: NotificationsProps): Promise<void> {
     const installation = this.ctx.storage.kv.get<Installation>("installation");
     const webhookUrl = this.ctx.storage.kv.get<string>("webhookUrl");
+    const migration = this.ctx.storage.kv.get<AddressMigration>("addressMigration");
+    const webhookIds = [
+      ...new Set(
+        [
+          installation?.webhookId,
+          migration?.webhookId,
+          ...this.#retiredDestinations().map(([, destination]) => destination.webhookId),
+        ].filter((value): value is string => value !== undefined),
+      ),
+    ];
     for (const [key, policy] of this.#policies()) {
       if (!installation) throw new Error("Notification destination is missing.");
-      await removeNotificationPolicy(
-        token,
-        owner.accountId,
-        owner.userObjectId,
-        policy.alertType,
-        installation.webhookId,
-        policy.policyId ? { policyId: policy.policyId } : undefined,
-        policy.policy,
-      );
+      for (const [index, webhookId] of webhookIds.entries())
+        await removeNotificationPolicy(
+          token,
+          owner.accountId,
+          owner.userObjectId,
+          policy.alertType,
+          webhookId,
+          index === 0 && policy.policyId ? { policyId: policy.policyId } : undefined,
+          policy.policy,
+        );
       this.ctx.storage.kv.delete(key);
     }
     if (webhookUrl)
       await removeNotificationConnection(token, owner.accountId, webhookUrl, installation);
+    if (migration)
+      await removeNotificationConnection(
+        token,
+        owner.accountId,
+        migration.webhookUrl,
+        migration.webhookId ? { webhookId: migration.webhookId } : undefined,
+      );
+    for (const [key, destination] of this.#retiredDestinations()) {
+      await removeNotificationConnection(
+        token,
+        owner.accountId,
+        destination.webhookUrl,
+        destination,
+      );
+      this.ctx.storage.kv.delete(key);
+    }
   }
 
   async getStatus(): Promise<CloudflareNotificationStatus> {
@@ -681,6 +779,7 @@ export class CloudflareNotificationReceiver extends DurableObject<NotificationEn
       this.ctx.storage.kv.get<string>("pendingAuthHash"),
       installation?.authHash,
       migration?.authHash,
+      ...this.#retiredDestinations().map(([, destination]) => destination.authHash),
     ];
     if (
       !(
@@ -689,7 +788,11 @@ export class CloudflareNotificationReceiver extends DurableObject<NotificationEn
     )
       return 401;
     if (requestPath) {
-      const urls = [this.ctx.storage.kv.get<string>("webhookUrl"), migration?.webhookUrl];
+      const urls = [
+        this.ctx.storage.kv.get<string>("webhookUrl"),
+        migration?.webhookUrl,
+        ...this.#retiredDestinations().map(([, destination]) => destination.webhookUrl),
+      ];
       if (!urls.some((url) => url && new URL(url).pathname === requestPath)) return 404;
     }
     return 204;

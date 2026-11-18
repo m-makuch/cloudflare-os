@@ -64,6 +64,9 @@ function id(value: unknown): string {
   }
   return value;
 }
+function sameId(left: string, right: string): boolean {
+  return left.replaceAll("-", "").toLowerCase() === right.replaceAll("-", "").toLowerCase();
+}
 async function requestEnvelope(
   token: string,
   path: string,
@@ -237,11 +240,34 @@ function hasOnlyPolicyDestination(value: unknown, destination: string): boolean 
   const webhooks = policyWebhookIds(value);
   return (
     webhooks.length === 1 &&
-    webhooks[0] === destination &&
+    sameId(webhooks[0]!, destination) &&
     Object.entries(mechanisms).every(
       ([key, entries]) => key === "webhooks" || (Array.isArray(entries) && entries.length === 0),
     )
   );
+}
+
+/** Delete a retired destination only after no policy references it; tolerate a lost DELETE response. */
+export async function removeUnusedNotificationDestination(
+  token: string,
+  accountId: string,
+  webhookId: string,
+): Promise<boolean> {
+  const root = `/accounts/${assertCloudflareAccountId(accountId)}/alerting/v3`;
+  const destination = id(webhookId);
+  if (
+    (await list(token, `${root}/policies`)).some((policy) =>
+      policyWebhookIds(policy.mechanisms).some((webhookId) => sameId(webhookId, destination)),
+    )
+  )
+    return false;
+  if (
+    (await list(token, `${root}/destinations/webhooks`)).some((item) =>
+      sameId(id(item.id), destination),
+    )
+  )
+    await request(token, `${root}/destinations/webhooks/${destination}`, "DELETE");
+  return true;
 }
 
 /** The marker survives an interrupted POST, so a retry can adopt only its own policy. */
@@ -252,28 +278,63 @@ export async function provisionNotificationPolicy(
   alertType: string,
   ownerId: string,
   settings?: CloudflareNotificationPolicySettings,
+  recovery?: { previousWebhookId: string; policyId?: string },
 ): Promise<NotificationPolicy> {
   const root = `/accounts/${assertCloudflareAccountId(accountId)}/alerting/v3/policies`;
   const destination = id(webhookId);
   const canonical = canonicalNotificationPolicy(settings);
   const description = await policyMarker(ownerId, alertType, canonical);
-  const matches = (await list(token, root)).filter((item) => item.description === description);
+  const policies = await list(token, root);
+  const matches = policies.filter((item) => item.description === description);
   if (matches.length > 1)
     throw new Error("Multiple Cloudflare OS policies match this configuration.");
+  const sameConfiguration = (item: Record<string, unknown>) =>
+    item.description === description &&
+    item.alert_type === alertType &&
+    item.enabled === true &&
+    JSON.stringify(
+      canonicalNotificationPolicy({
+        alertInterval: item.alert_interval as string | undefined,
+        filters: item.filters as CloudflareNotificationPolicySettings["filters"],
+      }),
+    ) === JSON.stringify(canonical);
+  const changed = () => new Error("The managed notification policy was changed in Cloudflare.");
+  const knownId = recovery?.policyId ? id(recovery.policyId) : undefined;
+  if (knownId && policies.some((item) => sameId(id(item.id), knownId) && item !== matches[0]))
+    throw changed();
   if (matches[0]) {
-    if (
-      matches[0].alert_type !== alertType ||
-      matches[0].enabled !== true ||
-      JSON.stringify(
-        canonicalNotificationPolicy({
-          alertInterval: matches[0].alert_interval as string | undefined,
-          filters: matches[0].filters as CloudflareNotificationPolicySettings["filters"],
-        }),
-      ) !== JSON.stringify(canonical) ||
-      !hasOnlyPolicyDestination(matches[0].mechanisms, destination)
-    )
-      throw new Error("The managed notification policy was changed in Cloudflare.");
-    return { policyId: id(matches[0].id) };
+    const existing = matches[0];
+    if (!sameConfiguration(existing)) throw changed();
+    const policyId = id(existing.id);
+    if (!hasOnlyPolicyDestination(existing.mechanisms, destination)) {
+      const empty = Object.values(object(existing.mechanisms)).every(
+        (entries) => Array.isArray(entries) && entries.length === 0,
+      );
+      if (
+        !recovery ||
+        (!empty && !hasOnlyPolicyDestination(existing.mechanisms, id(recovery.previousWebhookId)))
+      )
+        throw changed();
+      await request(token, `${root}/${policyId}`, "PUT", {
+        name: typeof existing.name === "string" ? existing.name : `Cloudflare OS: ${alertType}`,
+        description,
+        alert_type: alertType,
+        enabled: true,
+        ...(canonical.alertInterval === undefined
+          ? {}
+          : { alert_interval: canonical.alertInterval }),
+        ...(canonical.filters === undefined ? {} : { filters: canonical.filters }),
+        mechanisms: { webhooks: [{ id: destination }] },
+      });
+      const updated = object(await request(token, `${root}/${policyId}`));
+      if (
+        !sameId(id(updated.id), policyId) ||
+        !sameConfiguration(updated) ||
+        !hasOnlyPolicyDestination(updated.mechanisms, destination)
+      )
+        throw changed();
+    }
+    return { policyId };
   }
   let policy: Record<string, unknown>;
   try {
@@ -325,20 +386,4 @@ export async function removeNotificationPolicy(
   const policyIds = new Set(matches.map((item) => id(item.id)));
   if (known) policyIds.add(id(known.policyId));
   for (const policyId of policyIds) await request(token, `${root}/${policyId}`, "DELETE");
-}
-
-/** Update the owned destination in place so its policies keep the same webhook ID. */
-export async function updateNotificationDestination(
-  token: string,
-  accountId: string,
-  webhookId: string,
-  webhookUrl: string,
-  apiKey: string,
-): Promise<void> {
-  await request(
-    token,
-    `/accounts/${assertCloudflareAccountId(accountId)}/alerting/v3/destinations/webhooks/${id(webhookId)}`,
-    "PUT",
-    { name: "Cloudflare OS", type: "generic", url: webhookUrl, secret: apiKey },
-  );
 }

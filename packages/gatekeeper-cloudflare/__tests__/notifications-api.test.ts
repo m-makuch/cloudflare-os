@@ -7,6 +7,7 @@ import {
   provisionNotificationPolicy,
   removeNotificationConnection,
   removeNotificationPolicy,
+  removeUnusedNotificationDestination,
 } from "../src/notifications-api.js";
 
 const account = "a".repeat(32);
@@ -112,9 +113,11 @@ it("rejects redirects without following them with the account token", async () =
 it("recovers an interrupted creation without updating the destination's immutable secret", async () => {
   const calls = mock([[{ id: webhook, url }]]);
 
-  expect(await provisionNotificationInstallation("token", account, url, "original-secret")).toEqual({
-    webhookId: webhook,
-  });
+  expect(await provisionNotificationInstallation("token", account, url, "original-secret")).toEqual(
+    {
+      webhookId: webhook,
+    },
+  );
   expect(calls.map((call) => call.init.method)).toEqual(["GET"]);
 });
 
@@ -221,6 +224,134 @@ it("recovers a lost policy creation response and refuses a changed policy", asyn
   await expect(
     provisionNotificationPolicy("token", account, webhook, "incident_alert", ownerId),
   ).rejects.toThrow("changed");
+});
+
+it.each([{}, { webhooks: [] }, { webhooks: [{ id: otherWebhook }] }])(
+  "repairs an owned policy during destination recovery: %j",
+  async (mechanisms) => {
+    const existing = {
+      id: policy,
+      name: "Existing policy name",
+      description: `Cloudflare OS managed ${ownerId} incident_alert`,
+      alert_type: "incident_alert",
+      enabled: true,
+      mechanisms,
+    };
+    const updated = { ...existing, mechanisms: { webhooks: [{ id: webhook }] } };
+    const calls = mock([[existing], { id: policy }, updated]);
+    expect(
+      await provisionNotificationPolicy(
+        "token",
+        account,
+        webhook,
+        "incident_alert",
+        ownerId,
+        undefined,
+        { previousWebhookId: otherWebhook, policyId: policy },
+      ),
+    ).toEqual({ policyId: policy });
+    expect(calls.map((call) => call.init.method)).toEqual(["GET", "PUT", "GET"]);
+    expect(JSON.parse(calls[1]!.init.body as string)).toEqual({
+      name: existing.name,
+      description: existing.description,
+      alert_type: "incident_alert",
+      enabled: true,
+      mechanisms: updated.mechanisms,
+    });
+  },
+);
+
+it.each([
+  { mechanisms: { webhooks: [{ id: "f".repeat(32) }] } },
+  { mechanisms: { webhooks: [], email: [{ id: "someone@example.test" }] } },
+  { mechanisms: { webhooks: [{ id: otherWebhook }, { id: "f".repeat(32) }] } },
+  { enabled: false },
+  { filters: { product: ["other"] } },
+  { description: "A user-edited policy" },
+])("refuses to overwrite a changed policy during recovery: %j", async (change) => {
+  const existing = {
+    id: policy,
+    description: `Cloudflare OS managed ${ownerId} incident_alert`,
+    alert_type: "incident_alert",
+    enabled: true,
+    mechanisms: {},
+    ...change,
+  };
+  const calls = mock([[existing]]);
+  await expect(
+    provisionNotificationPolicy("token", account, webhook, "incident_alert", ownerId, undefined, {
+      previousWebhookId: otherWebhook,
+      policyId: policy,
+    }),
+  ).rejects.toThrow("changed in Cloudflare");
+  expect(calls.map((call) => call.init.method)).toEqual(["GET"]);
+});
+
+it("checks that policy repair actually changed the destination before reporting success", async () => {
+  const existing = {
+    id: policy,
+    description: `Cloudflare OS managed ${ownerId} incident_alert`,
+    alert_type: "incident_alert",
+    enabled: true,
+    mechanisms: {},
+  };
+  mock([[existing], { id: policy }, existing]);
+  await expect(
+    provisionNotificationPolicy("token", account, webhook, "incident_alert", ownerId, undefined, {
+      previousWebhookId: otherWebhook,
+      policyId: policy,
+    }),
+  ).rejects.toThrow("changed in Cloudflare");
+});
+
+it("preserves canonical filters and the re-alert interval while repairing a configured policy", async () => {
+  const settings = { filters: { product: ["workers"], limit: ["100"] }, alertInterval: "30m" };
+  const creation = mock([[], { id: policy }]);
+  await provisionNotificationPolicy(
+    "token",
+    account,
+    otherWebhook,
+    "incident_alert",
+    ownerId,
+    settings,
+  );
+  const existing = { ...JSON.parse(creation[1]!.init.body as string), id: policy };
+  const updated = { ...existing, mechanisms: { webhooks: [{ id: webhook }] } };
+  const calls = mock([[existing], { id: policy }, updated]);
+  expect(
+    await provisionNotificationPolicy(
+      "token",
+      account,
+      webhook,
+      "incident_alert",
+      ownerId,
+      settings,
+      { previousWebhookId: otherWebhook, policyId: policy },
+    ),
+  ).toEqual({ policyId: policy });
+  expect(JSON.parse(calls[1]!.init.body as string)).toEqual({
+    ...existing,
+    id: undefined,
+    mechanisms: updated.mechanisms,
+  });
+});
+
+it.each([webhook, "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb", webhook.toUpperCase()])(
+  "retains destinations referenced by external policies (%s)",
+  async (reference) => {
+    const calls = mock([[{ mechanisms: { webhooks: [{ id: reference }] } }]]);
+    expect(await removeUnusedNotificationDestination("token", account, webhook)).toBe(false);
+    expect(calls.map((call) => call.init.method)).toEqual(["GET"]);
+  },
+);
+
+it("deletes only an unreferenced retired destination and tolerates its lost deletion response", async () => {
+  const calls = mock([[], [{ id: webhook }, { id: otherWebhook }], {}, [], [{ id: otherWebhook }]]);
+  expect(await removeUnusedNotificationDestination("token", account, webhook)).toBe(true);
+  expect(await removeUnusedNotificationDestination("token", account, webhook)).toBe(true);
+  expect(calls.filter((call) => call.init.method === "DELETE").map((call) => call.url)).toEqual([
+    `https://api.cloudflare.com/client/v4/accounts/${account}/alerting/v3/destinations/webhooks/${webhook}`,
+  ]);
 });
 
 it("finds a managed destination on a later provider page", async () => {

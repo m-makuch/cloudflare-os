@@ -817,65 +817,289 @@ it("removes a managed policy when only external-policy subscribers remain", asyn
   expect(await receivedAlerts()).toEqual([expect.objectContaining({ subscriber: "hook-2" })]);
 });
 
-it("retries an interrupted address migration in place with the same pending secret", async () => {
-  const stub = await setup(notificationReceiverName(userObjectId, accountId));
-  await runInDurableObject(stub, (_instance, state) =>
-    state.storage.kv.put(
-      "webhookUrl",
-      `https://hooks.example/old/webhooks/${userObjectId}/${accountId}`,
-    ),
-  );
-  const oldPath = `/old/webhooks/${userObjectId}/${accountId}`;
+/** Model ANS's immutable webhook fields, mutable policies, and destination deletion cascade. */
+async function destinationRecoveryProvider(
+  name: string,
+  { deleted = false, external = false, loseResponse = "" } = {},
+) {
+  const stub = await setup(name);
+  const oldId = "d".repeat(32);
+  const newId = "e".repeat(32);
+  const policyId = "b".repeat(32);
+  const oldUrl = `https://hooks.example/gatekeeper/cloudflare/webhooks/${userObjectId}/${accountId}`;
+  await runInDurableObject(stub, (_instance, state) => state.storage.kv.put("webhookUrl", oldUrl));
+  const destinations = new Map<string, { id: string; url: string; secret: string }>();
+  if (!deleted) destinations.set(oldId, { id: oldId, url: oldUrl, secret });
+  const policies = new Map<
+    string,
+    {
+      id: string;
+      name: string;
+      description: string;
+      alert_type: string;
+      enabled: boolean;
+      mechanisms: { webhooks: { id: string }[] };
+    }
+  >([
+    [
+      policyId,
+      {
+        id: policyId,
+        name: "Keep this policy name",
+        description: `Cloudflare OS managed ${userObjectId} test_alert`,
+        alert_type: "test_alert",
+        enabled: true,
+        mechanisms: { webhooks: deleted ? [] : [{ id: oldId }] },
+      },
+    ],
+  ]);
+  if (external)
+    policies.set("f".repeat(32), {
+      id: "f".repeat(32),
+      name: "External policy",
+      description: "Configured outside Cloudflare OS",
+      alert_type: "test_alert",
+      enabled: true,
+      mechanisms: { webhooks: [{ id: oldId }] },
+    });
+  const failOnce = (operation: string) => {
+    if (loseResponse !== operation) return;
+    loseResponse = "";
+    throw new Error(`Lost ${operation} response`);
+  };
+  const fetch = vi.fn(async (url: string, init: RequestInit) => {
+    const resourceId = url.split("/").at(-1)!;
+    const webhooks = url.includes("/destinations/webhooks");
+    if (init.method === "GET") {
+      const result = webhooks
+        ? resourceId === "webhooks"
+          ? [...destinations.values()]
+          : destinations.get(resourceId)
+        : resourceId === "policies"
+          ? [...policies.values()]
+          : policies.get(resourceId);
+      return result === undefined
+        ? new Response(null, { status: 404 })
+        : Response.json({ success: true, result });
+    }
+    if (webhooks && init.method === "POST") {
+      const body = JSON.parse(init.body as string);
+      const receiverStub = env.NOTIFICATION_RECEIVER.getByName(name);
+      expect(
+        await receiverStub.receiveWebhook(
+          body.secret,
+          "application/json",
+          JSON.stringify({
+            text: "Hello World! This is a test message sent from https://cloudflare.com. If you can see this, your webhook is configured properly.",
+          }),
+          new URL(body.url).pathname,
+        ),
+      ).toBe(204);
+      destinations.set(newId, { id: newId, url: body.url, secret: body.secret });
+      failOnce("creation");
+      return Response.json({ success: true, result: { id: newId } });
+    }
+    if (!webhooks && init.method === "PUT") {
+      policies.set(resourceId, { ...JSON.parse(init.body as string), id: resourceId });
+      failOnce("policy update");
+      return Response.json({ success: true, result: { id: resourceId } });
+    }
+    if (init.method === "DELETE") {
+      if (webhooks) {
+        if (!destinations.delete(resourceId)) return new Response(null, { status: 500 });
+        for (const policy of policies.values())
+          policy.mechanisms.webhooks = policy.mechanisms.webhooks.filter(
+            (item) => item.id !== resourceId,
+          );
+        failOnce("deletion");
+      } else policies.delete(resourceId);
+      return Response.json({ success: true });
+    }
+    throw new Error("Unexpected provider request: webhook URLs and secrets are immutable");
+  });
+  vi.stubGlobal("fetch", fetch);
+  return { stub, oldId, newId, policyId, oldUrl, destinations, policies, fetch };
+}
+
+it.each(["", "creation", "policy update", "deletion"])(
+  "migrates through a replacement destination and keeps policy IDs across restart (lost: %s)",
+  async (loseResponse) => {
+    const name = `migrate-${loseResponse}`;
+    const provider = await destinationRecoveryProvider(name, { loseResponse });
+    if (loseResponse) {
+      await expect(enableAdditionalHook(name)).rejects.toThrow(`Lost ${loseResponse} response`);
+      if (loseResponse !== "deletion") {
+        expect(await sendAlert(provider.stub)).toBe(204);
+        expect(
+          await provider.stub.receiveWebhook(
+            provider.destinations.get(provider.newId)!.secret,
+            "application/json",
+            payload,
+          ),
+        ).toBe(204);
+      }
+      await abortAllDurableObjects();
+    }
+    await enableAdditionalHook(name);
+    const stub = env.NOTIFICATION_RECEIVER.getByName(name);
+    expect((await stub.getStatus()).webhookId).toBe(provider.newId);
+    expect(provider.destinations.size).toBe(1);
+    expect(provider.policies.get(provider.policyId)).toMatchObject({
+      name: "Keep this policy name",
+      mechanisms: { webhooks: [{ id: provider.newId }] },
+    });
+    expect(
+      provider.fetch.mock.calls.filter(
+        ([url, init]) => url.includes("/destinations/webhooks") && init.method === "POST",
+      ),
+    ).toHaveLength(1);
+    expect(provider.fetch.mock.calls.filter(([, init]) => init.method === "PUT")).toHaveLength(1);
+    expect(await stub.receiveWebhook(secret, "application/json", payload)).toBe(401);
+    expect(
+      await stub.receiveWebhook(
+        provider.destinations.get(provider.newId)!.secret,
+        "application/json",
+        payload,
+      ),
+    ).toBe(204);
+    await stub.deliverPending();
+    expect(
+      await runInDurableObject(stub, (_instance, state) => ({
+        migration: state.storage.kv.get("addressMigration"),
+        retired: [...state.storage.kv.list({ prefix: "retiredDestination:" })].length,
+      })),
+    ).toEqual({ migration: undefined, retired: 0 });
+  },
+);
+
+it.each(["", "creation", "policy update"])(
+  "repairs a surviving managed policy after destination deletion for existing hooks (lost: %s)",
+  async (loseResponse) => {
+    const name = `repair-deleted-${loseResponse}`;
+    const provider = await destinationRecoveryProvider(name, { deleted: true, loseResponse });
+    if (loseResponse) {
+      await expect(enableAdditionalHook(name)).rejects.toThrow(`Lost ${loseResponse} response`);
+      await abortAllDurableObjects();
+    }
+    await enableAdditionalHook(name);
+    const stub = env.NOTIFICATION_RECEIVER.getByName(name);
+    expect(provider.policies.size).toBe(1);
+    expect(provider.policies.get(provider.policyId)!.mechanisms.webhooks).toEqual([
+      { id: provider.newId },
+    ]);
+    expect(
+      await stub.receiveWebhook(
+        provider.destinations.get(provider.newId)!.secret,
+        "application/json",
+        payload,
+      ),
+    ).toBe(204);
+    await stub.deliverPending();
+    expect((await receivedAlerts()).map((alert) => alert.subscriber).toSorted()).toEqual([
+      "hook-1",
+      "hook-2",
+    ]);
+  },
+);
+
+it("retains external policies and their old verifier until the retired destination is unused", async () => {
+  const name = "migrate-external-policy";
+  const provider = await destinationRecoveryProvider(name, { external: true });
+  await enableAdditionalHook(name);
+  expect(provider.destinations.size).toBe(2);
+  expect(provider.policies.get("f".repeat(32))!.mechanisms.webhooks).toEqual([
+    { id: provider.oldId },
+  ]);
   expect(
-    (
-      await SELF.fetch(`https://hooks.example${oldPath}`, {
-        method: "POST",
-        headers: { "cf-webhook-auth": secret, "content-type": "application/json" },
-        body: payload,
-      })
-    ).status,
-  ).toBe(404);
-  expect(
-    await stub.receiveWebhook(
+    await provider.stub.receiveWebhook(
       secret,
       "application/json",
       payload,
-      `/unrelated/webhooks/${userObjectId}/${accountId}`,
+      new URL(provider.oldUrl).pathname,
     ),
-  ).toBe(404);
-  const calls: { url: string; method?: string; body: { url: string; secret: string } }[] = [];
-  mockProvider(async (url: string, init: RequestInit) => {
-    calls.push({ url, method: init.method, body: JSON.parse(init.body as string) });
-    if (calls.length === 1) throw new Error("Lost update response");
-    return Response.json({ success: true, result: { id: "d".repeat(32) } });
-  });
-  const enable = () =>
-    runInDurableObject(stub, async (instance, state) => {
-      const exports = state.exports as unknown as {
-        NotificationTestHooks(options: object): Fetcher<NotificationTestHooks>;
-      };
-      await instance.enable(
-        { accountId, userObjectId, hookId: "hook-2", alertType: "test_alert" },
-        exports.NotificationTestHooks({ props: { hookId: "hook-2" } }) as unknown as Parameters<
-          typeof instance.enable
-        >[1],
-      );
-    });
-  await expect(enable()).rejects.toThrow("Lost update response");
-  expect(await sendAlert(stub)).toBe(204);
-  expect(await stub.receiveWebhook(calls[0]!.body.secret, "application/json", payload)).toBe(204);
-  await enable();
-  expect(calls).toHaveLength(2);
-  expect(calls[1]).toEqual(calls[0]);
-  expect(calls[0]!.url).toMatch(/destinations\/webhooks\/dddddddddddddddddddddddddddddddd$/);
-  expect(calls[0]!.method).toBe("PUT");
-  expect(await stub.receiveWebhook(calls[0]!.body.secret, "application/json", payload)).toBe(204);
-  expect(await sendAlert(stub)).toBe(401);
+  ).toBe(204);
+  await provider.stub.deliverPending();
   expect(
-    await runInDurableObject(stub, (_instance, state) => state.storage.kv.get("addressMigration")),
-  ).toBeUndefined();
-  expect((await stub.getStatus()).webhookId).toBe("d".repeat(32));
+    await provider.stub.receiveWebhook(secret, "application/json", payload, "/unrelated/path"),
+  ).toBe(404);
+  await abortAllDurableObjects();
+  expect(
+    await env.NOTIFICATION_RECEIVER.getByName(name).receiveWebhook(
+      secret,
+      "application/json",
+      payload,
+      new URL(provider.oldUrl).pathname,
+    ),
+  ).toBe(204);
+  provider.policies.delete("f".repeat(32));
+  await enableAdditionalHook(name);
+  const stub = env.NOTIFICATION_RECEIVER.getByName(name);
+  expect(provider.destinations.has(provider.oldId)).toBe(false);
+  expect(await stub.receiveWebhook(secret, "application/json", payload)).toBe(401);
 });
+
+it("reuses a retained destination's existing verifier when returning to its address", async () => {
+  const name = "reuse-retired-address";
+  const provider = await destinationRecoveryProvider(name);
+  const retainedSecret = "1".repeat(64);
+  const webhookUrl = `https://hooks.example/notifications/webhooks/${userObjectId}/${accountId}`;
+  provider.destinations.set(provider.newId, {
+    id: provider.newId,
+    url: webhookUrl,
+    secret: retainedSecret,
+  });
+  const authHash = await hashWebhookApiKey(retainedSecret);
+  await runInDurableObject(provider.stub, (_instance, state) =>
+    state.storage.kv.put(`retiredDestination:${provider.newId}`, {
+      accountId,
+      userObjectId,
+      authHash,
+      webhookId: provider.newId,
+      webhookUrl,
+    }),
+  );
+  await enableAdditionalHook(name);
+  expect((await provider.stub.getStatus()).webhookId).toBe(provider.newId);
+  expect(provider.fetch.mock.calls.some(([, init]) => init.method === "POST")).toBe(false);
+  expect(await provider.stub.receiveWebhook(retainedSecret, "application/json", payload)).toBe(204);
+  await provider.stub.deliverPending();
+  expect(provider.destinations.has(provider.oldId)).toBe(false);
+});
+
+it("does not commit migration when the replacement destination has an unexpected live URL", async () => {
+  const name = "migration-readback-mismatch";
+  const provider = await destinationRecoveryProvider(name);
+  vi.stubGlobal("fetch", async (url: string, init: RequestInit) => {
+    const response = await provider.fetch(url, init);
+    if (init.method === "GET" && url.endsWith(`/webhooks/${provider.newId}`))
+      return Response.json({
+        success: true,
+        result: { id: provider.newId, url: "https://other.example/hook" },
+      });
+    return response;
+  });
+  await expect(enableAdditionalHook(name)).rejects.toThrow("does not match its expected address");
+  expect((await provider.stub.getStatus()).webhookId).toBe(provider.oldId);
+  expect(provider.fetch.mock.calls.some(([, init]) => init.method === "PUT")).toBe(false);
+  expect(await sendAlert(provider.stub)).toBe(204);
+});
+
+it.each(["creation", "policy update"])(
+  "disconnects both destinations after an interrupted migration (lost: %s)",
+  async (loseResponse) => {
+    const name = `disconnect-migration-${loseResponse}`;
+    const provider = await destinationRecoveryProvider(name, { loseResponse });
+    await expect(enableAdditionalHook(name)).rejects.toThrow(`Lost ${loseResponse} response`);
+    const error = await provider.stub.revokeWithToken("test-access").then(
+      () => undefined,
+      (caught: Error) => caught,
+    );
+    expect(error).toBeUndefined();
+    expect(provider.policies.size).toBe(0);
+    expect(provider.destinations.size).toBe(0);
+    expect(await provider.stub.receiveWebhook(secret, "application/json", payload)).toBe(410);
+  },
+);
 
 it("isolates configured policies, shares canonical settings, and cleans up only the last managed subscriber", async () => {
   const policies = new Map<string, Record<string, unknown>>();
