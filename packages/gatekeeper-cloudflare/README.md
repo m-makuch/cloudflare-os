@@ -281,19 +281,26 @@ lazily, so unknown credentials leave no persistent state. It accepts Cloudflare'
 512 KiB while streaming. API keys are random 256-bit values. Provisioning durably retains the pending
 creation key across failures and restarts, reusing it when recovering a destination because ANS
 cannot update its secret. The key is removed after installation or suspension; only its SHA-256
-verifier is retained once setup completes. An address migration temporarily stores the pending
-secret to retry an interrupted update exactly, accepting both the old and pending credentials until
-it succeeds.
-Enabling a hook reconciles a changed base URL by updating the existing destination in place,
-preserving its ID and policies. The standard gatekeeper path remains a migration fallback, subject to
-the stored-path check. Arbitrary historical custom paths require an explicit deployment routing
-transition. Both origins must route to this Worker during a hostname change.
+verifier is retained once setup completes. ANS webhook URLs and secrets are immutable. Enabling a
+hook reconciles a changed base URL by creating a replacement destination, checking its live URL, and
+moving this connection's managed policies to it without changing their IDs or settings. Each policy
+update is read back before the new installation is committed. Pending creation credentials survive
+interruption and restart; both old and pending credentials work during migration.
+External policies are never rewritten. An old destination and its verifier are retained while any
+policy still references it; a subsequent hook enable removes it once unused. Returning to a retained
+address reuses that destination's existing verifier. Disconnect cleans up active, pending, and
+retired destinations. Only hashes remain after migration completes.
+The standard gatekeeper path remains a migration fallback, subject to the stored-path check.
+Arbitrary historical custom paths require an explicit deployment routing transition. Both origins
+must route to this Worker while old destinations remain in use during a hostname change.
 Hook enablement also reads the owned destination live, even when its configured address is unchanged.
 Only an explicit HTTP 404 is treated as provider deletion: setup is invalidated and exact-URL
 provisioning recreates or recovers the destination and retains subscribers. A new destination gets a
-fresh secret; interrupted creation reuses its pending secret.
-Managed policy intents are marked for reconciliation when their hooks are enabled again. External
-policies are not rewritten. Authorization failures, transient provider errors, and malformed lookup
+fresh secret; interrupted creation reuses its pending secret. All stored managed-policy intents are
+reconciled before committing the replacement, including those belonging to existing subscribers.
+Recovery repairs an otherwise unchanged owned policy whose old destination association is missing,
+but refuses changed settings, disabled policies, extra recipients, or another destination.
+Authorization failures, transient provider errors, and malformed lookup
 responses fail enablement without creating a replacement. A lost creation response can be recovered
 on retry or after restart without duplicating the destination.
 Provider requests are fixed-origin, bounded,
