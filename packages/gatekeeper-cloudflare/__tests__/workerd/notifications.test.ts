@@ -54,6 +54,14 @@ function mockProvider(
   vi.stubGlobal("fetch", fetch);
   return fetch;
 }
+async function setCredentials() {
+  const account = env.USER_ACCOUNT.get(env.USER_ACCOUNT.idFromString(userObjectId));
+  await runInDurableObject(account, (_instance, state) => {
+    state.storage.kv.put("refreshToken", "test-refresh");
+    state.storage.kv.put("accessToken", { token: "test-access", expires: Date.now() + 86400_000 });
+    state.storage.kv.put("grantedScopes", ["notifications.write"]);
+  });
+}
 async function setup(
   name: string,
   alertType = "test_alert",
@@ -62,12 +70,7 @@ async function setup(
   createPolicy = true,
   policy?: CloudflareNotificationPolicySettings,
 ) {
-  const account = env.USER_ACCOUNT.get(env.USER_ACCOUNT.idFromString(userObjectId));
-  await runInDurableObject(account, (_instance, state) => {
-    state.storage.kv.put("refreshToken", "test-refresh");
-    state.storage.kv.put("accessToken", { token: "test-access", expires: Date.now() + 86400_000 });
-    state.storage.kv.put("grantedScopes", ["notifications.write"]);
-  });
+  await setCredentials();
   const stub = env.NOTIFICATION_RECEIVER.getByName(name);
   const authHash = await hashWebhookApiKey(secret);
   await runInDurableObject(stub, async (instance, state) => {
@@ -663,6 +666,85 @@ it("uses an existing destination without creating a policy and routes its alerts
 });
 
 it.each([false, true])(
+  "retries initial provisioning with the original secret after restart (created before failure: %s)",
+  async (createdBeforeFailure) => {
+    await setCredentials();
+    const name = `initial-provisioning-${createdBeforeFailure}`;
+    let stub = env.NOTIFICATION_RECEIVER.getByName(name);
+    let created: { id: string; url: string; secret: string } | undefined;
+    const attemptedSecrets: string[] = [];
+    const fetch = vi.fn(async (_url: string, init: RequestInit) => {
+      if (init.method === "GET")
+        return Response.json({ success: true, result: created ? [created] : [] });
+      if (init.method !== "POST") throw new Error("Unexpected provider request");
+      const body = JSON.parse(init.body as string);
+      attemptedSecrets.push(body.secret);
+      expect(
+        await env.NOTIFICATION_RECEIVER.getByName(name).receiveWebhook(
+          body.secret,
+          "application/json",
+          JSON.stringify({
+            text: "Hello World! This is a test message sent from https://cloudflare.com. If you can see this, your webhook is configured properly.",
+          }),
+        ),
+      ).toBe(204);
+      if (attemptedSecrets.length === 1 && !createdBeforeFailure)
+        throw new Error("Creation request failed");
+      created = { ...body, id: "d".repeat(32) };
+      if (attemptedSecrets.length === 1) throw new Error("Lost destination creation response");
+      return Response.json({ success: true, result: { id: "d".repeat(32) } });
+    });
+    vi.stubGlobal("fetch", fetch);
+
+    await expect(enableAdditionalHook(name)).rejects.toThrow(
+      createdBeforeFailure ? "Lost destination creation response" : "Creation request failed",
+    );
+    expect(await stub.getStatus()).toMatchObject({ installed: false, subscribers: 0 });
+    expect(
+      await runInDurableObject(stub, (_instance, state) => state.storage.kv.get("pendingApiKey")),
+    ).toBe(attemptedSecrets[0]);
+
+    await abortAllDurableObjects();
+    stub = env.NOTIFICATION_RECEIVER.getByName(name);
+    await enableAdditionalHook(name);
+
+    expect(attemptedSecrets).toEqual(Array(createdBeforeFailure ? 1 : 2).fill(created!.secret));
+    expect(await stub.getStatus()).toMatchObject({ installed: true, subscribers: 1 });
+    expect(
+      await runInDurableObject(stub, (_instance, state) => state.storage.kv.get("pendingApiKey")),
+    ).toBeUndefined();
+    expect(await stub.receiveWebhook(created!.secret, "application/json", payload)).toBe(204);
+    await stub.deliverPending();
+    expect(await receivedAlerts()).toEqual([expect.objectContaining({ subscriber: "hook-2" })]);
+  },
+);
+
+it("discards the pending creation secret on disconnect even if provider cleanup fails", async () => {
+  await setCredentials();
+  const name = "disconnect-pending-creation";
+  const stub = env.NOTIFICATION_RECEIVER.getByName(name);
+  mockProvider(async (_url, init) => {
+    if (init.method === "GET") return Response.json({ success: true, result: [] });
+    throw new Error("Lost destination creation response");
+  });
+  await expect(enableAdditionalHook(name)).rejects.toThrow("Lost destination creation response");
+  expect(
+    await runInDurableObject(stub, (_instance, state) => state.storage.kv.get("pendingApiKey")),
+  ).toEqual(expect.any(String));
+
+  mockProvider(async () => new Response(null, { status: 503 }));
+  const error = await stub.revokeWithToken("test-access").then(
+    () => undefined,
+    (caught: Error) => caught,
+  );
+  expect(error?.message).toContain("HTTP 503");
+  expect((await stub.getStatus()).suspended).toBe(true);
+  expect(
+    await runInDurableObject(stub, (_instance, state) => state.storage.kv.get("pendingApiKey")),
+  ).toBeUndefined();
+});
+
+it.each([false, true])(
   "recreates a deleted destination without losing existing subscribers (lost response: %s)",
   async (loseResponse) => {
     const name = `deleted-destination-${loseResponse}`;
@@ -681,8 +763,6 @@ it.each([false, true])(
         posts++;
         created = { ...JSON.parse(init.body as string), id: replacementId };
         if (loseResponse) throw new Error("Lost destination creation response");
-      } else if (init.method === "PUT") {
-        created = { ...JSON.parse(init.body as string), id: replacementId };
       } else throw new Error("Unexpected provider request");
       return Response.json({ success: true, result: { id: replacementId } });
     });

@@ -278,16 +278,20 @@ configured notification base path and standard gatekeeper base path are routed t
 receiver authenticates before writing storage and creates receipt tables
 lazily, so unknown credentials leave no persistent state. It accepts Cloudflare's documented
 `{"text":"…"}` test message and checks any reported account ID. Request bodies are capped at
-512 KiB while streaming. API keys are random 256-bit values; only their SHA-256 verifier is retained
-once setup completes. An address migration temporarily stores the pending secret to retry an
-interrupted update exactly, accepting both the old and pending credentials until it succeeds.
+512 KiB while streaming. API keys are random 256-bit values. Provisioning durably retains the pending
+creation key across failures and restarts, reusing it when recovering a destination because ANS
+cannot update its secret. The key is removed after installation or suspension; only its SHA-256
+verifier is retained once setup completes. An address migration temporarily stores the pending
+secret to retry an interrupted update exactly, accepting both the old and pending credentials until
+it succeeds.
 Enabling a hook reconciles a changed base URL by updating the existing destination in place,
 preserving its ID and policies. The standard gatekeeper path remains a migration fallback, subject to
 the stored-path check. Arbitrary historical custom paths require an explicit deployment routing
 transition. Both origins must route to this Worker during a hostname change.
 Hook enablement also reads the owned destination live, even when its configured address is unchanged.
 Only an explicit HTTP 404 is treated as provider deletion: setup is invalidated and exact-URL
-provisioning recreates or recovers the destination, rotates its secret, and retains subscribers.
+provisioning recreates or recovers the destination and retains subscribers. A new destination gets a
+fresh secret; interrupted creation reuses its pending secret.
 Managed policy intents are marked for reconciliation when their hooks are enabled again. External
 policies are not rewritten. Authorization failures, transient provider errors, and malformed lookup
 responses fail enablement without creating a replacement. A lost creation response can be recovered

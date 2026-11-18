@@ -169,7 +169,8 @@ export async function getNotificationDestinationUrl(
   }
 }
 
-/** Reconcile by the exact connection URL, never adopt another connection's similarly named webhook.
+/** Reconcile by the exact connection URL using the caller's durably retained creation secret.
+ * Never adopt another connection's similarly named webhook.
  */
 export async function provisionNotificationInstallation(
   token: string,
@@ -189,8 +190,7 @@ export async function provisionNotificationInstallation(
   const webhookId = matches[0]
     ? id(matches[0].id)
     : id(object(await request(token, `${root}/destinations/webhooks`, "POST", body)).id);
-  // Recover a previous interrupted attempt, replacing its unknowable provider-side secret.
-  if (matches[0]) await request(token, `${root}/destinations/webhooks/${webhookId}`, "PUT", body);
+  // ANS keeps URL and secret immutable; interrupted creation must reuse the original secret.
   return { webhookId };
 }
 
