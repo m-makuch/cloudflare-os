@@ -84,6 +84,7 @@ export class TestConnectCallback extends WorkerEntrypoint<Env, { label: string }
 }
 
 class SubscriptionTestQueue extends RpcTarget implements ApprovalQueue {
+  async getFetcher(): Promise<Fetcher> { throw new Error("Unexpected session fetcher"); }
   async requireLive(): Promise<void> {}
   async watchSession(): Promise<never> { throw new Error("Unexpected session watcher"); }
   async getExecutionId(): Promise<undefined> { return undefined; }
